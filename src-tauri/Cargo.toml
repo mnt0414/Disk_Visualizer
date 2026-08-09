@@ -1,0 +1,25 @@
+[package]
+name = "disk-visualizer"
+version = "0.1.0"
+description = "Offline disk usage visualization for macOS and Windows"
+authors = ["Disk Visualizer contributors"]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.77.2"
+
+[lib]
+name = "disk_visualizer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
