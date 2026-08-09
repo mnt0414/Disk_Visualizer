@@ -28,6 +28,7 @@
   "bundle": {
     "active": false,
     "targets": "all",
+    "icon": [],
     "category": "Utility",
     "shortDescription": "Visualize local disk usage safely and offline"
   }
