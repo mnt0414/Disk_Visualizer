@@ -53,9 +53,9 @@ export function App() {
         </button>
       </header>
 
-      <aside className="sidebar" aria-label="メインナビゲーション">
+      <aside className="sidebar">
         <p className="section-label">分析</p>
-        <nav>
+        <nav aria-label="メインナビゲーション">
           {navigation.map((item) => (
             <button
               key={item}
