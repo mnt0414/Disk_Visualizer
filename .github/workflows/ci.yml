@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  frontend:
+  frontend-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,7 +18,25 @@ jobs:
           node-version: 22
       - run: npm install
       - run: npm run check
+
+  frontend-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
       - run: npm test
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
       - run: npm run build
 
   rust-quality:
