@@ -1,10 +1,12 @@
 mod scan_jobs;
 mod scanner;
+mod storage;
 
 use scan_jobs::{ScanJobSnapshot, ScanManager};
 use scanner::ScanSummary;
 use serde::Serialize;
-use tauri::State;
+use storage::{SavedScan, ScanRepository};
+use tauri::{Manager, State};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,10 +49,29 @@ fn resume_scan(id: u64, manager: State<'_, ScanManager>) -> Result<ScanJobSnapsh
 fn cancel_scan(id: u64, manager: State<'_, ScanManager>) -> Result<ScanJobSnapshot, String> {
     manager.cancel(id)
 }
+#[tauri::command]
+fn list_saved_scans(repository: State<'_, ScanRepository>) -> Result<Vec<SavedScan>, String> {
+    repository.list()
+}
+#[tauri::command]
+fn delete_saved_scan(id: i64, repository: State<'_, ScanRepository>) -> Result<(), String> {
+    repository.delete(id)
+}
+#[tauri::command]
+fn check_scan_index(repository: State<'_, ScanRepository>) -> Result<bool, String> {
+    repository.integrity_check()
+}
 
 pub fn run() {
     tauri::Builder::default()
-        .manage(ScanManager::default())
+        .setup(|app| {
+            let database_path = app.path().app_data_dir()?.join("scan-index.sqlite3");
+            let repository = ScanRepository::new(database_path);
+            repository.initialize().map_err(std::io::Error::other)?;
+            app.manage(ScanManager::new(repository.clone()));
+            app.manage(repository);
+            Ok(())
+        })
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             get_app_info,
@@ -59,7 +80,10 @@ pub fn run() {
             get_scan_status,
             pause_scan,
             resume_scan,
-            cancel_scan
+            cancel_scan,
+            list_saved_scans,
+            delete_saved_scan,
+            check_scan_index
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Disk Visualizer");

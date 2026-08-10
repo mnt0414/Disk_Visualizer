@@ -1,4 +1,5 @@
 use crate::scanner::{self, ScanSummary};
+use crate::storage::ScanRepository;
 use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,7 +21,6 @@ pub struct ScanJobSnapshot {
     pub result: Option<ScanSummary>,
     pub error: Option<String>,
 }
-
 struct JobState {
     status: String,
     current_path: String,
@@ -42,7 +42,6 @@ struct ScanJob {
     control: Mutex<Control>,
     wake: Condvar,
 }
-
 impl ScanJob {
     fn snapshot(&self) -> ScanJobSnapshot {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -75,12 +74,17 @@ impl ScanJob {
         state.total_size_bytes = state.total_size_bytes.saturating_add(size);
     }
 }
-
-#[derive(Default)]
 pub struct ScanManager {
     active: Mutex<Option<Arc<ScanJob>>>,
+    repository: ScanRepository,
 }
 impl ScanManager {
+    pub fn new(repository: ScanRepository) -> Self {
+        Self {
+            active: Mutex::new(None),
+            repository,
+        }
+    }
     pub fn start(&self, path: String) -> Result<ScanJobSnapshot, String> {
         if !Path::new(&path).is_absolute() {
             return Err("スキャン対象には絶対パスを指定してください".to_owned());
@@ -113,6 +117,7 @@ impl ScanManager {
         });
         *active = Some(Arc::clone(&job));
         let snapshot = job.snapshot();
+        let repository = self.repository.clone();
         std::thread::spawn(move || {
             let control_job = Arc::clone(&job);
             let progress_job = Arc::clone(&job);
@@ -126,18 +131,29 @@ impl ScanManager {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .cancelled;
-            let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
             match result {
                 Ok(summary) if !cancelled => {
-                    state.status = "completed".to_owned();
-                    state.current_path.clear();
-                    state.result = Some(summary);
+                    let persisted = repository.save_summary(&summary);
+                    let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
+                    match persisted {
+                        Ok(_) => {
+                            state.status = "completed".to_owned();
+                            state.current_path.clear();
+                            state.result = Some(summary);
+                        }
+                        Err(error) => {
+                            state.status = "failed".to_owned();
+                            state.error = Some(error);
+                        }
+                    }
                 }
                 _ if cancelled => {
+                    let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.status = "cancelled".to_owned();
                     state.current_path.clear();
                 }
                 Err(error) => {
+                    let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.status = "failed".to_owned();
                     state.error = Some(error);
                 }
@@ -161,8 +177,7 @@ impl ScanManager {
     pub fn pause(&self, id: u64) -> Result<ScanJobSnapshot, String> {
         let job = self.job(id)?;
         {
-            let mut control = job.control.lock().unwrap_or_else(|e| e.into_inner());
-            control.paused = true;
+            job.control.lock().unwrap_or_else(|e| e.into_inner()).paused = true;
         }
         {
             job.state.lock().unwrap_or_else(|e| e.into_inner()).status = "paused".to_owned();
@@ -172,8 +187,7 @@ impl ScanManager {
     pub fn resume(&self, id: u64) -> Result<ScanJobSnapshot, String> {
         let job = self.job(id)?;
         {
-            let mut control = job.control.lock().unwrap_or_else(|e| e.into_inner());
-            control.paused = false;
+            job.control.lock().unwrap_or_else(|e| e.into_inner()).paused = false;
         }
         {
             job.state.lock().unwrap_or_else(|e| e.into_inner()).status = "running".to_owned();

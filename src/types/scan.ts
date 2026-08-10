@@ -32,3 +32,13 @@ export type ScanJobSnapshot = {
   result: ScanSummary | null
   error: string | null
 }
+
+export type SavedScan = {
+  id: number
+  rootPath: string
+  totalSizeBytes: number
+  fileCount: number
+  directoryCount: number
+  skippedCount: number
+  completedAt: number
+}
