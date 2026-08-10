@@ -29,6 +29,7 @@ fn scan_folder(path: String) -> Result<ScanSummary, String> {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![get_app_info, scan_folder])
         .run(tauri::generate_context!())
         .expect("failed to run Disk Visualizer");
