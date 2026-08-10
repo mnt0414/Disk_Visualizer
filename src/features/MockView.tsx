@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from 'react'
+import { chooseFolder } from '../services/folderPicker'
 import { scanFolder } from '../services/scan'
 import type { ScanSummary } from '../types/scan'
 import './mock-views.css'
@@ -29,13 +30,18 @@ function Scan() {
   const [result, setResult] = useState<ScanSummary | null>(null)
   const [error, setError] = useState('')
   const [running, setRunning] = useState(false)
+  const [picking, setPicking] = useState(false)
+  const pickFolder = async () => {
+    setPicking(true); setError('')
+    try { const selected = await chooseFolder(); if (selected) setPath(selected) } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) } finally { setPicking(false) }
+  }
   const startScan = async (event: FormEvent) => {
     event.preventDefault()
     setRunning(true); setError(''); setResult(null)
     try { setResult(await scanFolder(path)) } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) } finally { setRunning(false) }
   }
   const rows = result?.entries.map((entry) => [entry.name, entry.path, formatBytes(entry.sizeBytes), entry.isDirectory ? `${entry.fileCount.toLocaleString()}項目` : 'ファイル']) ?? []
-  return <div className="mock-stack"><section className="panel scan-card"><span className="eyebrow">読み取り専用スキャン</span><h2>フォルダを分析</h2><p>ファイルの内容やリンク先を開かず、名前とサイズだけを集計します。</p><form className="scan-form" onSubmit={startScan}><label htmlFor="scan-path">絶対パス</label><input id="scan-path" value={path} onChange={(event) => setPath(event.target.value)} placeholder={navigator.platform.startsWith('Win') ? 'C:\\Users\\name\\Documents' : '/Users/name/Documents'} autoComplete="off" /><button className="primary-button" type="submit" disabled={running}>{running ? 'スキャン中…' : 'スキャン開始'}</button></form>{error && <p className="scan-error" role="alert">{error}</p>}</section>{result && <><section className="scan-result-summary" aria-label="スキャン結果"><article><span>合計サイズ</span><strong>{formatBytes(result.totalSizeBytes)}</strong></article><article><span>ファイル</span><strong>{result.fileCount.toLocaleString()}</strong></article><article><span>フォルダ</span><strong>{result.directoryCount.toLocaleString()}</strong></article><article><span>読み飛ばし</span><strong>{result.skippedCount.toLocaleString()}</strong></article></section><DataTable eyebrow="スキャン結果" title={result.rootPath} rows={rows} /></>}</div>
+  return <div className="mock-stack"><section className="panel scan-card"><span className="eyebrow">読み取り専用スキャン</span><h2>フォルダを分析</h2><p>ファイルの内容やリンク先を開かず、名前とサイズだけを集計します。</p><form className="scan-form" onSubmit={startScan}><label htmlFor="scan-path">スキャン対象</label><div className="scan-path-row"><input id="scan-path" value={path} onChange={(event) => setPath(event.target.value)} placeholder={navigator.platform.startsWith('Win') ? 'C:\\Users\\name\\Documents' : '/Users/name/Documents'} autoComplete="off" /><button className="secondary-button" type="button" disabled={picking || running} onClick={pickFolder}>{picking ? '選択中…' : 'フォルダを選択'}</button></div><button className="primary-button" type="submit" disabled={running || picking || !path.trim()}>{running ? 'スキャン中…' : 'スキャン開始'}</button></form>{error && <p className="scan-error" role="alert">{error}</p>}</section>{result && <><section className="scan-result-summary" aria-label="スキャン結果"><article><span>合計サイズ</span><strong>{formatBytes(result.totalSizeBytes)}</strong></article><article><span>ファイル</span><strong>{result.fileCount.toLocaleString()}</strong></article><article><span>フォルダ</span><strong>{result.directoryCount.toLocaleString()}</strong></article><article><span>読み飛ばし</span><strong>{result.skippedCount.toLocaleString()}</strong></article></section><DataTable eyebrow="スキャン結果" title={result.rootPath} rows={rows} /></>}</div>
 }
 
 function Settings() { return <section className="panel mock-panel"><div className="mock-header"><span className="eyebrow">設定</span><h2>既定の動作</h2></div><label className="setting"><span><strong>初期負荷プロファイル</strong><small>CPUとI/Oの使用量</small></span><select defaultValue="balanced"><option value="balanced">バランス</option><option value="quiet">低負荷</option></select></label><label className="setting"><span><strong>ユーザー指定の除外を維持</strong><small>フルスキャンでも適用</small></span><input type="checkbox" defaultChecked /></label><div className="setting"><span><strong>外部通信</strong><small>スキャン結果を送信しません</small></span><b>無効</b></div></section> }
