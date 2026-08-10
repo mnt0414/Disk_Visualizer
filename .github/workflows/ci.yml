@@ -6,7 +6,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   frontend:
@@ -25,9 +25,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml
+      - name: Commit canonical Rust formatting
+        if: github.event_name == 'pull_request'
+        run: |
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src-tauri
+            git commit -m "style: apply canonical Rust formatting"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
       - run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
 
   rust-quality:
