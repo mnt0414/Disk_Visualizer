@@ -1,7 +1,7 @@
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -120,7 +120,8 @@ pub fn scan_folder_path(path: &Path) -> Result<ScanSummary, String> {
         };
         let child_path = child.path();
         let child_totals = scan_entry(&child_path);
-        let is_directory = fs::symlink_metadata(&child_path).is_ok_and(|metadata| metadata.is_dir());
+        let is_directory = fs::symlink_metadata(&child_path)
+            .is_ok_and(|metadata| metadata.is_dir());
         entries.push(ScanEntry {
             name: child.file_name().to_string_lossy().into_owned(),
             path: display_path(&child_path),
@@ -149,6 +150,7 @@ pub fn scan_folder_path(path: &Path) -> Result<ScanSummary, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_directory(name: &str) -> PathBuf {
@@ -167,7 +169,8 @@ mod tests {
         let nested = root.join("projects");
         fs::create_dir(&nested).expect("nested directory should be created");
         fs::write(root.join("note.txt"), b"1234").expect("root file should be written");
-        fs::write(nested.join("video.bin"), [0_u8; 8]).expect("nested file should be written");
+        fs::write(nested.join("video.bin"), [0_u8; 8])
+            .expect("nested file should be written");
 
         let summary = scan_folder_path(&root).expect("folder scan should succeed");
 
