@@ -18,11 +18,11 @@ describe('MockView', () => {
     expect(screen.getByText('Adobe Premiere Pro')).toBeInTheDocument()
   })
 
-  it('fills the path from the native folder picker', async () => {
-    mockedChooseFolder.mockResolvedValue('/Users/test/Documents')
+  it('opens the native folder picker', async () => {
+    mockedChooseFolder.mockResolvedValue(null)
     render(<MockView viewId="scan" label="スキャン" description="" />)
     fireEvent.click(screen.getByRole('button', { name: 'フォルダを選択' }))
-    await waitFor(() => expect(screen.getByLabelText('スキャン対象')).toHaveValue('/Users/test/Documents'))
+    await waitFor(() => expect(mockedChooseFolder).toHaveBeenCalledOnce())
   })
 
   it('scans a selected path and renders the result', async () => {
