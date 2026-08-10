@@ -110,8 +110,8 @@ pub fn scan_folder_path(path: &Path) -> Result<ScanSummary, String> {
         };
         let child_path = child.path();
         let item = scan_entry(child_path.as_path());
-        let is_directory = fs::symlink_metadata(child_path.as_path())
-            .is_ok_and(|metadata| metadata.is_dir());
+        let is_directory =
+            fs::symlink_metadata(child_path.as_path()).is_ok_and(|metadata| metadata.is_dir());
         entries.push(ScanEntry {
             name: child.file_name().to_string_lossy().into_owned(),
             path: child_path.to_string_lossy().into_owned(),
@@ -158,8 +158,7 @@ mod tests {
         let nested = root.join("projects");
         fs::create_dir(nested.as_path()).expect("nested directory should be created");
         fs::write(root.join("note.txt"), b"1234").expect("root file should be written");
-        fs::write(nested.join("video.bin"), [0_u8; 8])
-            .expect("nested file should be written");
+        fs::write(nested.join("video.bin"), [0_u8; 8]).expect("nested file should be written");
 
         let summary = scan_folder_path(root.as_path()).expect("folder scan should succeed");
         assert_eq!(summary.total_size_bytes, 12);
