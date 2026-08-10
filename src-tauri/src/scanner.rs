@@ -39,7 +39,9 @@ impl Totals {
     fn add(&mut self, other: &Totals) {
         self.size_bytes = self.size_bytes.saturating_add(other.size_bytes);
         self.file_count = self.file_count.saturating_add(other.file_count);
-        self.directory_count = self.directory_count.saturating_add(other.directory_count);
+        self.directory_count = self
+            .directory_count
+            .saturating_add(other.directory_count);
         self.skipped_count = self.skipped_count.saturating_add(other.skipped_count);
     }
 }
@@ -172,8 +174,10 @@ mod tests {
         let nested = root.join("projects");
         fs::create_dir(&nested).expect("nested directory should be created");
         fs::write(root.join("note.txt"), b"1234").expect("root file should be written");
-        let mut file = fs::File::create(nested.join("video.bin")).expect("file should be created");
-        file.write_all(&[0_u8; 8]).expect("file should be written");
+        let mut file =
+            fs::File::create(nested.join("video.bin")).expect("file should be created");
+        file.write_all(&[0_u8; 8])
+            .expect("file should be written");
 
         let summary = scan_folder_path(&root).expect("folder scan should succeed");
 
