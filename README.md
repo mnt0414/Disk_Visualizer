@@ -25,13 +25,17 @@ npm install
 npm run tauri dev
 ```
 
+PNG and ICO assets required by Tauri are generated locally from the versioned icon source before development and production builds.
+
 Quality checks:
 
 ```bash
 npm run format:check
 npm run check
 npm test
-cd src-tauri && cargo fmt --check && cargo test
+npm run icons
+cargo fmt --check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 ## Privacy and safety
