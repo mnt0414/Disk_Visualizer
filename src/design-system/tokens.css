@@ -1,7 +1,10 @@
 :root {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans JP", sans-serif;
   color-scheme: light dark;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
   --color-accent: #4f46e5;
+  --color-accent-hover: #4338ca;
   --color-accent-strong: #3730a3;
   --color-accent-soft: #e0e7ff;
   --color-on-accent: #ffffff;
@@ -9,24 +12,47 @@
   --color-focus: #4f46e5;
   --color-background: #f4f6f8;
   --color-surface: #ffffff;
+  --color-surface-raised: #ffffff;
   --color-surface-muted: #f8fafc;
+  --color-surface-selected: #eef2ff;
   --color-text: #111827;
+  --color-text-secondary: #475467;
   --color-text-muted: #667085;
   --color-border: #d7dce3;
+  --color-border-subtle: #e7eaf0;
+  --color-success: #138a5b;
+  --color-success-soft: #dff7eb;
+  --color-warning: #b54708;
+  --color-warning-soft: #fff0d8;
+  --color-danger: #c4323f;
+  --color-danger-soft: #ffe4e8;
+  --color-map-1: #4f46e5;
+  --color-map-2: #6366f1;
+  --color-map-3: #818cf8;
+  --color-map-4: #a5b4fc;
+  --color-map-5: #c7d2fe;
+  --color-map-6: #e0e7ff;
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-md: 0 8px 24px rgba(16, 24, 40, 0.08);
   --radius-sm: 6px;
   --radius-md: 10px;
   --radius-lg: 14px;
+  --radius-xl: 20px;
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
   --space-4: 16px;
+  --space-5: 20px;
   --space-6: 24px;
-  --motion-fast: 150ms;
-  --motion-standard: 220ms;
+  --space-8: 32px;
+  --space-10: 40px;
+  --motion-fast: 120ms;
+  --motion-standard: 200ms;
 }
 
 html[data-theme='dark'] {
   --color-accent: #818cf8;
+  --color-accent-hover: #a5b4fc;
   --color-accent-strong: #a5b4fc;
   --color-accent-soft: #252858;
   --color-on-accent: #0b0d10;
@@ -34,8 +60,47 @@ html[data-theme='dark'] {
   --color-focus: #a5b4fc;
   --color-background: #0b0d10;
   --color-surface: #15181d;
+  --color-surface-raised: #1b1f26;
   --color-surface-muted: #1b1f26;
+  --color-surface-selected: #252858;
   --color-text: #f9fafb;
+  --color-text-secondary: #d0d5dd;
   --color-text-muted: #98a2b3;
   --color-border: #343b46;
+  --color-border-subtle: #252b34;
+  --color-success: #5bd3a2;
+  --color-success-soft: #123f31;
+  --color-warning: #fdbf6f;
+  --color-warning-soft: #4a2c13;
+  --color-danger: #ff8994;
+  --color-danger-soft: #4c1f26;
+  --color-map-1: #4f46e5;
+  --color-map-2: #6366f1;
+  --color-map-3: #818cf8;
+  --color-map-4: #4f56a8;
+  --color-map-5: #343a7a;
+  --color-map-6: #252858;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --shadow-md: 0 12px 32px rgba(0, 0, 0, 0.3);
+}
+
+@media (forced-colors: active) {
+  :root {
+    --color-accent: Highlight;
+    --color-accent-hover: Highlight;
+    --color-accent-soft: Canvas;
+    --color-on-accent: HighlightText;
+    --color-on-accent-soft: CanvasText;
+    --color-focus: Highlight;
+    --color-background: Canvas;
+    --color-surface: Canvas;
+    --color-surface-raised: Canvas;
+    --color-surface-muted: Canvas;
+    --color-surface-selected: Canvas;
+    --color-text: CanvasText;
+    --color-text-secondary: CanvasText;
+    --color-text-muted: GrayText;
+    --color-border: CanvasText;
+    --color-border-subtle: GrayText;
+  }
 }
