@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::cmp::Reverse;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -36,7 +37,7 @@ struct Totals {
 }
 
 impl Totals {
-    fn add(&mut self, other: &Totals) {
+    fn add(&mut self, other: &Self) {
         self.size_bytes = self.size_bytes.saturating_add(other.size_bytes);
         self.file_count = self.file_count.saturating_add(other.file_count);
         self.directory_count = self
@@ -52,7 +53,7 @@ fn display_path(path: &Path) -> String {
 
 fn scan_entry(path: &Path) -> Totals {
     let mut totals = Totals::default();
-    let mut pending = vec![PathBuf::from(path)];
+    let mut pending = vec![path.to_path_buf()];
 
     while let Some(current) = pending.pop() {
         let metadata = match fs::symlink_metadata(&current) {
@@ -119,9 +120,7 @@ pub fn scan_folder_path(path: &Path) -> Result<ScanSummary, String> {
         };
         let child_path = child.path();
         let child_totals = scan_entry(&child_path);
-        let is_directory = fs::symlink_metadata(&child_path)
-            .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-            .unwrap_or(false);
+        let is_directory = fs::symlink_metadata(&child_path).is_ok_and(|metadata| metadata.is_dir());
         entries.push(ScanEntry {
             name: child.file_name().to_string_lossy().into_owned(),
             path: display_path(&child_path),
@@ -134,12 +133,7 @@ pub fn scan_folder_path(path: &Path) -> Result<ScanSummary, String> {
         totals.add(&child_totals);
     }
 
-    entries.sort_by(|left, right| {
-        right
-            .size_bytes
-            .cmp(&left.size_bytes)
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-    });
+    entries.sort_by_key(|entry| (Reverse(entry.size_bytes), entry.name.to_lowercase()));
 
     Ok(ScanSummary {
         root_path: display_path(&root),
@@ -155,7 +149,6 @@ pub fn scan_folder_path(path: &Path) -> Result<ScanSummary, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_directory(name: &str) -> PathBuf {
@@ -174,10 +167,7 @@ mod tests {
         let nested = root.join("projects");
         fs::create_dir(&nested).expect("nested directory should be created");
         fs::write(root.join("note.txt"), b"1234").expect("root file should be written");
-        let mut file =
-            fs::File::create(nested.join("video.bin")).expect("file should be created");
-        file.write_all(&[0_u8; 8])
-            .expect("file should be written");
+        fs::write(nested.join("video.bin"), [0_u8; 8]).expect("nested file should be written");
 
         let summary = scan_folder_path(&root).expect("folder scan should succeed");
 
