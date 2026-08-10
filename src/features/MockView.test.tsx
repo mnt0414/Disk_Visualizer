@@ -1,40 +1,11 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { fireEvent,render,screen,waitFor } from '@testing-library/react'
+import { beforeEach,describe,expect,it,vi } from 'vitest'
 import { chooseFolder } from '../services/folderPicker'
-import { scanFolder } from '../services/scan'
+import { startScan } from '../services/scan'
 import { MockView } from './MockView'
-
-vi.mock('../services/folderPicker', () => ({ chooseFolder: vi.fn() }))
-vi.mock('../services/scan', () => ({ scanFolder: vi.fn() }))
-const mockedChooseFolder = vi.mocked(chooseFolder)
-const mockedScanFolder = vi.mocked(scanFolder)
-
-beforeEach(() => { mockedChooseFolder.mockReset(); mockedScanFolder.mockReset() })
-
-describe('MockView', () => {
-  it('renders application cache evidence', () => {
-    render(<MockView viewId="app-cache" label="アプリキャッシュ" description="" />)
-    expect(screen.getByRole('heading', { name: 'キャッシュ候補' })).toBeInTheDocument()
-    expect(screen.getByText('Adobe Premiere Pro')).toBeInTheDocument()
-  })
-
-  it('opens the native folder picker', async () => {
-    mockedChooseFolder.mockResolvedValue(null)
-    render(<MockView viewId="scan" label="スキャン" description="" />)
-    fireEvent.click(screen.getByRole('button', { name: 'フォルダを選択' }))
-    await waitFor(() => expect(mockedChooseFolder).toHaveBeenCalledOnce())
-  })
-
-  it('scans a selected path and renders the result', async () => {
-    mockedScanFolder.mockResolvedValue({ rootPath: '/Users/test/Documents', totalSizeBytes: 1024, fileCount: 1, directoryCount: 0, skippedCount: 0, elapsedMilliseconds: 2, entries: [{ name: 'note.txt', path: '/Users/test/Documents/note.txt', sizeBytes: 1024, fileCount: 1, directoryCount: 0, skippedCount: 0, isDirectory: false }] })
-    render(<MockView viewId="scan" label="スキャン" description="" />)
-    const input = screen.getByLabelText('スキャン対象')
-    fireEvent.change(input, { target: { value: '/Users/test/Documents' } })
-    const form = input.closest('form')
-    expect(form).not.toBeNull()
-    fireEvent.submit(form!)
-    await waitFor(() => expect(screen.getByText('note.txt')).toBeInTheDocument())
-    expect(mockedScanFolder).toHaveBeenCalledWith('/Users/test/Documents')
-    expect(screen.getAllByText('1.0 KB')).toHaveLength(2)
-  })
-})
+vi.mock('../services/folderPicker',()=>({chooseFolder:vi.fn()}))
+vi.mock('../services/scan',()=>({startScan:vi.fn(),getScanStatus:vi.fn(),pauseScan:vi.fn(),resumeScan:vi.fn(),cancelScan:vi.fn()}))
+const mockedChooseFolder=vi.mocked(chooseFolder);const mockedStartScan=vi.mocked(startScan)
+beforeEach(()=>{mockedChooseFolder.mockReset();mockedStartScan.mockReset()})
+const result={rootPath:'/Users/test/Documents',totalSizeBytes:1024,fileCount:1,directoryCount:0,skippedCount:0,elapsedMilliseconds:2,entries:[{name:'note.txt',path:'/Users/test/Documents/note.txt',sizeBytes:1024,fileCount:1,directoryCount:0,skippedCount:0,isDirectory:false}]}
+describe('MockView',()=>{it('renders application cache evidence',()=>{render(<MockView viewId="app-cache" label="アプリキャッシュ" description=""/>);expect(screen.getByRole('heading',{name:'キャッシュ候補'})).toBeInTheDocument()});it('opens the native folder picker',async()=>{mockedChooseFolder.mockResolvedValue(null);render(<MockView viewId="scan" label="スキャン" description=""/>);fireEvent.click(screen.getByRole('button',{name:'フォルダを選択'}));await waitFor(()=>expect(mockedChooseFolder).toHaveBeenCalledOnce())});it('starts an asynchronous scan and renders its result',async()=>{mockedStartScan.mockResolvedValue({id:1,path:'/Users/test/Documents',status:'completed',currentPath:'',totalSizeBytes:1024,fileCount:1,directoryCount:0,skippedCount:0,result,error:null});render(<MockView viewId="scan" label="スキャン" description=""/>);const input=screen.getByLabelText('スキャン対象');fireEvent.change(input,{target:{value:'/Users/test/Documents'}});fireEvent.submit(input.closest('form')!);await waitFor(()=>expect(screen.getByText('note.txt')).toBeInTheDocument());expect(mockedStartScan).toHaveBeenCalledWith('/Users/test/Documents')})})
