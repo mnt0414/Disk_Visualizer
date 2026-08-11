@@ -134,9 +134,9 @@ impl ScanManager {
             let result = scanner::scan_folder_path_controlled(
                 Path::new(&path),
                 move || control_job.can_continue(),
-                move |p, f, d, s, b| {
-                    progress_job.progress(p, f, d, s, b);
-                    progress_stream.record(p, f, d, b);
+                move |p, f, d, s, counted, actual| {
+                    progress_job.progress(p, f, d, s, counted);
+                    progress_stream.record(p, f, d, actual);
                 },
             );
             let cancelled = job

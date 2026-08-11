@@ -11,12 +11,20 @@ permissions:
 jobs:
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
+      - name: Install frontend dependencies
+        run: npm install --no-audit --no-fund
+        timeout-minutes: 10
+        env:
+          NPM_CONFIG_FETCH_RETRIES: 5
+          NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: 20000
+          NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: 120000
+          NPM_CONFIG_FETCH_TIMEOUT: 300000
       - run: npm run check
       - run: npm test
       - run: npm run build
@@ -28,7 +36,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
+      - name: Install frontend dependencies
+        run: npm install --no-audit --no-fund
+        timeout-minutes: 10
+        env:
+          NPM_CONFIG_FETCH_RETRIES: 5
+          NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: 20000
+          NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: 120000
+          NPM_CONFIG_FETCH_TIMEOUT: 300000
       - run: npm run build
       - name: Install Tauri Linux dependencies
         run: |
@@ -59,5 +74,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: npm install
+      - name: Install frontend dependencies
+        run: npm install --no-audit --no-fund
+        timeout-minutes: 10
+        env:
+          NPM_CONFIG_FETCH_RETRIES: 5
+          NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: 20000
+          NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: 120000
+          NPM_CONFIG_FETCH_TIMEOUT: 300000
       - run: npm run tauri build -- --debug --target ${{ matrix.target }}

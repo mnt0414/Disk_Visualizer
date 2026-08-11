@@ -1,3 +1,4 @@
+mod file_metrics;
 mod scan_jobs;
 mod scanner;
 mod storage;
@@ -61,7 +62,6 @@ fn delete_saved_scan(id: i64, repository: State<'_, ScanRepository>) -> Result<(
 fn check_scan_index(repository: State<'_, ScanRepository>) -> Result<bool, String> {
     repository.integrity_check()
 }
-
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -88,7 +88,6 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("failed to run Disk Visualizer");
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
