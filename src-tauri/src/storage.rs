@@ -1,4 +1,4 @@
-use crate::scanner::ScanSummary;
+use crate::scanner::{ScanProgress, ScanSummary};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -30,10 +30,14 @@ struct IndexedEntry {
     parent_path: Option<String>,
     relative_path: String,
     entry_type: &'static str,
-    size_bytes: u64,
+    logical_size: u64,
+    allocated_size: Option<u64>,
     file_count: u64,
     directory_count: u64,
     is_directory: bool,
+    file_identity: Option<String>,
+    volume_identity: Option<String>,
+    modified_at: Option<i64>,
 }
 #[derive(Clone)]
 pub struct StreamingScanWriter {
@@ -55,6 +59,9 @@ fn unix_time() -> Result<i64, String> {
 }
 fn to_i64(value: u64, label: &str) -> Result<i64, String> {
     i64::try_from(value).map_err(|_| format!("{label}が保存可能な範囲を超えています"))
+}
+fn optional_to_i64(value: Option<u64>, label: &str) -> Result<Option<i64>, String> {
+    value.map(|value| to_i64(value, label)).transpose()
 }
 fn elapsed_to_i64(value: u128) -> Result<i64, String> {
     i64::try_from(value).map_err(|_| "経過時間が保存可能な範囲を超えています".to_owned())
@@ -162,7 +169,7 @@ impl ScanRepository {
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|e| e.to_string())?;
         {
-            let mut statement=transaction.prepare_cached("INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,file_count,directory_count,is_directory) VALUES (?1,?2,?3,?4,?5,?6,?7,?7,?8,?9,?10)").map_err(|e|e.to_string())?;
+            let mut statement=transaction.prepare_cached("INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,allocated_size,file_count,directory_count,is_directory,file_identity,volume_identity,modified_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?7,?8,?9,?10,?11,?12,?13,?14)").map_err(|e|e.to_string())?;
             for entry in entries {
                 statement
                     .execute(params![
@@ -172,10 +179,14 @@ impl ScanRepository {
                         entry.parent_path,
                         entry.relative_path,
                         entry.entry_type,
-                        to_i64(entry.size_bytes, "項目サイズ")?,
+                        to_i64(entry.logical_size, "論理サイズ")?,
+                        optional_to_i64(entry.allocated_size, "割り当て済みサイズ")?,
                         to_i64(entry.file_count, "ファイル数")?,
                         to_i64(entry.directory_count, "フォルダ数")?,
-                        if entry.is_directory { 1_i64 } else { 0_i64 }
+                        if entry.is_directory { 1_i64 } else { 0_i64 },
+                        entry.file_identity,
+                        entry.volume_identity,
+                        entry.modified_at,
                     ])
                     .map_err(|e| format!("スキャン項目を保存できません: {e}"))?;
             }
@@ -247,10 +258,11 @@ impl ScanRepository {
     }
 }
 impl StreamingScanWriter {
-    pub fn record(&self, path: &Path, files: u64, directories: u64, size_bytes: u64) {
-        if files == 0 && directories == 0 {
+    pub(crate) fn record(&self, progress: &ScanProgress) {
+        if progress.file_count == 0 && progress.directory_count == 0 {
             return;
         }
+        let path = &progress.path;
         let entry = IndexedEntry {
             name: path
                 .file_name()
@@ -266,11 +278,15 @@ impl StreamingScanWriter {
                 .unwrap_or(path)
                 .to_string_lossy()
                 .into_owned(),
-            entry_type: if directories > 0 { "directory" } else { "file" },
-            size_bytes,
-            file_count: files,
-            directory_count: directories,
-            is_directory: directories > 0,
+            entry_type: if progress.directory_count > 0 { "directory" } else { "file" },
+            logical_size: progress.logical_size_bytes,
+            allocated_size: progress.allocated_size_bytes,
+            file_count: progress.file_count,
+            directory_count: progress.directory_count,
+            is_directory: progress.directory_count > 0,
+            file_identity: progress.file_identity.clone(),
+            volume_identity: progress.volume_identity.clone(),
+            modified_at: progress.modified_at,
         };
         let batch = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -283,12 +299,7 @@ impl StreamingScanWriter {
         self.write(batch)
     }
     fn write(&self, batch: Vec<IndexedEntry>) {
-        if self
-            .error
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-        {
+        if self.error.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
             return;
         }
         if let Err(error) = self.repository.append_batch(self.scan_id, &batch) {
@@ -311,12 +322,11 @@ impl StreamingScanWriter {
         self.repository.finish_stream(self.scan_id, summary)
     }
     pub fn interrupt(&self, failed: bool) -> Result<(), String> {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.repository
-            .stop_stream(self.scan_id, if failed { "failed" } else { "interrupted" })
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.repository.stop_stream(
+            self.scan_id,
+            if failed { "failed" } else { "interrupted" },
+        )
     }
     #[cfg(test)]
     fn pending_len(&self) -> usize {
@@ -355,14 +365,46 @@ mod tests {
             entries_truncated: false,
         }
     }
+    fn progress(path: PathBuf) -> ScanProgress {
+        ScanProgress {
+            path,
+            file_count: 1,
+            directory_count: 0,
+            skipped_count: 0,
+            counted_size_bytes: 1024,
+            logical_size_bytes: 1024,
+            allocated_size_bytes: Some(4096),
+            file_identity: Some("42".to_owned()),
+            volume_identity: Some("7".to_owned()),
+            modified_at: Some(1234),
+        }
+    }
     #[test]
     fn streams_lists_and_deletes_complete_scans() {
         let repository = repository("stream");
         let writer = repository.begin_stream("/tmp/sample").unwrap();
-        writer.record(Path::new("/tmp/sample/file.bin"), 1, 0, 1024);
+        writer.record(&progress(PathBuf::from("/tmp/sample/file.bin")));
         writer.complete(&summary(1)).unwrap();
         assert_eq!(repository.list().unwrap().len(), 1);
         assert!(repository.integrity_check().unwrap());
+        let _ = std::fs::remove_file(repository.path());
+    }
+    #[test]
+    fn persists_filesystem_metadata() {
+        let repository = repository("metadata");
+        let writer = repository.begin_stream("/tmp/sample").unwrap();
+        writer.record(&progress(PathBuf::from("/tmp/sample/file.bin")));
+        writer.complete(&summary(1)).unwrap();
+        let stored: (i64, i64, String, String, i64) = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT logical_size,allocated_size,file_identity,volume_identity,modified_at FROM scan_entries LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (1024, 4096, "42".to_owned(), "7".to_owned(), 1234));
         let _ = std::fs::remove_file(repository.path());
     }
     #[test]
@@ -370,7 +412,9 @@ mod tests {
         let repository = repository("bounded");
         let writer = repository.begin_stream("/tmp/sample").unwrap();
         for index in 0..(WRITE_BATCH_SIZE * 3 + 7) {
-            writer.record(Path::new(&format!("/tmp/sample/{index}.bin")), 1, 0, 1024);
+            writer.record(&progress(PathBuf::from(format!(
+                "/tmp/sample/{index}.bin"
+            ))));
             assert!(writer.pending_len() < WRITE_BATCH_SIZE);
         }
         writer
@@ -408,7 +452,7 @@ mod tests {
         let count = 1_000_000_u64;
         let started = std::time::Instant::now();
         for index in 0..count {
-            writer.record(Path::new(&format!("/benchmark/{index}.bin")), 1, 0, 1024);
+            writer.record(&progress(PathBuf::from(format!("/benchmark/{index}.bin"))));
         }
         writer.complete(&summary(count)).unwrap();
         assert_eq!(repository.count_entries(), count as i64);
