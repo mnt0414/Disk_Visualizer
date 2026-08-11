@@ -1,7 +1,7 @@
 use crate::scanner::{ScanProgress, ScanSummary};
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -246,7 +246,7 @@ impl ScanRepository {
         Ok(result == "ok")
     }
     #[cfg(test)]
-    fn path(&self) -> &Path {
+    fn path(&self) -> &std::path::Path {
         &self.database_path
     }
     #[cfg(test)]
