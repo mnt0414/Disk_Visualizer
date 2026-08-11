@@ -13,7 +13,12 @@ pub struct FileMetrics {
 }
 
 pub fn modified_at(metadata: &Metadata) -> Option<i64> {
-    let seconds = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let seconds = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
     i64::try_from(seconds).ok()
 }
 

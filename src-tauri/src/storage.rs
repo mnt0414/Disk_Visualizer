@@ -278,7 +278,11 @@ impl StreamingScanWriter {
                 .unwrap_or(path)
                 .to_string_lossy()
                 .into_owned(),
-            entry_type: if progress.directory_count > 0 { "directory" } else { "file" },
+            entry_type: if progress.directory_count > 0 {
+                "directory"
+            } else {
+                "file"
+            },
             logical_size: progress.logical_size_bytes,
             allocated_size: progress.allocated_size_bytes,
             file_count: progress.file_count,
@@ -299,7 +303,12 @@ impl StreamingScanWriter {
         self.write(batch)
     }
     fn write(&self, batch: Vec<IndexedEntry>) {
-        if self.error.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+        if self
+            .error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             return;
         }
         if let Err(error) = self.repository.append_batch(self.scan_id, &batch) {
@@ -322,11 +331,12 @@ impl StreamingScanWriter {
         self.repository.finish_stream(self.scan_id, summary)
     }
     pub fn interrupt(&self, failed: bool) -> Result<(), String> {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.repository.stop_stream(
-            self.scan_id,
-            if failed { "failed" } else { "interrupted" },
-        )
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.repository
+            .stop_stream(self.scan_id, if failed { "failed" } else { "interrupted" })
     }
     #[cfg(test)]
     fn pending_len(&self) -> usize {
@@ -412,9 +422,7 @@ mod tests {
         let repository = repository("bounded");
         let writer = repository.begin_stream("/tmp/sample").unwrap();
         for index in 0..(WRITE_BATCH_SIZE * 3 + 7) {
-            writer.record(&progress(PathBuf::from(format!(
-                "/tmp/sample/{index}.bin"
-            ))));
+            writer.record(&progress(PathBuf::from(format!("/tmp/sample/{index}.bin"))));
             assert!(writer.pending_len() < WRITE_BATCH_SIZE);
         }
         writer

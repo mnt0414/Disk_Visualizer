@@ -163,8 +163,7 @@ where
                 .as_ref()
                 .zip(metrics.file_identity.as_ref())
                 .map(|(volume, file)| format!("{volume}:{file}"));
-            let duplicate = deduplication_key
-                .is_some_and(|identity| !seen_files.insert(identity));
+            let duplicate = deduplication_key.is_some_and(|identity| !seen_files.insert(identity));
             totals.files = totals.files.saturating_add(1);
             if duplicate {
                 totals.hard_link_duplicates = totals.hard_link_duplicates.saturating_add(1);
