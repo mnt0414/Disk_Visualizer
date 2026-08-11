@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
-
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanJobSnapshot {
@@ -96,6 +95,7 @@ impl ScanManager {
                 return Err("別のスキャンが実行中です".to_owned());
             }
         }
+        let stream = self.repository.begin_stream(&path)?;
         let job = Arc::new(ScanJob {
             id: NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed),
             path: path.clone(),
@@ -117,14 +117,17 @@ impl ScanManager {
         });
         *active = Some(Arc::clone(&job));
         let snapshot = job.snapshot();
-        let repository = self.repository.clone();
         std::thread::spawn(move || {
             let control_job = Arc::clone(&job);
             let progress_job = Arc::clone(&job);
+            let progress_stream = stream.clone();
             let result = scanner::scan_folder_path_controlled(
                 Path::new(&path),
                 move || control_job.can_continue(),
-                move |p, f, d, s, b| progress_job.progress(p, f, d, s, b),
+                move |p, f, d, s, b| {
+                    progress_job.progress(p, f, d, s, b);
+                    progress_stream.record(p, f, d, b);
+                },
             );
             let cancelled = job
                 .control
@@ -133,7 +136,7 @@ impl ScanManager {
                 .cancelled;
             match result {
                 Ok(summary) if !cancelled => {
-                    let persisted = repository.save_summary(&summary);
+                    let persisted = stream.complete(&summary);
                     let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
                     match persisted {
                         Ok(_) => {
@@ -148,14 +151,16 @@ impl ScanManager {
                     }
                 }
                 _ if cancelled => {
+                    let _ = stream.interrupt(false);
                     let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.status = "cancelled".to_owned();
                     state.current_path.clear();
                 }
                 Err(error) => {
+                    let persistence_error = stream.interrupt(true).err();
                     let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.status = "failed".to_owned();
-                    state.error = Some(error);
+                    state.error = Some(persistence_error.unwrap_or(error));
                 }
                 _ => {}
             }
