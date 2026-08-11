@@ -24,6 +24,37 @@ pub fn collect(_path: &Path, metadata: &Metadata) -> FileMetrics {
 }
 
 #[cfg(windows)]
+fn file_identity(path: &Path) -> Option<String> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+        .ok()?;
+    let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as _, &mut information)
+    };
+    if succeeded == 0 {
+        return None;
+    }
+    let file_index =
+        ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64;
+    Some(format!(
+        "{}:{file_index}",
+        information.dwVolumeSerialNumber
+    ))
+}
+
+#[cfg(windows)]
 pub fn collect(path: &Path, metadata: &Metadata) -> FileMetrics {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::MetadataExt;
@@ -36,13 +67,9 @@ pub fn collect(path: &Path, metadata: &Metadata) -> FileMetrics {
     let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
     let allocated_size = ((high as u64) << 32) | low as u64;
     let attributes = metadata.file_attributes();
-    let identity = metadata
-        .volume_serial_number()
-        .zip(metadata.file_index())
-        .map(|(volume, index)| format!("{volume}:{index}"));
     FileMetrics {
         allocated_size,
-        identity,
+        identity: file_identity(path),
         is_sparse: attributes & FILE_ATTRIBUTE_SPARSE_FILE != 0,
         is_compressed: attributes & FILE_ATTRIBUTE_COMPRESSED != 0,
     }
