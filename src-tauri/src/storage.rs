@@ -4,9 +4,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-
 const WRITE_BATCH_SIZE: usize = 500;
-
 #[derive(Clone)]
 pub struct ScanRepository {
     database_path: PathBuf,
@@ -38,11 +36,10 @@ pub struct StreamingScanWriter {
     pending: Arc<Mutex<Vec<IndexedEntry>>>,
     error: Arc<Mutex<Option<String>>>,
 }
-
 fn unix_time() -> Result<i64, String> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|error| error.to_string())?
+        .map_err(|e| e.to_string())?
         .as_secs() as i64)
 }
 impl ScanRepository {
@@ -51,42 +48,53 @@ impl ScanRepository {
     }
     fn connection(&self) -> Result<Connection, String> {
         let connection = Connection::open(&self.database_path)
-            .map_err(|error| format!("スキャン履歴を開けません: {error}"))?;
+            .map_err(|e| format!("スキャン履歴を開けません: {e}"))?;
         connection
             .execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
-            .map_err(|error| error.to_string())?;
+            .map_err(|e| e.to_string())?;
         Ok(connection)
     }
     pub fn initialize(&self) -> Result<(), String> {
         if let Some(parent) = self.database_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("保存先を作成できません: {error}"))?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("保存先を作成できません: {e}"))?;
         }
         let connection = self.connection()?;
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .map_err(|error| error.to_string())?;
+            .map_err(|e| e.to_string())?;
         match version {
-            0 => Self::create_v2(&connection),
-            1 => self.migrate_v1(&connection),
-            2 => Ok(()),
-            other => Err(format!("未対応のスキャン履歴バージョンです: {other}")),
+            0 => Self::create_v2(&connection)?,
+            1 => self.migrate_v1(&connection)?,
+            2 => {}
+            other => return Err(format!("未対応のスキャン履歴バージョンです: {other}")),
         }
+        let check: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        if check != "ok" {
+            return Err(format!("スキャン履歴の整合性を確認できません: {check}"));
+        }
+        self.recover_incomplete_sessions()?;
+        Ok(())
     }
     fn create_v2(connection: &Connection) -> Result<(), String> {
-        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,root_path TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('in_progress','complete','interrupted','failed')),total_size_bytes INTEGER NOT NULL DEFAULT 0,file_count INTEGER NOT NULL DEFAULT 0,directory_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,elapsed_milliseconds INTEGER NOT NULL DEFAULT 0,started_at INTEGER NOT NULL,completed_at INTEGER); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,size_bytes INTEGER NOT NULL,file_count INTEGER NOT NULL,directory_count INTEGER NOT NULL,skipped_count INTEGER NOT NULL DEFAULT 0,is_directory INTEGER NOT NULL); CREATE INDEX scan_entries_scan_size ON scan_entries(scan_id,size_bytes DESC); PRAGMA user_version=2;").map_err(|error|format!("スキャン履歴を初期化できません: {error}"))
+        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,root_path TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('in_progress','complete','interrupted','failed')),total_size_bytes INTEGER NOT NULL DEFAULT 0,file_count INTEGER NOT NULL DEFAULT 0,directory_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,elapsed_milliseconds INTEGER NOT NULL DEFAULT 0,started_at INTEGER NOT NULL,completed_at INTEGER); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,size_bytes INTEGER NOT NULL,file_count INTEGER NOT NULL,directory_count INTEGER NOT NULL,skipped_count INTEGER NOT NULL DEFAULT 0,is_directory INTEGER NOT NULL); CREATE INDEX scan_entries_scan_size ON scan_entries(scan_id,size_bytes DESC); PRAGMA user_version=2;").map_err(|e|format!("スキャン履歴を初期化できません: {e}"))
     }
     fn migrate_v1(&self, connection: &Connection) -> Result<(), String> {
         let backup = self.database_path.with_extension("sqlite3.v1-backup");
         if !backup.exists() {
             std::fs::copy(&self.database_path, &backup)
-                .map_err(|error| format!("移行前バックアップを作成できません: {error}"))?;
+                .map_err(|e| format!("移行前バックアップを作成できません: {e}"))?;
         }
-        connection.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE; ALTER TABLE scan_entries RENAME TO scan_entries_v1; ALTER TABLE scan_sessions RENAME TO scan_sessions_v1; CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,root_path TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('in_progress','complete','interrupted','failed')),total_size_bytes INTEGER NOT NULL DEFAULT 0,file_count INTEGER NOT NULL DEFAULT 0,directory_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,elapsed_milliseconds INTEGER NOT NULL DEFAULT 0,started_at INTEGER NOT NULL,completed_at INTEGER); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,size_bytes INTEGER NOT NULL,file_count INTEGER NOT NULL,directory_count INTEGER NOT NULL,skipped_count INTEGER NOT NULL DEFAULT 0,is_directory INTEGER NOT NULL); INSERT INTO scan_sessions (id,root_path,status,total_size_bytes,file_count,directory_count,skipped_count,elapsed_milliseconds,started_at,completed_at) SELECT id,root_path,'complete',total_size_bytes,file_count,directory_count,skipped_count,elapsed_milliseconds,completed_at,completed_at FROM scan_sessions_v1; INSERT INTO scan_entries SELECT * FROM scan_entries_v1; DROP TABLE scan_entries_v1; DROP TABLE scan_sessions_v1; CREATE INDEX scan_entries_scan_size ON scan_entries(scan_id,size_bytes DESC); PRAGMA user_version=2; COMMIT; PRAGMA foreign_keys=ON;").map_err(|error|format!("スキャン履歴を移行できません: {error}"))
+        connection.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE; ALTER TABLE scan_entries RENAME TO scan_entries_v1; ALTER TABLE scan_sessions RENAME TO scan_sessions_v1; CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,root_path TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('in_progress','complete','interrupted','failed')),total_size_bytes INTEGER NOT NULL DEFAULT 0,file_count INTEGER NOT NULL DEFAULT 0,directory_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,elapsed_milliseconds INTEGER NOT NULL DEFAULT 0,started_at INTEGER NOT NULL,completed_at INTEGER); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,size_bytes INTEGER NOT NULL,file_count INTEGER NOT NULL,directory_count INTEGER NOT NULL,skipped_count INTEGER NOT NULL DEFAULT 0,is_directory INTEGER NOT NULL); INSERT INTO scan_sessions (id,root_path,status,total_size_bytes,file_count,directory_count,skipped_count,elapsed_milliseconds,started_at,completed_at) SELECT id,root_path,'complete',total_size_bytes,file_count,directory_count,skipped_count,elapsed_milliseconds,completed_at,completed_at FROM scan_sessions_v1; INSERT INTO scan_entries SELECT * FROM scan_entries_v1; DROP TABLE scan_entries_v1; DROP TABLE scan_sessions_v1; CREATE INDEX scan_entries_scan_size ON scan_entries(scan_id,size_bytes DESC); PRAGMA user_version=2; COMMIT; PRAGMA foreign_keys=ON;").map_err(|e|format!("スキャン履歴を移行できません: {e}"))
+    }
+    pub fn recover_incomplete_sessions(&self) -> Result<usize, String> {
+        let connection = self.connection()?;
+        connection.execute("UPDATE scan_sessions SET status='interrupted',completed_at=?1 WHERE status='in_progress'",[unix_time()?]).map_err(|e|format!("未完了のスキャン履歴を復旧できません: {e}"))
     }
     pub fn begin_stream(&self, root_path: &str) -> Result<StreamingScanWriter, String> {
         let connection = self.connection()?;
-        connection.execute("INSERT INTO scan_sessions (root_path,status,started_at) VALUES (?1,'in_progress',?2)",params![root_path,unix_time()?]).map_err(|error|format!("スキャン履歴を開始できません: {error}"))?;
+        connection.execute("INSERT INTO scan_sessions (root_path,status,started_at) VALUES (?1,'in_progress',?2)",params![root_path,unix_time()?]).map_err(|e|format!("スキャン履歴を開始できません: {e}"))?;
         Ok(StreamingScanWriter {
             repository: self.clone(),
             scan_id: connection.last_insert_rowid(),
@@ -99,11 +107,9 @@ impl ScanRepository {
             return Ok(());
         }
         let mut connection = self.connection()?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
+        let transaction = connection.transaction().map_err(|e| e.to_string())?;
         {
-            let mut statement=transaction.prepare_cached("INSERT INTO scan_entries (scan_id,name,path,size_bytes,file_count,directory_count,is_directory) VALUES (?1,?2,?3,?4,?5,?6,?7)").map_err(|error|error.to_string())?;
+            let mut statement=transaction.prepare_cached("INSERT INTO scan_entries (scan_id,name,path,size_bytes,file_count,directory_count,is_directory) VALUES (?1,?2,?3,?4,?5,?6,?7)").map_err(|e|e.to_string())?;
             for entry in entries {
                 statement
                     .execute(params![
@@ -115,24 +121,24 @@ impl ScanRepository {
                         entry.directory_count as i64,
                         if entry.is_directory { 1_i64 } else { 0_i64 }
                     ])
-                    .map_err(|error| format!("スキャン項目を保存できません: {error}"))?;
+                    .map_err(|e| format!("スキャン項目を保存できません: {e}"))?;
             }
         }
-        transaction.commit().map_err(|error| error.to_string())
+        transaction.commit().map_err(|e| e.to_string())
     }
     fn finish_stream(&self, scan_id: i64, summary: &ScanSummary) -> Result<(), String> {
         let connection = self.connection()?;
-        connection.execute("UPDATE scan_sessions SET status='complete',total_size_bytes=?2,file_count=?3,directory_count=?4,skipped_count=?5,elapsed_milliseconds=?6,completed_at=?7 WHERE id=?1",params![scan_id,summary.total_size_bytes as i64,summary.file_count as i64,summary.directory_count as i64,summary.skipped_count as i64,summary.elapsed_milliseconds as i64,unix_time()?]).map_err(|error|format!("スキャン履歴を確定できません: {error}"))?;
+        connection.execute("UPDATE scan_sessions SET status='complete',total_size_bytes=?2,file_count=?3,directory_count=?4,skipped_count=?5,elapsed_milliseconds=?6,completed_at=?7 WHERE id=?1",params![scan_id,summary.total_size_bytes as i64,summary.file_count as i64,summary.directory_count as i64,summary.skipped_count as i64,summary.elapsed_milliseconds as i64,unix_time()?]).map_err(|e|format!("スキャン履歴を確定できません: {e}"))?;
         Ok(())
     }
     fn stop_stream(&self, scan_id: i64, status: &str) -> Result<(), String> {
         let connection = self.connection()?;
-        connection.execute("UPDATE scan_sessions SET status=?2,completed_at=?3 WHERE id=?1 AND status='in_progress'",params![scan_id,status,unix_time()?]).map_err(|error|error.to_string())?;
+        connection.execute("UPDATE scan_sessions SET status=?2,completed_at=?3 WHERE id=?1 AND status='in_progress'",params![scan_id,status,unix_time()?]).map_err(|e|e.to_string())?;
         Ok(())
     }
     pub fn list(&self) -> Result<Vec<SavedScan>, String> {
         let connection = self.connection()?;
-        let mut statement=connection.prepare("SELECT id,root_path,total_size_bytes,file_count,directory_count,skipped_count,completed_at FROM scan_sessions WHERE status='complete' ORDER BY completed_at DESC,id DESC").map_err(|error|error.to_string())?;
+        let mut statement=connection.prepare("SELECT id,root_path,total_size_bytes,file_count,directory_count,skipped_count,completed_at FROM scan_sessions WHERE status='complete' ORDER BY completed_at DESC,id DESC").map_err(|e|e.to_string())?;
         let rows = statement
             .query_map([], |row| {
                 Ok(SavedScan {
@@ -145,27 +151,34 @@ impl ScanRepository {
                     completed_at: row.get(6)?,
                 })
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())
+            .map_err(|e| e.to_string())
     }
     pub fn delete(&self, id: i64) -> Result<(), String> {
         let connection = self.connection()?;
         connection
             .execute("DELETE FROM scan_sessions WHERE id=?1", [id])
-            .map_err(|error| format!("スキャン履歴を削除できません: {error}"))?;
+            .map_err(|e| format!("スキャン履歴を削除できません: {e}"))?;
         Ok(())
     }
     pub fn integrity_check(&self) -> Result<bool, String> {
         let connection = self.connection()?;
         let result: String = connection
             .query_row("PRAGMA quick_check", [], |row| row.get(0))
-            .map_err(|error| error.to_string())?;
+            .map_err(|e| e.to_string())?;
         Ok(result == "ok")
     }
     #[cfg(test)]
     fn path(&self) -> &Path {
         &self.database_path
+    }
+    #[cfg(test)]
+    fn count_entries(&self) -> i64 {
+        self.connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM scan_entries", [], |row| row.get(0))
+            .unwrap()
     }
 }
 impl StreamingScanWriter {
@@ -223,27 +236,34 @@ impl StreamingScanWriter {
         self.repository
             .stop_stream(self.scan_id, if failed { "failed" } else { "interrupted" })
     }
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scanner::ScanSummary;
+    use std::time::Instant;
     fn repository(name: &str) -> ScanRepository {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "disk-visualizer-{name}-{}-{}.sqlite3",
-            std::process::id(),
-            unix_time().unwrap()
+            "disk-visualizer-{name}-{}-{unique}.sqlite3",
+            std::process::id()
         ));
         let repository = ScanRepository::new(path);
-        let _ = std::fs::remove_file(repository.path());
         repository.initialize().unwrap();
         repository
     }
-    fn summary() -> ScanSummary {
+    fn summary(files: u64) -> ScanSummary {
         ScanSummary {
             root_path: "/tmp/sample".to_owned(),
-            total_size_bytes: 12,
-            file_count: 1,
+            total_size_bytes: files * 12,
+            file_count: files,
             directory_count: 0,
             skipped_count: 0,
             elapsed_milliseconds: 2,
@@ -255,7 +275,7 @@ mod tests {
         let repository = repository("stream");
         let writer = repository.begin_stream("/tmp/sample").unwrap();
         writer.record(Path::new("/tmp/sample/file.bin"), 1, 0, 12);
-        writer.complete(&summary()).unwrap();
+        writer.complete(&summary(1)).unwrap();
         let saved = repository.list().unwrap();
         assert_eq!(saved.len(), 1);
         assert!(repository.integrity_check().unwrap());
@@ -264,17 +284,58 @@ mod tests {
         let _ = std::fs::remove_file(repository.path());
     }
     #[test]
-    fn interrupted_scans_are_not_listed() {
-        let repository = repository("interrupted");
+    fn startup_recovers_abandoned_sessions() {
+        let repository = repository("recovery");
         let writer = repository.begin_stream("/tmp/sample").unwrap();
-        writer.record(Path::new("/tmp/sample/file.bin"), 1, 0, 12);
-        writer.interrupt(false).unwrap();
+        for index in 0..WRITE_BATCH_SIZE {
+            writer.record(Path::new(&format!("/tmp/sample/{index}.bin")), 1, 0, 12);
+        }
+        assert_eq!(repository.count_entries(), WRITE_BATCH_SIZE as i64);
+        drop(writer);
+        assert_eq!(repository.recover_incomplete_sessions().unwrap(), 1);
         assert!(repository.list().unwrap().is_empty());
         let connection = repository.connection().unwrap();
         let status: String = connection
             .query_row("SELECT status FROM scan_sessions", [], |row| row.get(0))
             .unwrap();
         assert_eq!(status, "interrupted");
+        let _ = std::fs::remove_file(repository.path());
+    }
+    #[test]
+    fn buffer_never_retains_a_full_batch() {
+        let repository = repository("bounded");
+        let writer = repository.begin_stream("/tmp/sample").unwrap();
+        for index in 0..(WRITE_BATCH_SIZE * 3 + 7) {
+            writer.record(Path::new(&format!("/tmp/sample/{index}.bin")), 1, 0, 12);
+            assert!(writer.pending_len() < WRITE_BATCH_SIZE);
+        }
+        writer
+            .complete(&summary((WRITE_BATCH_SIZE * 3 + 7) as u64))
+            .unwrap();
+        assert_eq!(
+            repository.count_entries(),
+            (WRITE_BATCH_SIZE * 3 + 7) as i64
+        );
+        let _ = std::fs::remove_file(repository.path());
+    }
+    #[test]
+    #[ignore = "manual million-entry benchmark"]
+    fn benchmark_million_entries() {
+        let repository = repository("benchmark");
+        let writer = repository.begin_stream("/benchmark").unwrap();
+        let count = 1_000_000_u64;
+        let started = Instant::now();
+        for index in 0..count {
+            writer.record(Path::new(&format!("/benchmark/{index}.bin")), 1, 0, 1024);
+        }
+        writer.complete(&summary(count)).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(repository.count_entries(), count as i64);
+        println!(
+            "entries={count} elapsed_ms={} db_bytes={}",
+            elapsed.as_millis(),
+            std::fs::metadata(repository.path()).unwrap().len()
+        );
         let _ = std::fs::remove_file(repository.path());
     }
 }
