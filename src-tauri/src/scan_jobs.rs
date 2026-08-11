@@ -4,14 +4,22 @@ use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanJobStatus {
+    Running,
+    Paused,
+    Completed,
+    Cancelled,
+    Failed,
+}
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanJobSnapshot {
     pub id: u64,
     pub path: String,
-    pub status: String,
+    pub status: ScanJobStatus,
     pub current_path: String,
     pub total_size_bytes: u64,
     pub file_count: u64,
@@ -21,7 +29,7 @@ pub struct ScanJobSnapshot {
     pub error: Option<String>,
 }
 struct JobState {
-    status: String,
+    status: ScanJobStatus,
     current_path: String,
     total_size_bytes: u64,
     file_count: u64,
@@ -47,7 +55,7 @@ impl ScanJob {
         ScanJobSnapshot {
             id: self.id,
             path: self.path.clone(),
-            status: state.status.clone(),
+            status: state.status,
             current_path: state.current_path.clone(),
             total_size_bytes: state.total_size_bytes,
             file_count: state.file_count,
@@ -90,8 +98,10 @@ impl ScanManager {
         }
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(job) = active.as_ref() {
-            let status = job.snapshot().status;
-            if !matches!(status.as_str(), "completed" | "cancelled" | "failed") {
+            if matches!(
+                job.snapshot().status,
+                ScanJobStatus::Running | ScanJobStatus::Paused
+            ) {
                 return Err("別のスキャンが実行中です".to_owned());
             }
         }
@@ -100,7 +110,7 @@ impl ScanManager {
             id: NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed),
             path: path.clone(),
             state: Mutex::new(JobState {
-                status: "running".to_owned(),
+                status: ScanJobStatus::Running,
                 current_path: path.clone(),
                 total_size_bytes: 0,
                 file_count: 0,
@@ -139,13 +149,13 @@ impl ScanManager {
                     let persisted = stream.complete(&summary);
                     let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
                     match persisted {
-                        Ok(_) => {
-                            state.status = "completed".to_owned();
+                        Ok(()) => {
+                            state.status = ScanJobStatus::Completed;
                             state.current_path.clear();
                             state.result = Some(summary);
                         }
                         Err(error) => {
-                            state.status = "failed".to_owned();
+                            state.status = ScanJobStatus::Failed;
                             state.error = Some(error);
                         }
                     }
@@ -153,13 +163,13 @@ impl ScanManager {
                 _ if cancelled => {
                     let _ = stream.interrupt(false);
                     let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
-                    state.status = "cancelled".to_owned();
+                    state.status = ScanJobStatus::Cancelled;
                     state.current_path.clear();
                 }
                 Err(error) => {
                     let persistence_error = stream.interrupt(true).err();
                     let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
-                    state.status = "failed".to_owned();
+                    state.status = ScanJobStatus::Failed;
                     state.error = Some(persistence_error.unwrap_or(error));
                 }
                 _ => {}
@@ -182,26 +192,36 @@ impl ScanManager {
     pub fn pause(&self, id: u64) -> Result<ScanJobSnapshot, String> {
         let job = self.job(id)?;
         {
+            let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.status != ScanJobStatus::Running {
+                return Err("実行中のスキャンだけを一時停止できます".to_owned());
+            }
             job.control.lock().unwrap_or_else(|e| e.into_inner()).paused = true;
-        }
-        {
-            job.state.lock().unwrap_or_else(|e| e.into_inner()).status = "paused".to_owned();
+            state.status = ScanJobStatus::Paused;
         }
         Ok(job.snapshot())
     }
     pub fn resume(&self, id: u64) -> Result<ScanJobSnapshot, String> {
         let job = self.job(id)?;
         {
+            let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.status != ScanJobStatus::Paused {
+                return Err("一時停止中のスキャンだけを再開できます".to_owned());
+            }
             job.control.lock().unwrap_or_else(|e| e.into_inner()).paused = false;
-        }
-        {
-            job.state.lock().unwrap_or_else(|e| e.into_inner()).status = "running".to_owned();
+            state.status = ScanJobStatus::Running;
         }
         job.wake.notify_all();
         Ok(job.snapshot())
     }
     pub fn cancel(&self, id: u64) -> Result<ScanJobSnapshot, String> {
         let job = self.job(id)?;
+        {
+            let state = job.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !matches!(state.status, ScanJobStatus::Running | ScanJobStatus::Paused) {
+                return Err("完了済みのスキャンはキャンセルできません".to_owned());
+            }
+        }
         {
             let mut control = job.control.lock().unwrap_or_else(|e| e.into_inner());
             control.cancelled = true;
