@@ -64,9 +64,7 @@ impl Totals {
             .hard_link_duplicates
             .saturating_add(other.hard_link_duplicates);
         self.sparse_files = self.sparse_files.saturating_add(other.sparse_files);
-        self.compressed_files = self
-            .compressed_files
-            .saturating_add(other.compressed_files);
+        self.compressed_files = self.compressed_files.saturating_add(other.compressed_files);
     }
 }
 
@@ -220,12 +218,7 @@ where
             }
         };
         let child_path = child.path();
-        let item = scan_entry(
-            &child_path,
-            &mut control,
-            &mut progress,
-            &mut seen_files,
-        )?;
+        let item = scan_entry(&child_path, &mut control, &mut progress, &mut seen_files)?;
         let is_directory =
             fs::symlink_metadata(&child_path).is_ok_and(|metadata| metadata.is_dir());
         entries_truncated |= retain_largest(

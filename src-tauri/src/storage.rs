@@ -343,7 +343,11 @@ mod tests {
         ScanSummary {
             root_path: "/tmp/sample".to_owned(),
             total_size_bytes: files * 1024,
+            allocated_size_bytes: files * 4096,
             file_count: files,
+            hard_link_duplicate_count: 0,
+            sparse_file_count: 0,
+            compressed_file_count: 0,
             directory_count: 0,
             skipped_count: 0,
             elapsed_milliseconds: 2,
