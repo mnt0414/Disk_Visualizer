@@ -1,0 +1,38 @@
+name: Phase 4 unused import fix
+
+on:
+  push:
+    branches: [feat/persist-filesystem-metadata]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/persist-filesystem-metadata
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Remove test-only import from production build
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src-tauri/src/storage.rs')
+          content = path.read_text()
+          content = content.replace('use std::path::{Path, PathBuf};', 'use std::path::PathBuf;')
+          content = content.replace('fn path(&self) -> &Path {', 'fn path(&self) -> &std::path::Path {')
+          path.write_text(content)
+          PY
+          cargo fmt --manifest-path src-tauri/Cargo.toml
+      - name: Commit fix
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src-tauri/src/storage.rs
+          git commit -m "fix: remove test-only Path import"
+          git push
