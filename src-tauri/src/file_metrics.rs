@@ -29,8 +29,8 @@ fn file_identity(path: &Path) -> Option<String> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
     };
 
     let file = OpenOptions::new()
@@ -40,18 +40,13 @@ fn file_identity(path: &Path) -> Option<String> {
         .open(path)
         .ok()?;
     let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
-    let succeeded = unsafe {
-        GetFileInformationByHandle(file.as_raw_handle() as _, &mut information)
-    };
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) };
     if succeeded == 0 {
         return None;
     }
-    let file_index =
-        ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64;
-    Some(format!(
-        "{}:{file_index}",
-        information.dwVolumeSerialNumber
-    ))
+    let file_index = ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64;
+    Some(format!("{}:{file_index}", information.dwVolumeSerialNumber))
 }
 
 #[cfg(windows)]
