@@ -1,0 +1,34 @@
+name: Capture Windows build diagnostics
+on:
+  push:
+    branches: [feat/filesystem-accuracy]
+permissions:
+  contents: write
+jobs:
+  diagnose:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/filesystem-accuracy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: npm install
+      - name: Capture build output
+        shell: pwsh
+        run: |
+          npm run tauri build -- --debug --target x86_64-pc-windows-msvc *> windows-build.log
+          exit 0
+      - name: Commit diagnostics
+        shell: pwsh
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add windows-build.log
+          git commit -m "ci: capture Windows build output"
+          git push
