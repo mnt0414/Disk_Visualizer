@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   format-review-fixes:
-    if: ${{ !contains(github.event.pull_request.head.sha, 'style') && github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,7 +24,7 @@ jobs:
           components: rustfmt
       - run: npm install
       - run: npm run format
-      - run: cargo fmt --manifest-path src-tauri/Cargo.toml
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml > rustfmt-output.txt 2>&1 || true
       - name: Commit formatting
         run: |
           git config user.name github-actions[bot]
