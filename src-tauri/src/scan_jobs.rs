@@ -1,4 +1,4 @@
-use crate::scanner::{self, ScanSummary};
+use crate::scanner::{self, ScanProgress, ScanSummary};
 use crate::storage::ScanRepository;
 use serde::Serialize;
 use std::path::Path;
@@ -72,13 +72,17 @@ impl ScanJob {
         }
         !control.cancelled
     }
-    fn progress(&self, path: &Path, files: u64, dirs: u64, skipped: u64, size: u64) {
+    fn progress(&self, progress: &ScanProgress) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.current_path = path.to_string_lossy().into_owned();
-        state.file_count = state.file_count.saturating_add(files);
-        state.directory_count = state.directory_count.saturating_add(dirs);
-        state.skipped_count = state.skipped_count.saturating_add(skipped);
-        state.total_size_bytes = state.total_size_bytes.saturating_add(size);
+        state.current_path = progress.path.to_string_lossy().into_owned();
+        state.file_count = state.file_count.saturating_add(progress.file_count);
+        state.directory_count = state
+            .directory_count
+            .saturating_add(progress.directory_count);
+        state.skipped_count = state.skipped_count.saturating_add(progress.skipped_count);
+        state.total_size_bytes = state
+            .total_size_bytes
+            .saturating_add(progress.counted_size_bytes);
     }
 }
 pub struct ScanManager {
@@ -134,9 +138,9 @@ impl ScanManager {
             let result = scanner::scan_folder_path_controlled(
                 Path::new(&path),
                 move || control_job.can_continue(),
-                move |p, f, d, s, counted, actual| {
-                    progress_job.progress(p, f, d, s, counted);
-                    progress_stream.record(p, f, d, actual);
+                move |progress| {
+                    progress_job.progress(progress);
+                    progress_stream.record(progress);
                 },
             );
             let cancelled = job

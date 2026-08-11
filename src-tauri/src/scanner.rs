@@ -3,10 +3,24 @@ use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fs::{self, ReadDir};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const MAX_SUMMARY_ENTRIES: usize = 200;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScanProgress {
+    pub path: PathBuf,
+    pub file_count: u64,
+    pub directory_count: u64,
+    pub skipped_count: u64,
+    pub counted_size_bytes: u64,
+    pub logical_size_bytes: u64,
+    pub allocated_size_bytes: Option<u64>,
+    pub file_identity: Option<String>,
+    pub volume_identity: Option<String>,
+    pub modified_at: Option<i64>,
+}
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -68,7 +82,7 @@ impl Totals {
     }
 }
 
-fn next_path(stack: &mut Vec<ReadDir>) -> Option<Result<std::path::PathBuf, ()>> {
+fn next_path(stack: &mut Vec<ReadDir>) -> Option<Result<PathBuf, ()>> {
     loop {
         let children = stack.last_mut()?;
         match children.next() {
@@ -89,7 +103,7 @@ fn scan_entry<C, P>(
 ) -> Result<Totals, String>
 where
     C: FnMut() -> bool,
-    P: FnMut(&Path, u64, u64, u64, u64, u64),
+    P: FnMut(&ScanProgress),
 {
     let mut totals = Totals::default();
     let mut current = Some(path.to_path_buf());
@@ -113,19 +127,44 @@ where
             Ok(metadata) => metadata,
             Err(_) => {
                 totals.skipped = totals.skipped.saturating_add(1);
-                progress(&path, 0, 0, 1, 0, 0);
+                progress(&ScanProgress {
+                    path,
+                    file_count: 0,
+                    directory_count: 0,
+                    skipped_count: 1,
+                    counted_size_bytes: 0,
+                    logical_size_bytes: 0,
+                    allocated_size_bytes: None,
+                    file_identity: None,
+                    volume_identity: None,
+                    modified_at: None,
+                });
                 continue;
             }
         };
         if metadata.file_type().is_symlink() {
             totals.skipped = totals.skipped.saturating_add(1);
-            progress(&path, 0, 0, 1, 0, 0);
+            progress(&ScanProgress {
+                path,
+                file_count: 0,
+                directory_count: 0,
+                skipped_count: 1,
+                counted_size_bytes: 0,
+                logical_size_bytes: 0,
+                allocated_size_bytes: None,
+                file_identity: None,
+                volume_identity: None,
+                modified_at: file_metrics::modified_at(&metadata),
+            });
         } else if metadata.is_file() {
             let metrics = file_metrics::collect(&path, &metadata);
-            let duplicate = metrics
-                .identity
+            let deduplication_key = metrics
+                .volume_identity
                 .as_ref()
-                .is_some_and(|identity| !seen_files.insert(identity.clone()));
+                .zip(metrics.file_identity.as_ref())
+                .map(|(volume, file)| format!("{volume}:{file}"));
+            let duplicate = deduplication_key
+                .is_some_and(|identity| !seen_files.insert(identity));
             totals.files = totals.files.saturating_add(1);
             if duplicate {
                 totals.hard_link_duplicates = totals.hard_link_duplicates.saturating_add(1);
@@ -139,27 +178,64 @@ where
                     .compressed_files
                     .saturating_add(u64::from(metrics.is_compressed));
             }
-            progress(
-                &path,
-                1,
-                0,
-                0,
-                if duplicate { 0 } else { metadata.len() },
-                metadata.len(),
-            );
+            progress(&ScanProgress {
+                path,
+                file_count: 1,
+                directory_count: 0,
+                skipped_count: 0,
+                counted_size_bytes: if duplicate { 0 } else { metadata.len() },
+                logical_size_bytes: metadata.len(),
+                allocated_size_bytes: Some(metrics.allocated_size),
+                file_identity: metrics.file_identity,
+                volume_identity: metrics.volume_identity,
+                modified_at: metrics.modified_at,
+            });
         } else if metadata.is_dir() {
             totals.directories = totals.directories.saturating_add(1);
-            progress(&path, 0, 1, 0, 0, 0);
+            progress(&ScanProgress {
+                path: path.clone(),
+                file_count: 0,
+                directory_count: 1,
+                skipped_count: 0,
+                counted_size_bytes: 0,
+                logical_size_bytes: 0,
+                allocated_size_bytes: None,
+                file_identity: None,
+                volume_identity: None,
+                modified_at: file_metrics::modified_at(&metadata),
+            });
             match fs::read_dir(&path) {
                 Ok(children) => stack.push(children),
                 Err(_) => {
                     totals.skipped = totals.skipped.saturating_add(1);
-                    progress(&path, 0, 0, 1, 0, 0);
+                    progress(&ScanProgress {
+                        path,
+                        file_count: 0,
+                        directory_count: 0,
+                        skipped_count: 1,
+                        counted_size_bytes: 0,
+                        logical_size_bytes: 0,
+                        allocated_size_bytes: None,
+                        file_identity: None,
+                        volume_identity: None,
+                        modified_at: None,
+                    });
                 }
             }
         } else {
             totals.skipped = totals.skipped.saturating_add(1);
-            progress(&path, 0, 0, 1, 0, 0);
+            progress(&ScanProgress {
+                path,
+                file_count: 0,
+                directory_count: 0,
+                skipped_count: 1,
+                counted_size_bytes: 0,
+                logical_size_bytes: 0,
+                allocated_size_bytes: None,
+                file_identity: None,
+                volume_identity: None,
+                modified_at: file_metrics::modified_at(&metadata),
+            });
         }
     }
     Ok(totals)
@@ -187,7 +263,7 @@ pub fn scan_folder_path_controlled<C, P>(
 ) -> Result<ScanSummary, String>
 where
     C: FnMut() -> bool,
-    P: FnMut(&Path, u64, u64, u64, u64, u64),
+    P: FnMut(&ScanProgress),
 {
     if !path.is_absolute() {
         return Err("スキャン対象には絶対パスを指定してください".to_owned());
@@ -213,7 +289,18 @@ where
             Ok(child) => child,
             Err(_) => {
                 totals.skipped = totals.skipped.saturating_add(1);
-                progress(&root, 0, 0, 1, 0, 0);
+                progress(&ScanProgress {
+                    path: root.clone(),
+                    file_count: 0,
+                    directory_count: 0,
+                    skipped_count: 1,
+                    counted_size_bytes: 0,
+                    logical_size_bytes: 0,
+                    allocated_size_bytes: None,
+                    file_identity: None,
+                    volume_identity: None,
+                    modified_at: None,
+                });
                 continue;
             }
         };
@@ -257,13 +344,12 @@ where
 }
 
 pub fn scan_folder_path(path: &Path) -> Result<ScanSummary, String> {
-    scan_folder_path_controlled(path, || true, |_, _, _, _, _, _| {})
+    scan_folder_path_controlled(path, || true, |_| {})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_directory(name: &str) -> PathBuf {
@@ -303,6 +389,28 @@ mod tests {
         assert_eq!(summary.total_size_bytes, 16);
         assert_eq!(summary.file_count, 2);
         assert_eq!(summary.hard_link_duplicate_count, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reports_per_file_metadata() {
+        let root = temporary_directory("metadata");
+        let file = root.join("entry.bin");
+        fs::write(&file, [0_u8; 16]).unwrap();
+        let mut recorded = Vec::new();
+        scan_folder_path_controlled(&root, || true, |entry| recorded.push(entry.clone())).unwrap();
+        let entry = recorded
+            .iter()
+            .find(|entry| entry.path == file)
+            .expect("file metadata should be reported");
+        assert_eq!(entry.logical_size_bytes, 16);
+        assert!(entry.allocated_size_bytes.is_some());
+        assert!(entry.modified_at.is_some());
+        #[cfg(any(unix, windows))]
+        {
+            assert!(entry.file_identity.is_some());
+            assert!(entry.volume_identity.is_some());
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

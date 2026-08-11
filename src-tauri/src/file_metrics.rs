@@ -1,12 +1,20 @@
 use std::fs::Metadata;
 use std::path::Path;
+use std::time::UNIX_EPOCH;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileMetrics {
     pub allocated_size: u64,
-    pub identity: Option<String>,
+    pub file_identity: Option<String>,
+    pub volume_identity: Option<String>,
+    pub modified_at: Option<i64>,
     pub is_sparse: bool,
     pub is_compressed: bool,
+}
+
+pub fn modified_at(metadata: &Metadata) -> Option<i64> {
+    let seconds = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    i64::try_from(seconds).ok()
 }
 
 #[cfg(unix)]
@@ -17,14 +25,16 @@ pub fn collect(_path: &Path, metadata: &Metadata) -> FileMetrics {
     let logical_size = metadata.len();
     FileMetrics {
         allocated_size,
-        identity: Some(format!("{}:{}", metadata.dev(), metadata.ino())),
+        file_identity: Some(metadata.ino().to_string()),
+        volume_identity: Some(metadata.dev().to_string()),
+        modified_at: modified_at(metadata),
         is_sparse: allocated_size < logical_size,
         is_compressed: false,
     }
 }
 
 #[cfg(windows)]
-fn file_identity(path: &Path) -> Option<String> {
+fn file_identity(path: &Path) -> Option<(String, String)> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
@@ -46,7 +56,10 @@ fn file_identity(path: &Path) -> Option<String> {
         return None;
     }
     let file_index = ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64;
-    Some(format!("{}:{file_index}", information.dwVolumeSerialNumber))
+    Some((
+        file_index.to_string(),
+        information.dwVolumeSerialNumber.to_string(),
+    ))
 }
 
 #[cfg(windows)]
@@ -62,9 +75,14 @@ pub fn collect(path: &Path, metadata: &Metadata) -> FileMetrics {
     let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
     let allocated_size = ((high as u64) << 32) | low as u64;
     let attributes = metadata.file_attributes();
+    let (file_identity, volume_identity) = file_identity(path)
+        .map(|(file, volume)| (Some(file), Some(volume)))
+        .unwrap_or_default();
     FileMetrics {
         allocated_size,
-        identity: file_identity(path),
+        file_identity,
+        volume_identity,
+        modified_at: modified_at(metadata),
         is_sparse: attributes & FILE_ATTRIBUTE_SPARSE_FILE != 0,
         is_compressed: attributes & FILE_ATTRIBUTE_COMPRESSED != 0,
     }
@@ -74,6 +92,7 @@ pub fn collect(path: &Path, metadata: &Metadata) -> FileMetrics {
 pub fn collect(_path: &Path, metadata: &Metadata) -> FileMetrics {
     FileMetrics {
         allocated_size: metadata.len(),
+        modified_at: modified_at(metadata),
         ..FileMetrics::default()
     }
 }
