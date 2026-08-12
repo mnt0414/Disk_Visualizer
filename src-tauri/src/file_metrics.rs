@@ -39,6 +39,22 @@ pub fn is_non_followed_link(metadata: &Metadata) -> bool {
 }
 
 #[cfg(unix)]
+pub fn volume_identity(_path: &Path, metadata: &Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    Some(metadata.dev().to_string())
+}
+
+#[cfg(windows)]
+pub fn volume_identity(path: &Path, _metadata: &Metadata) -> Option<String> {
+    file_identity(path).map(|(_, volume)| volume)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn volume_identity(_path: &Path, _metadata: &Metadata) -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
 pub fn collect(_path: &Path, metadata: &Metadata) -> FileMetrics {
     use std::os::unix::fs::MetadataExt;
 

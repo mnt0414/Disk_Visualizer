@@ -95,8 +95,14 @@ fn next_path(stack: &mut Vec<ReadDir>) -> Option<Result<PathBuf, ()>> {
     }
 }
 
+fn crosses_volume(root: Option<&str>, current: Option<&str>) -> bool {
+    root.zip(current)
+        .is_some_and(|(root, current)| root != current)
+}
+
 fn scan_entry<C, P>(
     path: &Path,
+    root_volume_identity: Option<&str>,
     control: &mut C,
     progress: &mut P,
     seen_files: &mut HashSet<String>,
@@ -190,6 +196,23 @@ where
                 modified_at: metrics.modified_at,
             });
         } else if metadata.is_dir() {
+            let volume_identity = file_metrics::volume_identity(&path, &metadata);
+            if crosses_volume(root_volume_identity, volume_identity.as_deref()) {
+                totals.skipped = totals.skipped.saturating_add(1);
+                progress(&ScanProgress {
+                    path,
+                    file_count: 0,
+                    directory_count: 0,
+                    skipped_count: 1,
+                    counted_size_bytes: 0,
+                    logical_size_bytes: 0,
+                    allocated_size_bytes: None,
+                    file_identity: None,
+                    volume_identity,
+                    modified_at: file_metrics::modified_at(&metadata),
+                });
+                continue;
+            }
             totals.directories = totals.directories.saturating_add(1);
             progress(&ScanProgress {
                 path: path.clone(),
@@ -200,7 +223,7 @@ where
                 logical_size_bytes: 0,
                 allocated_size_bytes: None,
                 file_identity: None,
-                volume_identity: None,
+                volume_identity,
                 modified_at: file_metrics::modified_at(&metadata),
             });
             match fs::read_dir(&path) {
@@ -273,6 +296,9 @@ where
     if !root.is_dir() {
         return Err("スキャン対象はフォルダである必要があります".to_owned());
     }
+    let root_metadata = fs::symlink_metadata(&root)
+        .map_err(|error| format!("スキャン対象のボリュームを確認できません: {error}"))?;
+    let root_volume_identity = file_metrics::volume_identity(&root, &root_metadata);
     let started = Instant::now();
     let children =
         fs::read_dir(&root).map_err(|error| format!("スキャン対象を読み取れません: {error}"))?;
@@ -304,7 +330,13 @@ where
             }
         };
         let child_path = child.path();
-        let item = scan_entry(&child_path, &mut control, &mut progress, &mut seen_files)?;
+        let item = scan_entry(
+            &child_path,
+            root_volume_identity.as_deref(),
+            &mut control,
+            &mut progress,
+            &mut seen_files,
+        )?;
         let is_directory =
             fs::symlink_metadata(&child_path).is_ok_and(|metadata| metadata.is_dir());
         entries_truncated |= retain_largest(
@@ -389,6 +421,13 @@ mod tests {
         assert_eq!(summary.file_count, 2);
         assert_eq!(summary.hard_link_duplicate_count, 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detects_volume_identity_changes() {
+        assert!(crosses_volume(Some("root"), Some("other")));
+        assert!(!crosses_volume(Some("root"), Some("root")));
+        assert!(!crosses_volume(Some("root"), None));
     }
 
     #[cfg(unix)]
