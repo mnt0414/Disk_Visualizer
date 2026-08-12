@@ -1,0 +1,241 @@
+name: Phase 4 boundary implementation
+
+on:
+  push:
+    branches: [feat/link-and-volume-boundaries]
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/link-and-volume-boundaries
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Implement non-following filesystem boundaries
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          metrics = Path('src-tauri/src/file_metrics.rs')
+          text = metrics.read_text()
+          marker = '''pub fn modified_at(metadata: &Metadata) -> Option<i64> {
+              let seconds = metadata
+                  .modified()
+                  .ok()?
+                  .duration_since(UNIX_EPOCH)
+                  .ok()?
+                  .as_secs();
+              i64::try_from(seconds).ok()
+          }
+          '''
+          addition = marker + '''
+          #[cfg(unix)]
+          pub fn volume_identity(_path: &Path, metadata: &Metadata) -> Option<String> {
+              use std::os::unix::fs::MetadataExt;
+              Some(metadata.dev().to_string())
+          }
+
+          #[cfg(windows)]
+          pub fn volume_identity(path: &Path, _metadata: &Metadata) -> Option<String> {
+              file_identity(path).map(|(_, volume)| volume)
+          }
+
+          #[cfg(not(any(unix, windows)))]
+          pub fn volume_identity(_path: &Path, _metadata: &Metadata) -> Option<String> {
+              None
+          }
+
+          #[cfg(windows)]
+          pub fn is_reparse_point(metadata: &Metadata) -> bool {
+              use std::os::windows::fs::MetadataExt;
+              use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+              metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+          }
+
+          #[cfg(not(windows))]
+          pub fn is_reparse_point(_metadata: &Metadata) -> bool {
+              false
+          }
+          '''
+          if marker not in text:
+              raise SystemExit('modified_at marker not found')
+          metrics.write_text(text.replace(marker, addition, 1))
+
+          scanner = Path('src-tauri/src/scanner.rs')
+          text = scanner.read_text()
+          text = text.replace(
+              '''fn scan_entry<C, P>(
+              path: &Path,
+              control: &mut C,
+              progress: &mut P,
+              seen_files: &mut HashSet<String>,
+          ) -> Result<Totals, String>''',
+              '''fn crosses_volume(root: Option<&str>, current: Option<&str>) -> bool {
+              root.zip(current).is_some_and(|(root, current)| root != current)
+          }
+
+          fn scan_entry<C, P>(
+              path: &Path,
+              root_volume_identity: Option<&str>,
+              control: &mut C,
+              progress: &mut P,
+              seen_files: &mut HashSet<String>,
+          ) -> Result<Totals, String>''',
+              1,
+          )
+          text = text.replace(
+              'if metadata.file_type().is_symlink() {',
+              'if metadata.file_type().is_symlink() || file_metrics::is_reparse_point(&metadata) {',
+              1,
+          )
+          old_dir = '''        } else if metadata.is_dir() {
+              totals.directories = totals.directories.saturating_add(1);
+              progress(&ScanProgress {
+                  path: path.clone(),
+                  file_count: 0,
+                  directory_count: 1,
+                  skipped_count: 0,
+                  counted_size_bytes: 0,
+                  logical_size_bytes: 0,
+                  allocated_size_bytes: None,
+                  file_identity: None,
+                  volume_identity: None,
+                  modified_at: file_metrics::modified_at(&metadata),
+              });'''
+          new_dir = '''        } else if metadata.is_dir() {
+              let volume_identity = file_metrics::volume_identity(&path, &metadata);
+              if crosses_volume(root_volume_identity, volume_identity.as_deref()) {
+                  totals.skipped = totals.skipped.saturating_add(1);
+                  progress(&ScanProgress {
+                      path,
+                      file_count: 0,
+                      directory_count: 0,
+                      skipped_count: 1,
+                      counted_size_bytes: 0,
+                      logical_size_bytes: 0,
+                      allocated_size_bytes: None,
+                      file_identity: None,
+                      volume_identity,
+                      modified_at: file_metrics::modified_at(&metadata),
+                  });
+                  continue;
+              }
+              totals.directories = totals.directories.saturating_add(1);
+              progress(&ScanProgress {
+                  path: path.clone(),
+                  file_count: 0,
+                  directory_count: 1,
+                  skipped_count: 0,
+                  counted_size_bytes: 0,
+                  logical_size_bytes: 0,
+                  allocated_size_bytes: None,
+                  file_identity: None,
+                  volume_identity,
+                  modified_at: file_metrics::modified_at(&metadata),
+              });'''
+          if old_dir not in text:
+              raise SystemExit('directory branch marker not found')
+          text = text.replace(old_dir, new_dir, 1)
+          root_marker = '''    if !root.is_dir() {
+              return Err("スキャン対象はフォルダである必要があります".to_owned());
+          }
+          let started = Instant::now();'''
+          root_replacement = '''    if !root.is_dir() {
+              return Err("スキャン対象はフォルダである必要があります".to_owned());
+          }
+          let root_metadata = fs::symlink_metadata(&root)
+              .map_err(|error| format!("スキャン対象のボリュームを確認できません: {error}"))?;
+          let root_volume_identity = file_metrics::volume_identity(&root, &root_metadata);
+          let started = Instant::now();'''
+          if root_marker not in text:
+              raise SystemExit('root marker not found')
+          text = text.replace(root_marker, root_replacement, 1)
+          text = text.replace(
+              'let item = scan_entry(&child_path, &mut control, &mut progress, &mut seen_files)?;',
+              '''let item = scan_entry(
+                  &child_path,
+                  root_volume_identity.as_deref(),
+                  &mut control,
+                  &mut progress,
+                  &mut seen_files,
+              )?;''',
+              1,
+          )
+          test_marker = '''    #[test]
+              fn reports_per_file_metadata() {'''
+          test_addition = '''    #[test]
+              fn detects_volume_boundaries() {
+                  assert!(crosses_volume(Some("root"), Some("other")));
+                  assert!(!crosses_volume(Some("root"), Some("root")));
+                  assert!(!crosses_volume(Some("root"), None));
+              }
+
+              #[cfg(unix)]
+              #[test]
+              fn does_not_follow_symbolic_links() {
+                  use std::os::unix::fs::symlink;
+
+                  let root = temporary_directory("symlink");
+                  let outside = temporary_directory("outside");
+                  fs::write(outside.join("hidden.bin"), [0_u8; 16]).unwrap();
+                  symlink(&outside, root.join("linked")).unwrap();
+                  let summary = scan_folder_path(&root).unwrap();
+                  assert_eq!(summary.file_count, 0);
+                  assert_eq!(summary.total_size_bytes, 0);
+                  assert_eq!(summary.skipped_count, 1);
+                  fs::remove_dir_all(root).unwrap();
+                  fs::remove_dir_all(outside).unwrap();
+              }
+
+              #[test]
+              fn reports_per_file_metadata() {'''
+          if test_marker not in text:
+              raise SystemExit('test marker not found')
+          scanner.write_text(text.replace(test_marker, test_addition, 1))
+
+          storage = Path('src-tauri/src/storage.rs')
+          text = storage.read_text()
+          old = 'if progress.file_count == 0 && progress.directory_count == 0 {'
+          new = '''if progress.file_count == 0
+              && progress.directory_count == 0
+              && progress.skipped_count == 0
+          {'''
+          if old not in text:
+              raise SystemExit('storage filter marker not found')
+          storage.write_text(text.replace(old, new, 1))
+
+          progress = Path('docs/PHASE4_PROGRESS.md')
+          text = progress.read_text()
+          text = text.replace('- [ ] シンボリックリンク／ジャンクション／リパースポイントの分類', '- [x] シンボリックリンク／ジャンクション／リパースポイントを非追跡で除外')
+          text = text.replace('- [ ] 別ボリューム境界の既定動作', '- [x] 別ボリューム境界を既定で自動横断しない')
+          progress.write_text(text)
+
+          accuracy = Path('docs/FILESYSTEM_ACCURACY.md')
+          text = accuracy.read_text()
+          text += '''
+
+## Filesystem boundaries
+
+- シンボリックリンクは追跡せず、除外項目として記録する。
+- Windowsのジャンクションを含むリパースポイントは属性で検出し、追跡しない。
+- スキャン開始時のボリュームIDを基準にし、異なるボリュームIDのディレクトリへは降りない。
+- ボリュームIDを取得できない環境では推測で除外せず、従来どおり読み取り可能な範囲を走査する。
+- 非追跡項目と別ボリューム境界は`skipped_count`へ含め、SQLiteには`other`として保存する。
+'''
+          accuracy.write_text(text)
+          PY
+          cargo fmt --manifest-path src-tauri/Cargo.toml
+      - name: Commit implementation
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src-tauri/src/file_metrics.rs src-tauri/src/scanner.rs src-tauri/src/storage.rs docs/PHASE4_PROGRESS.md docs/FILESYSTEM_ACCURACY.md
+          git commit -m "feat: enforce link and volume boundaries"
+          git push
