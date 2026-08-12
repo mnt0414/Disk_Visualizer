@@ -19,20 +19,29 @@ jobs:
         with:
           node-version: 22
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
       - run: npm install --no-audit --no-fund
       - run: npm run build
-      - name: Capture Rust test output
+      - name: Capture macOS sequence output
         shell: bash
         run: |
           set +e
-          cargo test --manifest-path src-tauri/Cargo.toml > macos-test.log 2>&1
+          {
+            cargo test --manifest-path src-tauri/Cargo.toml
+            test_status=$?
+            if [ "$test_status" -ne 0 ]; then
+              exit "$test_status"
+            fi
+            npm run tauri build -- --debug --target aarch64-apple-darwin
+          } > macos-sequence.log 2>&1
           status=$?
-          cat macos-test.log
+          cat macos-sequence.log
           if [ "$status" -ne 0 ]; then
             git config user.name github-actions[bot]
             git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-            git add macos-test.log
-            git commit -m "ci: capture macOS test failure"
+            git add macos-sequence.log
+            git commit -m "ci: capture macOS sequence failure"
             git push
           fi
           exit 0
