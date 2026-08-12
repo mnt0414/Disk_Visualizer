@@ -1,0 +1,189 @@
+name: Phase 4 volume boundary
+
+on:
+  push:
+    branches: [feat/volume-boundary-policy]
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/volume-boundary-policy
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Implement volume boundary policy
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          metrics = Path('src-tauri/src/file_metrics.rs')
+          text = metrics.read_text()
+          marker = '#[cfg(unix)]\npub fn collect(_path: &Path, metadata: &Metadata) -> FileMetrics {'
+          helper = '''#[cfg(unix)]
+          pub fn volume_identity(_path: &Path, metadata: &Metadata) -> Option<String> {
+              use std::os::unix::fs::MetadataExt;
+              Some(metadata.dev().to_string())
+          }
+
+          #[cfg(windows)]
+          pub fn volume_identity(path: &Path, _metadata: &Metadata) -> Option<String> {
+              file_identity(path).map(|(_, volume)| volume)
+          }
+
+          #[cfg(not(any(unix, windows)))]
+          pub fn volume_identity(_path: &Path, _metadata: &Metadata) -> Option<String> {
+              None
+          }
+
+          #[cfg(unix)]
+          pub fn collect(_path: &Path, metadata: &Metadata) -> FileMetrics {'''
+          if text.count(marker) != 1:
+              raise SystemExit('file metrics volume marker mismatch')
+          metrics.write_text(text.replace(marker, helper, 1))
+
+          scanner = Path('src-tauri/src/scanner.rs')
+          text = scanner.read_text()
+          signature = '''fn scan_entry<C, P>(
+              path: &Path,
+              control: &mut C,'''
+          replacement = '''fn crosses_volume(root: Option<&str>, current: Option<&str>) -> bool {
+              root.zip(current).is_some_and(|(root, current)| root != current)
+          }
+
+          fn scan_entry<C, P>(
+              path: &Path,
+              root_volume_identity: Option<&str>,
+              control: &mut C,'''
+          if text.count(signature) != 1:
+              raise SystemExit('scan entry signature marker mismatch')
+          text = text.replace(signature, replacement, 1)
+
+          directory = '''        } else if metadata.is_dir() {
+              totals.directories = totals.directories.saturating_add(1);
+              progress(&ScanProgress {
+                  path: path.clone(),
+                  file_count: 0,
+                  directory_count: 1,
+                  skipped_count: 0,
+                  counted_size_bytes: 0,
+                  logical_size_bytes: 0,
+                  allocated_size_bytes: None,
+                  file_identity: None,
+                  volume_identity: None,
+                  modified_at: file_metrics::modified_at(&metadata),
+              });'''
+          guarded = '''        } else if metadata.is_dir() {
+              let volume_identity = file_metrics::volume_identity(&path, &metadata);
+              if crosses_volume(root_volume_identity, volume_identity.as_deref()) {
+                  totals.skipped = totals.skipped.saturating_add(1);
+                  progress(&ScanProgress {
+                      path,
+                      file_count: 0,
+                      directory_count: 0,
+                      skipped_count: 1,
+                      counted_size_bytes: 0,
+                      logical_size_bytes: 0,
+                      allocated_size_bytes: None,
+                      file_identity: None,
+                      volume_identity,
+                      modified_at: file_metrics::modified_at(&metadata),
+                  });
+                  continue;
+              }
+              totals.directories = totals.directories.saturating_add(1);
+              progress(&ScanProgress {
+                  path: path.clone(),
+                  file_count: 0,
+                  directory_count: 1,
+                  skipped_count: 0,
+                  counted_size_bytes: 0,
+                  logical_size_bytes: 0,
+                  allocated_size_bytes: None,
+                  file_identity: None,
+                  volume_identity,
+                  modified_at: file_metrics::modified_at(&metadata),
+              });'''
+          if text.count(directory) != 1:
+              raise SystemExit('directory branch marker mismatch')
+          text = text.replace(directory, guarded, 1)
+
+          root = '''    if !root.is_dir() {
+              return Err("スキャン対象はフォルダである必要があります".to_owned());
+          }
+              let started = Instant::now();'''
+          root_replacement = '''    if !root.is_dir() {
+              return Err("スキャン対象はフォルダである必要があります".to_owned());
+          }
+              let root_metadata = fs::symlink_metadata(&root)
+                  .map_err(|error| format!("スキャン対象のボリュームを確認できません: {error}"))?;
+              let root_volume_identity = file_metrics::volume_identity(&root, &root_metadata);
+              let started = Instant::now();'''
+          if text.count(root) != 1:
+              raise SystemExit('root volume marker mismatch')
+          text = text.replace(root, root_replacement, 1)
+
+          call = 'let item = scan_entry(&child_path, &mut control, &mut progress, &mut seen_files)?;'
+          call_replacement = '''let item = scan_entry(
+                  &child_path,
+                  root_volume_identity.as_deref(),
+                  &mut control,
+                  &mut progress,
+                  &mut seen_files,
+              )?;'''
+          if text.count(call) != 1:
+              raise SystemExit('scan entry call marker mismatch')
+          text = text.replace(call, call_replacement, 1)
+
+          test_marker = '''    #[cfg(unix)]
+              #[test]
+              fn does_not_follow_symbolic_links() {'''
+          test = '''    #[test]
+              fn detects_volume_identity_changes() {
+                  assert!(crosses_volume(Some("root"), Some("other")));
+                  assert!(!crosses_volume(Some("root"), Some("root")));
+                  assert!(!crosses_volume(Some("root"), None));
+              }
+
+              #[cfg(unix)]
+              #[test]
+              fn does_not_follow_symbolic_links() {'''
+          if text.count(test_marker) != 1:
+              raise SystemExit('volume test marker mismatch')
+          scanner.write_text(text.replace(test_marker, test, 1))
+
+          progress = Path('docs/PHASE4_PROGRESS.md')
+          text = progress.read_text()
+          old = '- [ ] 別ボリューム境界の既定動作'
+          new = '- [x] 別ボリューム境界を既定で自動横断しない'
+          if text.count(old) != 1:
+              raise SystemExit('progress volume marker mismatch')
+          progress.write_text(text.replace(old, new, 1))
+
+          accuracy = Path('docs/FILESYSTEM_ACCURACY.md')
+          text = accuracy.read_text()
+          text += '''
+
+## Volume boundary policy
+
+- スキャン開始時にルートのボリュームIDを取得する。
+- ディレクトリのボリュームIDがルートと異なる場合、その配下へは降りない。
+- ボリュームIDを取得できない環境では推測で除外せず、読み取り可能な範囲を走査する。
+- 境界で除外したディレクトリは`skipped_count`へ計上する。
+'''
+          accuracy.write_text(text)
+          PY
+          cargo fmt --manifest-path src-tauri/Cargo.toml
+      - name: Commit implementation
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src-tauri/src/file_metrics.rs src-tauri/src/scanner.rs docs/PHASE4_PROGRESS.md docs/FILESYSTEM_ACCURACY.md
+          git commit -m "feat: prevent automatic cross-volume traversal"
+          git push
