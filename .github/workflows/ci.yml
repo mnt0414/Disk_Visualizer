@@ -6,45 +6,9 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  boundary-implementation:
-    if: github.head_ref == 'feat/link-and-volume-boundaries' && github.actor != 'github-actions[bot]'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: feat/link-and-volume-boundaries
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Apply implementation script
-        run: |
-          set +e
-          {
-            sed -n "/python - <<'PY'/,/^          PY$/p" .github/workflows/phase4-boundary-implementation.yml | sed '1d;$d;s/^          //' > /tmp/implement-boundaries.py
-            test -s /tmp/implement-boundaries.py
-            python /tmp/implement-boundaries.py
-            cargo fmt --manifest-path src-tauri/Cargo.toml
-          } > boundary-implementation.log 2>&1
-          echo $? > /tmp/boundary-status
-          exit 0
-      - name: Commit implementation or diagnostics
-        run: |
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          if [ "$(cat /tmp/boundary-status)" -ne 0 ]; then
-            git add -f boundary-implementation.log
-            git commit -m "ci: capture boundary implementation failure"
-            git push
-            exit 0
-          fi
-          rm boundary-implementation.log
-          git add src-tauri/src/file_metrics.rs src-tauri/src/scanner.rs src-tauri/src/storage.rs docs/PHASE4_PROGRESS.md docs/FILESYSTEM_ACCURACY.md
-          git commit -m "feat: enforce link and volume boundaries"
-          git push
-
   frontend:
     runs-on: ubuntu-latest
     timeout-minutes: 20
