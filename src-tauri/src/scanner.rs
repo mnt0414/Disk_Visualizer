@@ -454,9 +454,10 @@ mod tests {
         fs::write(&file, [0_u8; 16]).unwrap();
         let mut recorded = Vec::new();
         scan_folder_path_controlled(&root, || true, |entry| recorded.push(entry.clone())).unwrap();
+        let canonical_file = file.canonicalize().unwrap();
         let entry = recorded
             .iter()
-            .find(|entry| entry.path == file)
+            .find(|entry| entry.path == canonical_file)
             .expect("file metadata should be reported");
         assert_eq!(entry.logical_size_bytes, 16);
         assert!(entry.allocated_size_bytes.is_some());
