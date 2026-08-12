@@ -82,4 +82,6 @@ jobs:
           NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: 20000
           NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: 120000
           NPM_CONFIG_FETCH_TIMEOUT: 300000
+      - name: Run platform Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
       - run: npm run tauri build -- --debug --target ${{ matrix.target }}
