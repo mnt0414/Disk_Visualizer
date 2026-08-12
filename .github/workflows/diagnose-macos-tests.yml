@@ -27,15 +27,13 @@ jobs:
         shell: bash
         run: |
           set +e
-          {
-            cargo test --manifest-path src-tauri/Cargo.toml
-            test_status=$?
-            if [ "$test_status" -ne 0 ]; then
-              exit "$test_status"
-            fi
-            npm run tauri build -- --debug --target aarch64-apple-darwin
-          } > macos-sequence.log 2>&1
+          : > macos-sequence.log
+          cargo test --manifest-path src-tauri/Cargo.toml >> macos-sequence.log 2>&1
           status=$?
+          if [ "$status" -eq 0 ]; then
+            npm run tauri build -- --debug --target aarch64-apple-darwin >> macos-sequence.log 2>&1
+            status=$?
+          fi
           cat macos-sequence.log
           if [ "$status" -ne 0 ]; then
             git config user.name github-actions[bot]
