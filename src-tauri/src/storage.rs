@@ -30,6 +30,7 @@ struct IndexedEntry {
     parent_path: Option<String>,
     relative_path: String,
     entry_type: &'static str,
+    counted_size: u64,
     logical_size: u64,
     allocated_size: Option<u64>,
     file_count: u64,
@@ -169,7 +170,7 @@ impl ScanRepository {
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|e| e.to_string())?;
         {
-            let mut statement=transaction.prepare_cached("INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,allocated_size,file_count,directory_count,is_directory,file_identity,volume_identity,modified_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?7,?8,?9,?10,?11,?12,?13,?14)").map_err(|e|e.to_string())?;
+            let mut statement=transaction.prepare_cached("INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,allocated_size,file_count,directory_count,is_directory,file_identity,volume_identity,modified_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)").map_err(|e|e.to_string())?;
             for entry in entries {
                 statement
                     .execute(params![
@@ -179,6 +180,7 @@ impl ScanRepository {
                         entry.parent_path,
                         entry.relative_path,
                         entry.entry_type,
+                        to_i64(entry.counted_size, "集計サイズ")?,
                         to_i64(entry.logical_size, "論理サイズ")?,
                         optional_to_i64(entry.allocated_size, "割り当て済みサイズ")?,
                         to_i64(entry.file_count, "ファイル数")?,
@@ -283,6 +285,7 @@ impl StreamingScanWriter {
             } else {
                 "file"
             },
+            counted_size: progress.counted_size_bytes,
             logical_size: progress.logical_size_bytes,
             allocated_size: progress.allocated_size_bytes,
             file_count: progress.file_count,
@@ -415,6 +418,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, (1024, 4096, "42".to_owned(), "7".to_owned(), 1234));
+        let _ = std::fs::remove_file(repository.path());
+    }
+    #[test]
+    fn counted_entry_sizes_match_completed_session_total() {
+        let repository = repository("hard-link-counted-size");
+        let writer = repository.begin_stream("/tmp/sample").unwrap();
+        writer.record(&progress(PathBuf::from("/tmp/sample/original.bin")));
+        let mut duplicate = progress(PathBuf::from("/tmp/sample/linked.bin"));
+        duplicate.counted_size_bytes = 0;
+        writer.record(&duplicate);
+        let mut completed = summary(2);
+        completed.total_size_bytes = 1024;
+        writer.complete(&completed).unwrap();
+        let stored: (i64, i64, i64, i64) = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT total_size_bytes FROM scan_sessions LIMIT 1),SUM(size_bytes),SUM(logical_size),COUNT(*) FROM scan_entries",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (1024, 1024, 2048, 2));
         let _ = std::fs::remove_file(repository.path());
     }
     #[test]
