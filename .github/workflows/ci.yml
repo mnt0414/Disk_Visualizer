@@ -21,13 +21,26 @@ jobs:
           components: rustfmt
       - name: Apply implementation script
         run: |
-          awk '/python - <<.PY./ { capture=1; next } /^          PY$/ { capture=0 } capture { sub(/^          /, ""); print }' .github/workflows/phase4-boundary-implementation.yml > /tmp/implement-boundaries.py
-          python /tmp/implement-boundaries.py
-          cargo fmt --manifest-path src-tauri/Cargo.toml
-      - name: Commit implementation
+          set +e
+          {
+            sed -n "/python - <<'PY'/,/^          PY$/p" .github/workflows/phase4-boundary-implementation.yml | sed '1d;$d;s/^          //' > /tmp/implement-boundaries.py
+            test -s /tmp/implement-boundaries.py
+            python /tmp/implement-boundaries.py
+            cargo fmt --manifest-path src-tauri/Cargo.toml
+          } > boundary-implementation.log 2>&1
+          echo $? > /tmp/boundary-status
+          exit 0
+      - name: Commit implementation or diagnostics
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          if [ "$(cat /tmp/boundary-status)" -ne 0 ]; then
+            git add -f boundary-implementation.log
+            git commit -m "ci: capture boundary implementation failure"
+            git push
+            exit 0
+          fi
+          rm boundary-implementation.log
           git add src-tauri/src/file_metrics.rs src-tauri/src/scanner.rs src-tauri/src/storage.rs docs/PHASE4_PROGRESS.md docs/FILESYSTEM_ACCURACY.md
           git commit -m "feat: enforce link and volume boundaries"
           git push
