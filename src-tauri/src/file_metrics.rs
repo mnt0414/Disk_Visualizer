@@ -22,6 +22,22 @@ pub fn modified_at(metadata: &Metadata) -> Option<i64> {
     i64::try_from(seconds).ok()
 }
 
+pub fn is_non_followed_link(metadata: &Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 #[cfg(unix)]
 pub fn collect(_path: &Path, metadata: &Metadata) -> FileMetrics {
     use std::os::unix::fs::MetadataExt;

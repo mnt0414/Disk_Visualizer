@@ -142,7 +142,7 @@ where
                 continue;
             }
         };
-        if metadata.file_type().is_symlink() {
+        if file_metrics::is_non_followed_link(&metadata) {
             totals.skipped = totals.skipped.saturating_add(1);
             progress(&ScanProgress {
                 path,
@@ -389,6 +389,23 @@ mod tests {
         assert_eq!(summary.file_count, 2);
         assert_eq!(summary.hard_link_duplicate_count, 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn does_not_follow_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_directory("symbolic-link");
+        let outside = temporary_directory("symbolic-link-target");
+        fs::write(outside.join("outside.bin"), [0_u8; 16]).unwrap();
+        symlink(&outside, root.join("linked-directory")).unwrap();
+        let summary = scan_folder_path(&root).unwrap();
+        assert_eq!(summary.total_size_bytes, 0);
+        assert_eq!(summary.file_count, 0);
+        assert_eq!(summary.skipped_count, 1);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
