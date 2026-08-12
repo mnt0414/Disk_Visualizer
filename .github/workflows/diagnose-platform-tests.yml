@@ -21,18 +21,21 @@ jobs:
           from pathlib import Path
           path = Path('src-tauri/src/scanner.rs')
           text = path.read_text()
-          old = '''        let entry = recorded
-              .iter()
-              .find(|entry| entry.path == file)
-              .expect("file metadata should be reported");'''
-          new = '''        let canonical_file = file.canonicalize().unwrap();
-          let entry = recorded
-              .iter()
-              .find(|entry| entry.path == canonical_file)
-              .expect("file metadata should be reported");'''
-          if text.count(old) != 1:
+          anchor = '        let entry = recorded\n'
+          comparison = '.find(|entry| entry.path == file)'
+          if text.count(anchor) != 1 or text.count(comparison) != 1:
               raise SystemExit('metadata test marker mismatch')
-          path.write_text(text.replace(old, new, 1))
+          text = text.replace(
+              anchor,
+              '        let canonical_file = file.canonicalize().unwrap();\n' + anchor,
+              1,
+          )
+          text = text.replace(
+              comparison,
+              '.find(|entry| entry.path == canonical_file)',
+              1,
+          )
+          path.write_text(text)
           PY
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
