@@ -24,7 +24,6 @@ jobs:
           from pathlib import Path
           path = Path('src-tauri/src/storage.rs')
           text = path.read_text()
-
           replacements = [
               (
                   '    logical_size: u64,\n    allocated_size: Option<u64>,',
@@ -47,34 +46,34 @@ jobs:
               if text.count(old) != 1:
                   raise SystemExit(f'marker mismatch: {old[:80]}')
               text = text.replace(old, new, 1)
-
-          marker = '''    #[test]
-          fn buffer_never_retains_a_full_batch() {'''
-          test = '''    #[test]
-          fn counted_entry_sizes_match_completed_session_total() {
-              let repository = repository("hard-link-counted-size");
-              let writer = repository.begin_stream("/tmp/sample").unwrap();
-              writer.record(&progress(PathBuf::from("/tmp/sample/original.bin")));
-              let mut duplicate = progress(PathBuf::from("/tmp/sample/linked.bin"));
-              duplicate.counted_size_bytes = 0;
-              writer.record(&duplicate);
-              let mut completed = summary(2);
-              completed.total_size_bytes = 1024;
-              writer.complete(&completed).unwrap();
-              let stored: (i64, i64, i64, i64) = repository
-                  .connection()
-                  .unwrap()
-                  .query_row(
-                      "SELECT (SELECT total_size_bytes FROM scan_sessions LIMIT 1),SUM(size_bytes),SUM(logical_size),COUNT(*) FROM scan_entries",
-                      [],
-                      |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                  )
-                  .unwrap();
-              assert_eq!(stored, (1024, 1024, 2048, 2));
-              let _ = std::fs::remove_file(repository.path());
-          }
-          #[test]
-          fn buffer_never_retains_a_full_batch() {'''
+          marker = '    #[test]\n    fn buffer_never_retains_a_full_batch() {'
+          test = (
+              '    #[test]\n'
+              '    fn counted_entry_sizes_match_completed_session_total() {\n'
+              '        let repository = repository("hard-link-counted-size");\n'
+              '        let writer = repository.begin_stream("/tmp/sample").unwrap();\n'
+              '        writer.record(&progress(PathBuf::from("/tmp/sample/original.bin")));\n'
+              '        let mut duplicate = progress(PathBuf::from("/tmp/sample/linked.bin"));\n'
+              '        duplicate.counted_size_bytes = 0;\n'
+              '        writer.record(&duplicate);\n'
+              '        let mut completed = summary(2);\n'
+              '        completed.total_size_bytes = 1024;\n'
+              '        writer.complete(&completed).unwrap();\n'
+              '        let stored: (i64, i64, i64, i64) = repository\n'
+              '            .connection()\n'
+              '            .unwrap()\n'
+              '            .query_row(\n'
+              '                "SELECT (SELECT total_size_bytes FROM scan_sessions LIMIT 1),SUM(size_bytes),SUM(logical_size),COUNT(*) FROM scan_entries",\n'
+              '                [],\n'
+              '                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),\n'
+              '            )\n'
+              '            .unwrap();\n'
+              '        assert_eq!(stored, (1024, 1024, 2048, 2));\n'
+              '        let _ = std::fs::remove_file(repository.path());\n'
+              '    }\n'
+              '    #[test]\n'
+              '    fn buffer_never_retains_a_full_batch() {'
+          )
           if text.count(marker) != 1:
               raise SystemExit('test insertion marker mismatch')
           path.write_text(text.replace(marker, test, 1))
