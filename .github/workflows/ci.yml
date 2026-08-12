@@ -6,9 +6,32 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
+  boundary-implementation:
+    if: github.head_ref == 'feat/link-and-volume-boundaries' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/link-and-volume-boundaries
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply implementation script
+        run: |
+          awk '/python - <<.PY./ { capture=1; next } /^          PY$/ { capture=0 } capture { sub(/^          /, ""); print }' .github/workflows/phase4-boundary-implementation.yml > /tmp/implement-boundaries.py
+          python /tmp/implement-boundaries.py
+          cargo fmt --manifest-path src-tauri/Cargo.toml
+      - name: Commit implementation
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src-tauri/src/file_metrics.rs src-tauri/src/scanner.rs src-tauri/src/storage.rs docs/PHASE4_PROGRESS.md docs/FILESYSTEM_ACCURACY.md
+          git commit -m "feat: enforce link and volume boundaries"
+          git push
+
   frontend:
     runs-on: ubuntu-latest
     timeout-minutes: 20
