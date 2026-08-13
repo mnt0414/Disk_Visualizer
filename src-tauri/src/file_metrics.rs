@@ -136,9 +136,7 @@ fn windows_snapshot(path: &Path) -> Option<WindowsSnapshot> {
     let allocated_size = if standard_succeeded == 0 {
         None
     } else {
-        // SAFETY: `AllocationSize` was initialized by the successful API call.
-        let allocation_size = unsafe { standard.AllocationSize.QuadPart };
-        u64::try_from(allocation_size).ok()
+        u64::try_from(standard.AllocationSize).ok()
     };
     let modified_at = file.metadata().ok().and_then(|value| modified_at(&value));
     Some(WindowsSnapshot {
