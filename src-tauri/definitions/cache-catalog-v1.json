@@ -1,0 +1,83 @@
+{
+  "catalogVersion": "2026.08.1",
+  "definitions": [
+    {
+      "id": "safari.macos.web-cache",
+      "definitionVersion": 1,
+      "platform": "macos",
+      "applicationName": "Safari",
+      "versionConstraint": "*",
+      "category": "browserCache",
+      "path": { "root": "home", "relativePath": "Library/Caches/com.apple.Safari", "source": "fixed" },
+      "confidence": "high",
+      "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
+      "regenerable": true,
+      "cleanupImpact": "browserMayRebuildCacheAndLoadSlower"
+    },
+    {
+      "id": "chrome.macos.cache",
+      "definitionVersion": 1,
+      "platform": "macos",
+      "applicationName": "Google Chrome",
+      "versionConstraint": "*",
+      "category": "browserCache",
+      "path": { "root": "home", "relativePath": "Library/Caches/Google/Chrome", "source": "fixed" },
+      "confidence": "high",
+      "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
+      "regenerable": true,
+      "cleanupImpact": "browserMayRebuildCacheAndLoadSlower"
+    },
+    {
+      "id": "firefox.macos.cache",
+      "definitionVersion": 1,
+      "platform": "macos",
+      "applicationName": "Firefox",
+      "versionConstraint": "*",
+      "category": "browserCache",
+      "path": { "root": "home", "relativePath": "Library/Caches/Firefox/Profiles", "source": "fixed" },
+      "confidence": "high",
+      "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
+      "regenerable": true,
+      "cleanupImpact": "browserMayRebuildCacheAndLoadSlower"
+    },
+    {
+      "id": "chrome.windows.default-cache",
+      "definitionVersion": 1,
+      "platform": "windows",
+      "applicationName": "Google Chrome",
+      "versionConstraint": "*",
+      "category": "browserCache",
+      "path": { "root": "localAppData", "relativePath": "Google/Chrome/User Data/Default/Cache", "source": "fixed" },
+      "confidence": "high",
+      "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
+      "regenerable": true,
+      "cleanupImpact": "browserMayRebuildCacheAndLoadSlower"
+    },
+    {
+      "id": "edge.windows.default-cache",
+      "definitionVersion": 1,
+      "platform": "windows",
+      "applicationName": "Microsoft Edge",
+      "versionConstraint": "*",
+      "category": "browserCache",
+      "path": { "root": "localAppData", "relativePath": "Microsoft/Edge/User Data/Default/Cache", "source": "fixed" },
+      "confidence": "high",
+      "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
+      "regenerable": true,
+      "cleanupImpact": "browserMayRebuildCacheAndLoadSlower"
+    },
+    {
+      "id": "firefox.windows.cache",
+      "definitionVersion": 1,
+      "platform": "windows",
+      "applicationName": "Firefox",
+      "versionConstraint": "*",
+      "category": "browserCache",
+      "path": { "root": "localAppData", "relativePath": "Mozilla/Firefox/Profiles", "source": "fixed" },
+      "confidence": "high",
+      "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
+      "regenerable": true,
+      "cleanupImpact": "browserMayRebuildCacheAndLoadSlower"
+    }
+  ]
+}

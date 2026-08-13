@@ -1,8 +1,10 @@
+mod cache_catalog;
 mod file_metrics;
 mod scan_jobs;
 mod scanner;
 mod storage;
 
+use cache_catalog::CacheCatalog;
 use scan_jobs::{ScanJobSnapshot, ScanManager};
 use scanner::ScanSummary;
 use serde::Serialize;
@@ -25,6 +27,10 @@ fn get_app_info() -> AppInfo {
         platform: std::env::consts::OS,
         architecture: std::env::consts::ARCH,
     }
+}
+#[tauri::command]
+fn get_cache_catalog() -> Result<CacheCatalog, String> {
+    Ok(cache_catalog::bundled_catalog()?.clone())
 }
 #[tauri::command]
 fn scan_folder(path: String) -> Result<ScanSummary, String> {
@@ -75,6 +81,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             get_app_info,
+            get_cache_catalog,
             scan_folder,
             start_scan,
             get_scan_status,
@@ -96,5 +103,11 @@ mod tests {
         let info = get_app_info();
         assert_eq!(info.name, "Disk Visualizer");
         assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+    }
+    #[test]
+    fn exposes_bundled_cache_catalog() {
+        let catalog = get_cache_catalog().unwrap();
+        assert!(!catalog.catalog_version.is_empty());
+        assert!(!catalog.definitions.is_empty());
     }
 }
