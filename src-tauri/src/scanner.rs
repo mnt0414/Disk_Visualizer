@@ -178,7 +178,9 @@ where
                 totals.hard_link_duplicates = totals.hard_link_duplicates.saturating_add(1);
             } else {
                 totals.size = totals.size.saturating_add(metadata.len());
-                totals.allocated = totals.allocated.saturating_add(metrics.allocated_size);
+                if let Some(allocated_size) = metrics.allocated_size {
+                    totals.allocated = totals.allocated.saturating_add(allocated_size);
+                }
                 totals.sparse_files = totals
                     .sparse_files
                     .saturating_add(u64::from(metrics.is_sparse));
@@ -194,7 +196,7 @@ where
                 skip_reason: None,
                 counted_size_bytes: if duplicate { 0 } else { metadata.len() },
                 logical_size_bytes: metadata.len(),
-                allocated_size_bytes: Some(metrics.allocated_size),
+                allocated_size_bytes: metrics.allocated_size,
                 file_identity: metrics.file_identity,
                 volume_identity: metrics.volume_identity,
                 modified_at: metrics.modified_at,
