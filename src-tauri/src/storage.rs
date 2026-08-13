@@ -35,6 +35,8 @@ struct IndexedEntry {
     allocated_size: Option<u64>,
     file_count: u64,
     directory_count: u64,
+    skipped_count: u64,
+    skip_reason: Option<&'static str>,
     is_directory: bool,
     file_identity: Option<String>,
     volume_identity: Option<String>,
@@ -92,17 +94,23 @@ impl ScanRepository {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
         match version {
-            0 => Self::create_v3(&connection)?,
+            0 => Self::create_v4(&connection)?,
             1 => {
                 self.consistent_backup(&connection, "sqlite3.v1-backup")?;
                 Self::migrate_v1_to_v2(&connection)?;
-                Self::migrate_v2_to_v3(&connection)?
+                Self::migrate_v2_to_v3(&connection)?;
+                Self::migrate_v3_to_v4(&connection)?
             }
             2 => {
                 self.consistent_backup(&connection, "sqlite3.v2-backup")?;
-                Self::migrate_v2_to_v3(&connection)?
+                Self::migrate_v2_to_v3(&connection)?;
+                Self::migrate_v3_to_v4(&connection)?
             }
-            3 => {}
+            3 => {
+                self.consistent_backup(&connection, "sqlite3.v3-backup")?;
+                Self::migrate_v3_to_v4(&connection)?
+            }
+            4 => {}
             other => return Err(format!("未対応のスキャン履歴バージョンです: {other}")),
         }
         let check: String = connection
@@ -135,14 +143,17 @@ impl ScanRepository {
         }
         Ok(())
     }
-    fn create_v3(connection: &Connection) -> Result<(), String> {
-        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,root_path TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('in_progress','complete','interrupted','failed')),total_size_bytes INTEGER NOT NULL DEFAULT 0,file_count INTEGER NOT NULL DEFAULT 0,directory_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,elapsed_milliseconds INTEGER NOT NULL DEFAULT 0,started_at INTEGER NOT NULL,completed_at INTEGER); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,parent_path TEXT,relative_path TEXT NOT NULL,entry_type TEXT NOT NULL CHECK(entry_type IN ('file','directory','other')),size_bytes INTEGER NOT NULL,logical_size INTEGER NOT NULL,allocated_size INTEGER,file_count INTEGER NOT NULL,directory_count INTEGER NOT NULL,skipped_count INTEGER NOT NULL DEFAULT 0,is_directory INTEGER NOT NULL,file_identity TEXT,volume_identity TEXT,modified_at INTEGER); CREATE INDEX scan_entries_scan_size ON scan_entries(scan_id,size_bytes DESC); CREATE INDEX scan_entries_scan_parent ON scan_entries(scan_id,parent_path); PRAGMA user_version=3;").map_err(|e|format!("スキャン履歴を初期化できません: {e}"))
+    fn create_v4(connection: &Connection) -> Result<(), String> {
+        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,root_path TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('in_progress','complete','interrupted','failed')),total_size_bytes INTEGER NOT NULL DEFAULT 0,file_count INTEGER NOT NULL DEFAULT 0,directory_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,elapsed_milliseconds INTEGER NOT NULL DEFAULT 0,started_at INTEGER NOT NULL,completed_at INTEGER); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,parent_path TEXT,relative_path TEXT NOT NULL,entry_type TEXT NOT NULL CHECK(entry_type IN ('file','directory','other')),size_bytes INTEGER NOT NULL,logical_size INTEGER NOT NULL,allocated_size INTEGER,file_count INTEGER NOT NULL,directory_count INTEGER NOT NULL,skipped_count INTEGER NOT NULL DEFAULT 0,is_directory INTEGER NOT NULL,file_identity TEXT,volume_identity TEXT,modified_at INTEGER,skip_reason TEXT); CREATE INDEX scan_entries_scan_size ON scan_entries(scan_id,size_bytes DESC); CREATE INDEX scan_entries_scan_parent ON scan_entries(scan_id,parent_path); PRAGMA user_version=4;").map_err(|e|format!("スキャン履歴を初期化できません: {e}"))
     }
     fn migrate_v1_to_v2(connection: &Connection) -> Result<(), String> {
         connection.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE; ALTER TABLE scan_entries RENAME TO scan_entries_v1; ALTER TABLE scan_sessions RENAME TO scan_sessions_v1; CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,root_path TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('in_progress','complete','interrupted','failed')),total_size_bytes INTEGER NOT NULL DEFAULT 0,file_count INTEGER NOT NULL DEFAULT 0,directory_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,elapsed_milliseconds INTEGER NOT NULL DEFAULT 0,started_at INTEGER NOT NULL,completed_at INTEGER); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,size_bytes INTEGER NOT NULL,file_count INTEGER NOT NULL,directory_count INTEGER NOT NULL,skipped_count INTEGER NOT NULL DEFAULT 0,is_directory INTEGER NOT NULL); INSERT INTO scan_sessions (id,root_path,status,total_size_bytes,file_count,directory_count,skipped_count,elapsed_milliseconds,started_at,completed_at) SELECT id,root_path,'complete',total_size_bytes,file_count,directory_count,skipped_count,elapsed_milliseconds,completed_at,completed_at FROM scan_sessions_v1; INSERT INTO scan_entries SELECT * FROM scan_entries_v1; DROP TABLE scan_entries_v1; DROP TABLE scan_sessions_v1; CREATE INDEX scan_entries_scan_size ON scan_entries(scan_id,size_bytes DESC); PRAGMA user_version=2; COMMIT; PRAGMA foreign_keys=ON;").map_err(|e|format!("スキャン履歴をv2へ移行できません: {e}"))
     }
     fn migrate_v2_to_v3(connection: &Connection) -> Result<(), String> {
         connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE scan_entries ADD COLUMN parent_path TEXT; ALTER TABLE scan_entries ADD COLUMN relative_path TEXT NOT NULL DEFAULT ''; ALTER TABLE scan_entries ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'other' CHECK(entry_type IN ('file','directory','other')); ALTER TABLE scan_entries ADD COLUMN logical_size INTEGER NOT NULL DEFAULT 0; ALTER TABLE scan_entries ADD COLUMN allocated_size INTEGER; ALTER TABLE scan_entries ADD COLUMN file_identity TEXT; ALTER TABLE scan_entries ADD COLUMN volume_identity TEXT; ALTER TABLE scan_entries ADD COLUMN modified_at INTEGER; UPDATE scan_entries SET relative_path=path,entry_type=CASE WHEN is_directory=1 THEN 'directory' ELSE 'file' END,logical_size=size_bytes; CREATE INDEX scan_entries_scan_parent ON scan_entries(scan_id,parent_path); PRAGMA user_version=3; COMMIT;").map_err(|e|format!("スキャン履歴をv3へ移行できません: {e}"))
+    }
+    fn migrate_v3_to_v4(connection: &Connection) -> Result<(), String> {
+        connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE scan_entries ADD COLUMN skip_reason TEXT; PRAGMA user_version=4; COMMIT;").map_err(|e|format!("スキャン履歴をv4へ移行できません: {e}"))
     }
     pub fn recover_incomplete_sessions(&self) -> Result<usize, String> {
         let connection = self.connection()?;
@@ -170,7 +181,7 @@ impl ScanRepository {
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|e| e.to_string())?;
         {
-            let mut statement=transaction.prepare_cached("INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,allocated_size,file_count,directory_count,is_directory,file_identity,volume_identity,modified_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)").map_err(|e|e.to_string())?;
+            let mut statement=transaction.prepare_cached("INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,allocated_size,file_count,directory_count,skipped_count,skip_reason,is_directory,file_identity,volume_identity,modified_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)").map_err(|e|e.to_string())?;
             for entry in entries {
                 statement
                     .execute(params![
@@ -185,6 +196,8 @@ impl ScanRepository {
                         optional_to_i64(entry.allocated_size, "割り当て済みサイズ")?,
                         to_i64(entry.file_count, "ファイル数")?,
                         to_i64(entry.directory_count, "フォルダ数")?,
+                        to_i64(entry.skipped_count, "読み飛ばし数")?,
+                        entry.skip_reason,
                         if entry.is_directory { 1_i64 } else { 0_i64 },
                         entry.file_identity,
                         entry.volume_identity,
@@ -261,7 +274,8 @@ impl ScanRepository {
 }
 impl StreamingScanWriter {
     pub(crate) fn record(&self, progress: &ScanProgress) {
-        if progress.file_count == 0 && progress.directory_count == 0 {
+        if progress.file_count == 0 && progress.directory_count == 0 && progress.skipped_count == 0
+        {
             return;
         }
         let path = &progress.path;
@@ -282,14 +296,18 @@ impl StreamingScanWriter {
                 .into_owned(),
             entry_type: if progress.directory_count > 0 {
                 "directory"
-            } else {
+            } else if progress.file_count > 0 {
                 "file"
+            } else {
+                "other"
             },
             counted_size: progress.counted_size_bytes,
             logical_size: progress.logical_size_bytes,
             allocated_size: progress.allocated_size_bytes,
             file_count: progress.file_count,
             directory_count: progress.directory_count,
+            skipped_count: progress.skipped_count,
+            skip_reason: progress.skip_reason,
             is_directory: progress.directory_count > 0,
             file_identity: progress.file_identity.clone(),
             volume_identity: progress.volume_identity.clone(),
@@ -384,6 +402,7 @@ mod tests {
             file_count: 1,
             directory_count: 0,
             skipped_count: 0,
+            skip_reason: None,
             counted_size_bytes: 1024,
             logical_size_bytes: 1024,
             allocated_size_bytes: Some(4096),
@@ -418,6 +437,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, (1024, 4096, "42".to_owned(), "7".to_owned(), 1234));
+        let _ = std::fs::remove_file(repository.path());
+    }
+    #[test]
+    fn persists_skipped_entries_with_reason() {
+        let repository = repository("skipped-entry");
+        let writer = repository.begin_stream("/tmp/sample").unwrap();
+        let mut skipped = progress(PathBuf::from("/tmp/sample/linked"));
+        skipped.file_count = 0;
+        skipped.skipped_count = 1;
+        skipped.skip_reason = Some("link_not_followed");
+        skipped.counted_size_bytes = 0;
+        skipped.logical_size_bytes = 0;
+        skipped.allocated_size_bytes = None;
+        skipped.file_identity = None;
+        writer.record(&skipped);
+        let mut completed = summary(0);
+        completed.skipped_count = 1;
+        writer.complete(&completed).unwrap();
+        let stored: (i64, String, String) = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT skipped_count,skip_reason,entry_type FROM scan_entries LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (1, "link_not_followed".to_owned(), "other".to_owned())
+        );
         let _ = std::fs::remove_file(repository.path());
     }
     #[test]
@@ -474,7 +524,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert!(path.with_extension("sqlite3.v2-backup").exists());
         let _ = std::fs::remove_file(path);
     }
