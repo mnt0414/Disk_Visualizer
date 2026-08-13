@@ -14,9 +14,9 @@ pub enum Platform {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CacheCategory {
-    BrowserCache,
-    MediaCache,
-    OperatingSystemCache,
+    Browser,
+    Media,
+    OperatingSystem,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
