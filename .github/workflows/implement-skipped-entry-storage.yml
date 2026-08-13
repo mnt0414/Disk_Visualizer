@@ -1,0 +1,175 @@
+name: Implement skipped-entry storage
+
+on:
+  push:
+    branches: [fix/phase4-persist-skipped-entries]
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/phase4-persist-skipped-entries
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Persist skipped entries and reasons
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          scanner_path = Path('src-tauri/src/scanner.rs')
+          scanner = scanner_path.read_text()
+          field = '    pub skipped_count: u64,\n    pub counted_size_bytes: u64,'
+          if scanner.count(field) != 1:
+              raise SystemExit('ScanProgress field marker mismatch')
+          scanner = scanner.replace(
+              field,
+              '    pub skipped_count: u64,\n    pub skip_reason: Option<&\'static str>,\n    pub counted_size_bytes: u64,',
+              1,
+          )
+          reasons = [
+              'metadata_unavailable',
+              'link_not_followed',
+              'different_volume',
+              'directory_unreadable',
+              'unsupported_entry_type',
+              'directory_entry_unreadable',
+          ]
+          output = []
+          in_progress = False
+          reason_index = 0
+          for line in scanner.splitlines(keepends=True):
+              if 'progress(&ScanProgress {' in line:
+                  in_progress = True
+              output.append(line)
+              if in_progress and line.strip().startswith('skipped_count:'):
+                  skipped = line.strip().startswith('skipped_count: 1')
+                  if skipped:
+                      reason = reasons[reason_index]
+                      reason_index += 1
+                      output.append(f'                    skip_reason: Some("{reason}"),\n')
+                  else:
+                      output.append('                    skip_reason: None,\n')
+              if in_progress and line.strip() == '});':
+                  in_progress = False
+          if reason_index != len(reasons):
+              raise SystemExit(f'skipped reason count mismatch: {reason_index}')
+          scanner_path.write_text(''.join(output))
+
+          storage_path = Path('src-tauri/src/storage.rs')
+          storage = storage_path.read_text()
+          replacements = [
+              (
+                  '    directory_count: u64,\n    is_directory: bool,',
+                  '    directory_count: u64,\n    skipped_count: u64,\n    skip_reason: Option<&\'static str>,\n    is_directory: bool,',
+              ),
+              (
+                  '            0 => Self::create_v3(&connection)?,\n            1 => {\n                self.consistent_backup(&connection, "sqlite3.v1-backup")?;\n                Self::migrate_v1_to_v2(&connection)?;\n                Self::migrate_v2_to_v3(&connection)?\n            }\n            2 => {\n                self.consistent_backup(&connection, "sqlite3.v2-backup")?;\n                Self::migrate_v2_to_v3(&connection)?\n            }\n            3 => {}',
+                  '            0 => Self::create_v4(&connection)?,\n            1 => {\n                self.consistent_backup(&connection, "sqlite3.v1-backup")?;\n                Self::migrate_v1_to_v2(&connection)?;\n                Self::migrate_v2_to_v3(&connection)?;\n                Self::migrate_v3_to_v4(&connection)?\n            }\n            2 => {\n                self.consistent_backup(&connection, "sqlite3.v2-backup")?;\n                Self::migrate_v2_to_v3(&connection)?;\n                Self::migrate_v3_to_v4(&connection)?\n            }\n            3 => {\n                self.consistent_backup(&connection, "sqlite3.v3-backup")?;\n                Self::migrate_v3_to_v4(&connection)?\n            }\n            4 => {}',
+              ),
+              (
+                  '    fn create_v3(connection: &Connection) -> Result<(), String> {',
+                  '    fn create_v4(connection: &Connection) -> Result<(), String> {',
+              ),
+              (
+                  'file_identity TEXT,volume_identity TEXT,modified_at INTEGER); CREATE INDEX scan_entries_scan_size',
+                  'file_identity TEXT,volume_identity TEXT,modified_at INTEGER,skip_reason TEXT); CREATE INDEX scan_entries_scan_size',
+              ),
+              (
+                  'CREATE INDEX scan_entries_scan_parent ON scan_entries(scan_id,parent_path); PRAGMA user_version=3;\").map_err(|e|format!("スキャン履歴を初期化できません: {e}"))',
+                  'CREATE INDEX scan_entries_scan_parent ON scan_entries(scan_id,parent_path); PRAGMA user_version=4;\").map_err(|e|format!("スキャン履歴を初期化できません: {e}"))',
+              ),
+              (
+                  'size_bytes,logical_size,allocated_size,file_count,directory_count,is_directory,file_identity,volume_identity,modified_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)',
+                  'size_bytes,logical_size,allocated_size,file_count,directory_count,skipped_count,skip_reason,is_directory,file_identity,volume_identity,modified_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)',
+              ),
+              (
+                  '                        to_i64(entry.directory_count, "フォルダ数")?,\n                        if entry.is_directory { 1_i64 } else { 0_i64 },',
+                  '                        to_i64(entry.directory_count, "フォルダ数")?,\n                        to_i64(entry.skipped_count, "読み飛ばし数")?,\n                        entry.skip_reason,\n                        if entry.is_directory { 1_i64 } else { 0_i64 },',
+              ),
+              (
+                  '        if progress.file_count == 0 && progress.directory_count == 0 {',
+                  '        if progress.file_count == 0\n            && progress.directory_count == 0\n            && progress.skipped_count == 0\n        {',
+              ),
+              (
+                  '            entry_type: if progress.directory_count > 0 {\n                "directory"\n            } else {\n                "file"\n            },',
+                  '            entry_type: if progress.directory_count > 0 {\n                "directory"\n            } else if progress.file_count > 0 {\n                "file"\n            } else {\n                "other"\n            },',
+              ),
+              (
+                  '            directory_count: progress.directory_count,\n            is_directory: progress.directory_count > 0,',
+                  '            directory_count: progress.directory_count,\n            skipped_count: progress.skipped_count,\n            skip_reason: progress.skip_reason,\n            is_directory: progress.directory_count > 0,',
+              ),
+              (
+                  '            skipped_count: 0,\n            counted_size_bytes: 1024,',
+                  '            skipped_count: 0,\n            skip_reason: None,\n            counted_size_bytes: 1024,',
+              ),
+              (
+                  '        assert_eq!(version, 3);',
+                  '        assert_eq!(version, 4);',
+              ),
+          ]
+          for old, new in replacements:
+              if storage.count(old) != 1:
+                  raise SystemExit(f'storage marker mismatch: {old[:100]}')
+              storage = storage.replace(old, new, 1)
+
+          migration_marker = '    pub fn recover_incomplete_sessions(&self) -> Result<usize, String> {'
+          migration = (
+              '    fn migrate_v3_to_v4(connection: &Connection) -> Result<(), String> {\n'
+              '        connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE scan_entries ADD COLUMN skip_reason TEXT; PRAGMA user_version=4; COMMIT;").map_err(|e|format!("スキャン履歴をv4へ移行できません: {e}"))\n'
+              '    }\n'
+              '    pub fn recover_incomplete_sessions(&self) -> Result<usize, String> {'
+          )
+          if storage.count(migration_marker) != 1:
+              raise SystemExit('migration insertion marker mismatch')
+          storage = storage.replace(migration_marker, migration, 1)
+
+          test_marker = '    #[test]\n    fn counted_entry_sizes_match_completed_session_total() {'
+          skipped_test = (
+              '    #[test]\n'
+              '    fn persists_skipped_entries_with_reason() {\n'
+              '        let repository = repository("skipped-entry");\n'
+              '        let writer = repository.begin_stream("/tmp/sample").unwrap();\n'
+              '        let mut skipped = progress(PathBuf::from("/tmp/sample/linked"));\n'
+              '        skipped.file_count = 0;\n'
+              '        skipped.skipped_count = 1;\n'
+              '        skipped.skip_reason = Some("link_not_followed");\n'
+              '        skipped.counted_size_bytes = 0;\n'
+              '        skipped.logical_size_bytes = 0;\n'
+              '        skipped.allocated_size_bytes = None;\n'
+              '        skipped.file_identity = None;\n'
+              '        writer.record(&skipped);\n'
+              '        let mut completed = summary(0);\n'
+              '        completed.skipped_count = 1;\n'
+              '        writer.complete(&completed).unwrap();\n'
+              '        let stored: (i64, String, String) = repository\n'
+              '            .connection()\n'
+              '            .unwrap()\n'
+              '            .query_row(\n'
+              '                "SELECT skipped_count,skip_reason,entry_type FROM scan_entries LIMIT 1",\n'
+              '                [],\n'
+              '                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),\n'
+              '            )\n'
+              '            .unwrap();\n'
+              '        assert_eq!(stored, (1, "link_not_followed".to_owned(), "other".to_owned()));\n'
+              '        let _ = std::fs::remove_file(repository.path());\n'
+              '    }\n'
+              '    #[test]\n'
+              '    fn counted_entry_sizes_match_completed_session_total() {'
+          )
+          if storage.count(test_marker) != 1:
+              raise SystemExit('skipped test insertion marker mismatch')
+          storage_path.write_text(storage.replace(test_marker, skipped_test, 1))
+          PY
+          cargo fmt --manifest-path src-tauri/Cargo.toml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src-tauri/src/scanner.rs src-tauri/src/storage.rs
+          git commit -m "fix: persist skipped entries and reasons"
+          git push
