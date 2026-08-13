@@ -15,7 +15,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: fix/phase4-handle-snapshot-toctou
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend dependencies
+        run: npm install --no-audit --no-fund
+      - name: Generate build assets
+        run: npm run build
       - name: Capture Rust test output
         shell: pwsh
         run: |
