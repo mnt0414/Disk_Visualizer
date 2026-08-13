@@ -1,4 +1,4 @@
-name: Implement handle snapshot scanner update
+name: Diagnose Windows handle snapshot
 
 on:
   push:
@@ -8,62 +8,22 @@ permissions:
   contents: write
 
 jobs:
-  implement:
+  diagnose:
     if: github.actor != 'github-actions[bot]'
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: fix/phase4-handle-snapshot-toctou
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Consume verified file snapshots
+      - name: Capture Rust test output
+        shell: pwsh
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('src-tauri/src/scanner.rs')
-          text = path.read_text()
-          old = '            let metrics = file_metrics::collect(&path, &metadata);'
-          new = '\n'.join([
-              '            let metrics = match file_metrics::collect(&path, &metadata) {',
-              '                Some(metrics) => metrics,',
-              '                None => {',
-              '                    totals.skipped = totals.skipped.saturating_add(1);',
-              '                    progress(&ScanProgress {',
-              '                        path,',
-              '                        file_count: 0,',
-              '                        directory_count: 0,',
-              '                        skipped_count: 1,',
-              '                        skip_reason: Some("file_snapshot_unavailable"),',
-              '                        counted_size_bytes: 0,',
-              '                        logical_size_bytes: 0,',
-              '                        allocated_size_bytes: None,',
-              '                        file_identity: None,',
-              '                        volume_identity: None,',
-              '                        modified_at: None,',
-              '                    });',
-              '                    continue;',
-              '                }',
-              '            };',
-          ])
-          if text.count(old) != 1:
-              raise SystemExit('collect marker mismatch')
-          text = text.replace(old, new, 1)
-          replacements = [
-              ('                totals.size = totals.size.saturating_add(metadata.len());', '                totals.size = totals.size.saturating_add(metrics.logical_size);'),
-              ('                counted_size_bytes: if duplicate { 0 } else { metadata.len() },', '                counted_size_bytes: if duplicate { 0 } else { metrics.logical_size },'),
-              ('                logical_size_bytes: metadata.len(),', '                logical_size_bytes: metrics.logical_size,'),
-          ]
-          for old, new in replacements:
-              if text.count(old) != 1:
-                  raise SystemExit(f'scanner size marker mismatch: {old}')
-              text = text.replace(old, new, 1)
-          path.write_text(text)
-          PY
-          cargo fmt --manifest-path src-tauri/Cargo.toml
+          cargo test --manifest-path src-tauri/Cargo.toml *> .github/windows-test-log.txt
+          $exitCode = $LASTEXITCODE
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src-tauri/src/file_metrics.rs src-tauri/src/scanner.rs
-          git commit -m "fix: use verified handle snapshots during scans"
+          git add .github/windows-test-log.txt
+          git commit -m "ci: capture Windows snapshot test output"
           git push
+          exit $exitCode
