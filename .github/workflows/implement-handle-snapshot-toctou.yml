@@ -19,6 +19,15 @@ jobs:
         with:
           node-version: 22
       - uses: dtolnay/rust-toolchain@stable
+      - name: Apply Windows allocation size type fix
+        shell: pwsh
+        run: |
+          $path = 'src-tauri/src/file_metrics.rs'
+          $text = Get-Content $path -Raw
+          $old = '        // SAFETY: `AllocationSize` was initialized by the successful API call.`r`n        let allocation_size = unsafe { standard.AllocationSize.QuadPart };'
+          if (-not $text.Contains($old)) { throw 'allocation size marker mismatch' }
+          $new = '        let allocation_size = standard.AllocationSize;'
+          Set-Content $path ($text.Replace($old, $new)) -NoNewline
       - name: Install frontend dependencies
         run: npm install --no-audit --no-fund
       - name: Generate build assets
@@ -30,7 +39,7 @@ jobs:
           $exitCode = $LASTEXITCODE
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add .github/windows-test-log.txt
-          git commit -m "ci: capture Windows snapshot test output"
+          git add src-tauri/src/file_metrics.rs .github/windows-test-log.txt
+          git commit -m "fix: use native allocation size value"
           git push
           exit $exitCode
