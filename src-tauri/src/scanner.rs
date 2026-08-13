@@ -166,7 +166,26 @@ where
                 modified_at: file_metrics::modified_at(&metadata),
             });
         } else if metadata.is_file() {
-            let metrics = file_metrics::collect(&path, &metadata);
+            let metrics = match file_metrics::collect(&path, &metadata) {
+                Some(metrics) => metrics,
+                None => {
+                    totals.skipped = totals.skipped.saturating_add(1);
+                    progress(&ScanProgress {
+                        path,
+                        file_count: 0,
+                        directory_count: 0,
+                        skipped_count: 1,
+                        skip_reason: Some("file_snapshot_unavailable"),
+                        counted_size_bytes: 0,
+                        logical_size_bytes: 0,
+                        allocated_size_bytes: None,
+                        file_identity: None,
+                        volume_identity: None,
+                        modified_at: None,
+                    });
+                    continue;
+                }
+            };
             let deduplication_key = metrics
                 .volume_identity
                 .as_ref()
@@ -177,7 +196,7 @@ where
             if duplicate {
                 totals.hard_link_duplicates = totals.hard_link_duplicates.saturating_add(1);
             } else {
-                totals.size = totals.size.saturating_add(metadata.len());
+                totals.size = totals.size.saturating_add(metrics.logical_size);
                 if let Some(allocated_size) = metrics.allocated_size {
                     totals.allocated = totals.allocated.saturating_add(allocated_size);
                 }
@@ -194,8 +213,8 @@ where
                 directory_count: 0,
                 skipped_count: 0,
                 skip_reason: None,
-                counted_size_bytes: if duplicate { 0 } else { metadata.len() },
-                logical_size_bytes: metadata.len(),
+                counted_size_bytes: if duplicate { 0 } else { metrics.logical_size },
+                logical_size_bytes: metrics.logical_size,
                 allocated_size_bytes: metrics.allocated_size,
                 file_identity: metrics.file_identity,
                 volume_identity: metrics.volume_identity,
