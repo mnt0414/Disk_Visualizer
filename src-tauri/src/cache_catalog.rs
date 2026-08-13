@@ -93,19 +93,31 @@ impl CacheCatalog {
         let mut ids = HashSet::new();
         for definition in &self.definitions {
             if definition.id.trim().is_empty() || !ids.insert(definition.id.as_str()) {
-                return Err(format!("キャッシュ定義IDが空または重複しています: {}", definition.id));
+                return Err(format!(
+                    "キャッシュ定義IDが空または重複しています: {}",
+                    definition.id
+                ));
             }
             if definition.definition_version == 0
                 || definition.application_name.trim().is_empty()
                 || definition.version_constraint.trim().is_empty()
                 || definition.evidence.is_empty()
-                || definition.evidence.iter().any(|value| value.trim().is_empty())
+                || definition
+                    .evidence
+                    .iter()
+                    .any(|value| value.trim().is_empty())
                 || definition.cleanup_impact.trim().is_empty()
             {
-                return Err(format!("キャッシュ定義の必須項目が不足しています: {}", definition.id));
+                return Err(format!(
+                    "キャッシュ定義の必須項目が不足しています: {}",
+                    definition.id
+                ));
             }
             relative_components(&definition.path.relative_path).map_err(|reason| {
-                format!("キャッシュ定義の相対パスが不正です ({}): {reason}", definition.id)
+                format!(
+                    "キャッシュ定義の相対パスが不正です ({}): {reason}",
+                    definition.id
+                )
             })?;
         }
         Ok(())
