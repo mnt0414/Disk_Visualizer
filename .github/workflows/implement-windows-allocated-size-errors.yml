@@ -1,0 +1,83 @@
+name: Implement Windows allocated-size error handling
+
+on:
+  push:
+    branches: [fix/phase4-windows-allocated-size-errors]
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/phase4-windows-allocated-size-errors
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Handle missing Windows allocated sizes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          metrics_path = Path('src-tauri/src/file_metrics.rs')
+          metrics = metrics_path.read_text()
+          replacements = [
+              ('    pub allocated_size: u64,', '    pub allocated_size: Option<u64>,'),
+              (
+                  '    let allocated_size = metadata.blocks().saturating_mul(512);\n    let logical_size = metadata.len();\n    FileMetrics {\n        allocated_size,',
+                  '    let allocated_size = metadata.blocks().saturating_mul(512);\n    let logical_size = metadata.len();\n    FileMetrics {\n        allocated_size: Some(allocated_size),',
+              ),
+              (
+                  '#[cfg(windows)]\npub fn collect(path: &Path, metadata: &Metadata) -> FileMetrics {\n    use std::os::windows::ffi::OsStrExt;\n    use std::os::windows::fs::MetadataExt;\n    use windows_sys::Win32::Storage::FileSystem::{\n        GetCompressedFileSizeW, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_SPARSE_FILE,\n    };\n\n    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();\n    let mut high = 0_u32;\n    // SAFETY: `wide` is NUL-terminated and remains alive for the call; `high` is a\n    // valid writable pointer for the high-order result.\n    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };\n    let allocated_size = ((high as u64) << 32) | low as u64;',
+                  '#[cfg(windows)]\nfn compressed_file_size(path: &Path) -> Option<u64> {\n    use std::os::windows::ffi::OsStrExt;\n    use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_SUCCESS};\n    use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;\n\n    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();\n    let mut high = 0_u32;\n    // SAFETY: clearing the calling thread\'s last-error value is required to\n    // distinguish a valid low-order `u32::MAX` result from API failure.\n    unsafe { SetLastError(ERROR_SUCCESS) };\n    // SAFETY: `wide` is NUL-terminated and remains alive for the call; `high` is a\n    // valid writable pointer for the high-order result.\n    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };\n    // SAFETY: `GetLastError` reads thread-local state immediately after the API call.\n    if low == u32::MAX && unsafe { GetLastError() } != ERROR_SUCCESS {\n        return None;\n    }\n    Some(((high as u64) << 32) | low as u64)\n}\n\n#[cfg(windows)]\npub fn collect(path: &Path, metadata: &Metadata) -> FileMetrics {\n    use std::os::windows::fs::MetadataExt;\n    use windows_sys::Win32::Storage::FileSystem::{\n        FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_SPARSE_FILE,\n    };\n\n    let allocated_size = compressed_file_size(path);',
+              ),
+              ('        allocated_size: metadata.len(),', '        allocated_size: Some(metadata.len()),'),
+          ]
+          for old, new in replacements:
+              if metrics.count(old) != 1:
+                  raise SystemExit(f'file_metrics marker mismatch: {old[:120]}')
+              metrics = metrics.replace(old, new, 1)
+
+          test_marker = '    #[cfg(any(unix, windows))]\n    #[test]\n    fn resolves_volume_identity_for_directories() {'
+          test = (
+              '    #[cfg(windows)]\n'
+              '    #[test]\n'
+              '    fn reports_missing_allocated_size_for_unavailable_path() {\n'
+              '        let missing = std::env::temp_dir().join(format!(\n'
+              '            "disk-visualizer-missing-allocated-size-{}",\n'
+              '            std::process::id()\n'
+              '        ));\n'
+              '        let _ = std::fs::remove_file(&missing);\n'
+              '        assert_eq!(compressed_file_size(&missing), None);\n'
+              '    }\n\n'
+              '    #[cfg(any(unix, windows))]\n'
+              '    #[test]\n'
+              '    fn resolves_volume_identity_for_directories() {'
+          )
+          if metrics.count(test_marker) != 1:
+              raise SystemExit('Windows error test marker mismatch')
+          metrics_path.write_text(metrics.replace(test_marker, test, 1))
+
+          scanner_path = Path('src-tauri/src/scanner.rs')
+          scanner = scanner_path.read_text()
+          old = '                totals.allocated = totals.allocated.saturating_add(metrics.allocated_size);'
+          new = '                if let Some(allocated_size) = metrics.allocated_size {\n                    totals.allocated = totals.allocated.saturating_add(allocated_size);\n                }'
+          if scanner.count(old) != 1:
+              raise SystemExit('scanner allocated total marker mismatch')
+          scanner = scanner.replace(old, new, 1)
+          old = '                allocated_size_bytes: Some(metrics.allocated_size),'
+          new = '                allocated_size_bytes: metrics.allocated_size,'
+          if scanner.count(old) != 1:
+              raise SystemExit('scanner progress allocated-size marker mismatch')
+          scanner_path.write_text(scanner.replace(old, new, 1))
+          PY
+          cargo fmt --manifest-path src-tauri/Cargo.toml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src-tauri/src/file_metrics.rs src-tauri/src/scanner.rs
+          git commit -m "fix: handle Windows allocated-size lookup failures"
+          git push
