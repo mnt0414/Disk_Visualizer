@@ -150,7 +150,53 @@ impl ScanRepository {
         connection.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE; ALTER TABLE scan_entries RENAME TO scan_entries_v1; ALTER TABLE scan_sessions RENAME TO scan_sessions_v1; CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,root_path TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('in_progress','complete','interrupted','failed')),total_size_bytes INTEGER NOT NULL DEFAULT 0,file_count INTEGER NOT NULL DEFAULT 0,directory_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,elapsed_milliseconds INTEGER NOT NULL DEFAULT 0,started_at INTEGER NOT NULL,completed_at INTEGER); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,size_bytes INTEGER NOT NULL,file_count INTEGER NOT NULL,directory_count INTEGER NOT NULL,skipped_count INTEGER NOT NULL DEFAULT 0,is_directory INTEGER NOT NULL); INSERT INTO scan_sessions (id,root_path,status,total_size_bytes,file_count,directory_count,skipped_count,elapsed_milliseconds,started_at,completed_at) SELECT id,root_path,'complete',total_size_bytes,file_count,directory_count,skipped_count,elapsed_milliseconds,completed_at,completed_at FROM scan_sessions_v1; INSERT INTO scan_entries SELECT * FROM scan_entries_v1; DROP TABLE scan_entries_v1; DROP TABLE scan_sessions_v1; CREATE INDEX scan_entries_scan_size ON scan_entries(scan_id,size_bytes DESC); PRAGMA user_version=2; COMMIT; PRAGMA foreign_keys=ON;").map_err(|e|format!("スキャン履歴をv2へ移行できません: {e}"))
     }
     fn migrate_v2_to_v3(connection: &Connection) -> Result<(), String> {
-        connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE scan_entries ADD COLUMN parent_path TEXT; ALTER TABLE scan_entries ADD COLUMN relative_path TEXT NOT NULL DEFAULT ''; ALTER TABLE scan_entries ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'other' CHECK(entry_type IN ('file','directory','other')); ALTER TABLE scan_entries ADD COLUMN logical_size INTEGER NOT NULL DEFAULT 0; ALTER TABLE scan_entries ADD COLUMN allocated_size INTEGER; ALTER TABLE scan_entries ADD COLUMN file_identity TEXT; ALTER TABLE scan_entries ADD COLUMN volume_identity TEXT; ALTER TABLE scan_entries ADD COLUMN modified_at INTEGER; UPDATE scan_entries SET relative_path=path,entry_type=CASE WHEN is_directory=1 THEN 'directory' ELSE 'file' END,logical_size=size_bytes; CREATE INDEX scan_entries_scan_parent ON scan_entries(scan_id,parent_path); PRAGMA user_version=3; COMMIT;").map_err(|e|format!("スキャン履歴をv3へ移行できません: {e}"))
+        connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE scan_entries ADD COLUMN parent_path TEXT; ALTER TABLE scan_entries ADD COLUMN relative_path TEXT NOT NULL DEFAULT ''; ALTER TABLE scan_entries ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'other' CHECK(entry_type IN ('file','directory','other')); ALTER TABLE scan_entries ADD COLUMN logical_size INTEGER NOT NULL DEFAULT 0; ALTER TABLE scan_entries ADD COLUMN allocated_size INTEGER; ALTER TABLE scan_entries ADD COLUMN file_identity TEXT; ALTER TABLE scan_entries ADD COLUMN volume_identity TEXT; ALTER TABLE scan_entries ADD COLUMN modified_at INTEGER;").map_err(|e|format!("スキャン履歴のv3移行を開始できません: {e}"))?;
+        let migration = (|| -> Result<(), String> {
+            let entries = {
+                let mut statement = connection
+                .prepare("SELECT e.id,e.path,s.root_path FROM scan_entries e JOIN scan_sessions s ON s.id=e.scan_id")
+                .map_err(|e| e.to_string())?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .map_err(|e| e.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?
+            };
+            let mut update = connection
+                .prepare_cached(
+                    "UPDATE scan_entries SET parent_path=?2,relative_path=?3 WHERE id=?1",
+                )
+                .map_err(|e| e.to_string())?;
+            for (id, stored_path, root_path) in entries {
+                let stored_path = PathBuf::from(stored_path);
+                let root_path = PathBuf::from(root_path);
+                let parent_path = stored_path
+                    .parent()
+                    .map(|value| value.to_string_lossy().into_owned());
+                let relative_path = stored_path
+                    .strip_prefix(&root_path)
+                    .unwrap_or(stored_path.as_path())
+                    .to_string_lossy()
+                    .into_owned();
+                update
+                    .execute(params![id, parent_path, relative_path])
+                    .map_err(|e| e.to_string())?;
+            }
+            drop(update);
+            connection.execute_batch("UPDATE scan_entries SET entry_type=CASE WHEN is_directory=1 THEN 'directory' ELSE 'file' END,logical_size=size_bytes; CREATE INDEX scan_entries_scan_parent ON scan_entries(scan_id,parent_path); PRAGMA user_version=3; COMMIT;").map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        if let Err(error) = migration {
+            let _ = connection.execute_batch("ROLLBACK;");
+            return Err(format!("スキャン履歴をv3へ移行できません: {error}"));
+        }
+        Ok(())
     }
     fn migrate_v3_to_v4(connection: &Connection) -> Result<(), String> {
         connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE scan_entries ADD COLUMN skip_reason TEXT; PRAGMA user_version=4; COMMIT;").map_err(|e|format!("スキャン履歴をv4へ移行できません: {e}"))
@@ -516,7 +562,7 @@ mod tests {
         let path = repository.path().to_path_buf();
         {
             let connection = repository.connection().unwrap();
-            connection.execute_batch("PRAGMA user_version=2; DROP INDEX scan_entries_scan_parent; CREATE TABLE replacement AS SELECT id,scan_id,name,path,size_bytes,file_count,directory_count,skipped_count,is_directory FROM scan_entries; DROP TABLE scan_entries; ALTER TABLE replacement RENAME TO scan_entries; CREATE INDEX scan_entries_scan_size ON scan_entries(scan_id,size_bytes DESC);").unwrap();
+            connection.execute_batch("PRAGMA user_version=2; DROP INDEX scan_entries_scan_parent; CREATE TABLE replacement AS SELECT id,scan_id,name,path,size_bytes,file_count,directory_count,skipped_count,is_directory FROM scan_entries; DROP TABLE scan_entries; ALTER TABLE replacement RENAME TO scan_entries; CREATE INDEX scan_entries_scan_size ON scan_entries(scan_id,size_bytes DESC); INSERT INTO scan_sessions (id,root_path,status,started_at) VALUES (1,'/tmp/sample','complete',1); INSERT INTO scan_entries (id,scan_id,name,path,size_bytes,file_count,directory_count,skipped_count,is_directory) VALUES (1,1,'file.bin','/tmp/sample/nested/file.bin',1024,1,0,0,0);").unwrap();
         }
         repository.initialize().unwrap();
         let version: i64 = repository
@@ -525,6 +571,22 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, 4);
+        let migrated_paths: (Option<String>, String) = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT parent_path,relative_path FROM scan_entries WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            migrated_paths,
+            (
+                Some("/tmp/sample/nested".to_owned()),
+                "nested/file.bin".to_owned()
+            )
+        );
         assert!(path.with_extension("sqlite3.v2-backup").exists());
         let _ = std::fs::remove_file(path);
     }
