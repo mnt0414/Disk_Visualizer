@@ -165,12 +165,8 @@ impl CacheCatalog {
                     .iter()
                     .find(|(kind, _)| *kind == definition.path.root)?;
                 let relative = relative_to_root(path, &root.1, platform)?;
-                path_has_component_prefix(
-                    &definition.path.relative_path,
-                    &relative,
-                    platform,
-                )
-                .then_some(definition)
+                path_has_component_prefix(&definition.path.relative_path, &relative, platform)
+                    .then_some(definition)
             })
             .max_by_key(|definition| definition.path.relative_path.split('/').count())
     }
@@ -254,7 +250,9 @@ fn configured_roots(platform: Platform) -> Vec<(CachePathRoot, PathBuf)> {
     };
     variables
         .iter()
-        .filter_map(|(root, variable)| std::env::var_os(variable).map(|value| (*root, value.into())))
+        .filter_map(|(root, variable)| {
+            std::env::var_os(variable).map(|value| (*root, value.into()))
+        })
         .collect()
 }
 
