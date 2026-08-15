@@ -77,10 +77,7 @@ pub fn evaluate_runtime_state(
 }
 
 /// Re-observes a path after an earlier observation and evaluates its state.
-pub fn evaluate_path_after(
-    path: &Path,
-    before: Option<&CacheObservation>,
-) -> CacheRuntimeState {
+pub fn evaluate_path_after(path: &Path, before: Option<&CacheObservation>) -> CacheRuntimeState {
     let after = observe_path(path);
     evaluate_runtime_state(before, after.as_ref())
 }
