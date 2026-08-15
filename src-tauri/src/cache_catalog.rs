@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const BUNDLED_CATALOG_JSON: &str = include_str!("../definitions/cache-catalog-v1.json");
@@ -27,7 +28,7 @@ pub enum Confidence {
     Low,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum CachePathRoot {
     Home,
@@ -73,6 +74,13 @@ pub struct CacheDefinition {
 pub struct CacheCatalog {
     pub catalog_version: String,
     pub definitions: Vec<CacheDefinition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheClassificationRef {
+    pub catalog_version: String,
+    pub definition_id: String,
+    pub definition_version: u32,
 }
 
 impl CacheCatalog {
@@ -142,6 +150,30 @@ impl CacheCatalog {
             })
             .collect()
     }
+
+    fn classify_absolute_with_roots(
+        &self,
+        platform: Platform,
+        path: &Path,
+        roots: &[(CachePathRoot, PathBuf)],
+    ) -> Option<&CacheDefinition> {
+        self.definitions
+            .iter()
+            .filter(|definition| definition.platform == platform)
+            .filter_map(|definition| {
+                let root = roots
+                    .iter()
+                    .find(|(kind, _)| *kind == definition.path.root)?;
+                let relative = relative_to_root(path, &root.1, platform)?;
+                path_has_component_prefix(
+                    &definition.path.relative_path,
+                    &relative,
+                    platform,
+                )
+                .then_some(definition)
+            })
+            .max_by_key(|definition| definition.path.relative_path.split('/').count())
+    }
 }
 
 fn relative_components(path: &str) -> Result<Vec<&str>, &'static str> {
@@ -175,6 +207,57 @@ fn path_has_component_prefix(definition: &str, candidate: &str, platform: Platfo
             })
 }
 
+fn normalized_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn relative_to_root(path: &Path, root: &Path, platform: Platform) -> Option<String> {
+    let path = normalized_path(path);
+    let root = normalized_path(root).trim_end_matches('/').to_owned();
+    let matches = match platform {
+        Platform::Windows => path
+            .get(..root.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&root)),
+        Platform::Macos => path.starts_with(&root),
+    };
+    if !matches {
+        return None;
+    }
+    let remainder = path.get(root.len()..)?;
+    if !remainder.is_empty() && !remainder.starts_with('/') {
+        return None;
+    }
+    let relative = remainder.trim_start_matches('/');
+    (!relative.is_empty()).then(|| relative.to_owned())
+}
+
+fn current_platform() -> Option<Platform> {
+    match std::env::consts::OS {
+        "macos" => Some(Platform::Macos),
+        "windows" => Some(Platform::Windows),
+        _ => None,
+    }
+}
+
+fn configured_roots(platform: Platform) -> Vec<(CachePathRoot, PathBuf)> {
+    let variables: &[(CachePathRoot, &str)] = match platform {
+        Platform::Macos => &[
+            (CachePathRoot::Home, "HOME"),
+            (CachePathRoot::SystemCache, "HOME"),
+        ],
+        Platform::Windows => &[
+            (CachePathRoot::Home, "USERPROFILE"),
+            (CachePathRoot::LocalAppData, "LOCALAPPDATA"),
+            (CachePathRoot::RoamingAppData, "APPDATA"),
+            (CachePathRoot::SystemCache, "WINDIR"),
+        ],
+    };
+    variables
+        .iter()
+        .filter_map(|(root, variable)| std::env::var_os(variable).map(|value| (*root, value.into())))
+        .collect()
+}
+
 static BUNDLED_CATALOG: OnceLock<Result<CacheCatalog, String>> = OnceLock::new();
 
 pub fn bundled_catalog() -> Result<&'static CacheCatalog, String> {
@@ -182,6 +265,18 @@ pub fn bundled_catalog() -> Result<&'static CacheCatalog, String> {
         Ok(catalog) => Ok(catalog),
         Err(error) => Err(error.clone()),
     }
+}
+
+pub fn classify_absolute_path(path: &Path) -> Option<CacheClassificationRef> {
+    let platform = current_platform()?;
+    let catalog = bundled_catalog().ok()?;
+    let definition =
+        catalog.classify_absolute_with_roots(platform, path, &configured_roots(platform))?;
+    Some(CacheClassificationRef {
+        catalog_version: catalog.catalog_version.clone(),
+        definition_id: definition.id.clone(),
+        definition_version: definition.definition_version,
+    })
 }
 
 #[cfg(test)]
@@ -227,6 +322,35 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn resolves_absolute_paths_against_explicit_roots() {
+        let catalog = bundled_catalog().unwrap();
+        let roots = vec![(
+            CachePathRoot::LocalAppData,
+            PathBuf::from("C:/Users/Sample/AppData/Local"),
+        )];
+        let definition = catalog
+            .classify_absolute_with_roots(
+                Platform::Windows,
+                Path::new(
+                    "c:/users/sample/appdata/local/Google/Chrome/User Data/Default/Cache/data_1",
+                ),
+                &roots,
+            )
+            .unwrap();
+        assert_eq!(definition.id, "chrome.windows.default-cache");
+    }
+
+    #[test]
+    fn rejects_root_prefix_collisions() {
+        assert!(relative_to_root(
+            Path::new("/Users/sample2/Library/Caches"),
+            Path::new("/Users/sample"),
+            Platform::Macos,
+        )
+        .is_none());
     }
 
     #[test]
