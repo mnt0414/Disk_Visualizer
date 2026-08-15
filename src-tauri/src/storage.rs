@@ -1,3 +1,4 @@
+use crate::cache_catalog::{self, CacheClassificationRef};
 use crate::scanner::{ScanProgress, ScanSummary};
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -41,6 +42,7 @@ struct IndexedEntry {
     file_identity: Option<String>,
     volume_identity: Option<String>,
     modified_at: Option<i64>,
+    cache_classification: Option<CacheClassificationRef>,
 }
 #[derive(Clone)]
 pub struct StreamingScanWriter {
@@ -94,23 +96,30 @@ impl ScanRepository {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
         match version {
-            0 => Self::create_v4(&connection)?,
+            0 => Self::create_v5(&connection)?,
             1 => {
                 self.consistent_backup(&connection, "sqlite3.v1-backup")?;
                 Self::migrate_v1_to_v2(&connection)?;
                 Self::migrate_v2_to_v3(&connection)?;
-                Self::migrate_v3_to_v4(&connection)?
+                Self::migrate_v3_to_v4(&connection)?;
+                Self::migrate_v4_to_v5(&connection)?
             }
             2 => {
                 self.consistent_backup(&connection, "sqlite3.v2-backup")?;
                 Self::migrate_v2_to_v3(&connection)?;
-                Self::migrate_v3_to_v4(&connection)?
+                Self::migrate_v3_to_v4(&connection)?;
+                Self::migrate_v4_to_v5(&connection)?
             }
             3 => {
                 self.consistent_backup(&connection, "sqlite3.v3-backup")?;
-                Self::migrate_v3_to_v4(&connection)?
+                Self::migrate_v3_to_v4(&connection)?;
+                Self::migrate_v4_to_v5(&connection)?
             }
-            4 => {}
+            4 => {
+                self.consistent_backup(&connection, "sqlite3.v4-backup")?;
+                Self::migrate_v4_to_v5(&connection)?
+            }
+            5 => {}
             other => return Err(format!("未対応のスキャン履歴バージョンです: {other}")),
         }
         let check: String = connection
@@ -143,8 +152,8 @@ impl ScanRepository {
         }
         Ok(())
     }
-    fn create_v4(connection: &Connection) -> Result<(), String> {
-        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,root_path TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('in_progress','complete','interrupted','failed')),total_size_bytes INTEGER NOT NULL DEFAULT 0,file_count INTEGER NOT NULL DEFAULT 0,directory_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,elapsed_milliseconds INTEGER NOT NULL DEFAULT 0,started_at INTEGER NOT NULL,completed_at INTEGER); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,parent_path TEXT,relative_path TEXT NOT NULL,entry_type TEXT NOT NULL CHECK(entry_type IN ('file','directory','other')),size_bytes INTEGER NOT NULL,logical_size INTEGER NOT NULL,allocated_size INTEGER,file_count INTEGER NOT NULL,directory_count INTEGER NOT NULL,skipped_count INTEGER NOT NULL DEFAULT 0,is_directory INTEGER NOT NULL,file_identity TEXT,volume_identity TEXT,modified_at INTEGER,skip_reason TEXT); CREATE INDEX scan_entries_scan_size ON scan_entries(scan_id,size_bytes DESC); CREATE INDEX scan_entries_scan_parent ON scan_entries(scan_id,parent_path); PRAGMA user_version=4;").map_err(|e|format!("スキャン履歴を初期化できません: {e}"))
+    fn create_v5(connection: &Connection) -> Result<(), String> {
+        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,root_path TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('in_progress','complete','interrupted','failed')),total_size_bytes INTEGER NOT NULL DEFAULT 0,file_count INTEGER NOT NULL DEFAULT 0,directory_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,elapsed_milliseconds INTEGER NOT NULL DEFAULT 0,started_at INTEGER NOT NULL,completed_at INTEGER); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,parent_path TEXT,relative_path TEXT NOT NULL,entry_type TEXT NOT NULL CHECK(entry_type IN ('file','directory','other')),size_bytes INTEGER NOT NULL,logical_size INTEGER NOT NULL,allocated_size INTEGER,file_count INTEGER NOT NULL,directory_count INTEGER NOT NULL,skipped_count INTEGER NOT NULL DEFAULT 0,is_directory INTEGER NOT NULL,file_identity TEXT,volume_identity TEXT,modified_at INTEGER,skip_reason TEXT,cache_catalog_version TEXT,cache_definition_id TEXT,cache_definition_version INTEGER); CREATE INDEX scan_entries_scan_size ON scan_entries(scan_id,size_bytes DESC); CREATE INDEX scan_entries_scan_parent ON scan_entries(scan_id,parent_path); PRAGMA user_version=5;").map_err(|e|format!("スキャン履歴を初期化できません: {e}"))
     }
     fn migrate_v1_to_v2(connection: &Connection) -> Result<(), String> {
         connection.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE; ALTER TABLE scan_entries RENAME TO scan_entries_v1; ALTER TABLE scan_sessions RENAME TO scan_sessions_v1; CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,root_path TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('in_progress','complete','interrupted','failed')),total_size_bytes INTEGER NOT NULL DEFAULT 0,file_count INTEGER NOT NULL DEFAULT 0,directory_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,elapsed_milliseconds INTEGER NOT NULL DEFAULT 0,started_at INTEGER NOT NULL,completed_at INTEGER); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,size_bytes INTEGER NOT NULL,file_count INTEGER NOT NULL,directory_count INTEGER NOT NULL,skipped_count INTEGER NOT NULL DEFAULT 0,is_directory INTEGER NOT NULL); INSERT INTO scan_sessions (id,root_path,status,total_size_bytes,file_count,directory_count,skipped_count,elapsed_milliseconds,started_at,completed_at) SELECT id,root_path,'complete',total_size_bytes,file_count,directory_count,skipped_count,elapsed_milliseconds,completed_at,completed_at FROM scan_sessions_v1; INSERT INTO scan_entries SELECT * FROM scan_entries_v1; DROP TABLE scan_entries_v1; DROP TABLE scan_sessions_v1; CREATE INDEX scan_entries_scan_size ON scan_entries(scan_id,size_bytes DESC); PRAGMA user_version=2; COMMIT; PRAGMA foreign_keys=ON;").map_err(|e|format!("スキャン履歴をv2へ移行できません: {e}"))
@@ -201,6 +210,9 @@ impl ScanRepository {
     fn migrate_v3_to_v4(connection: &Connection) -> Result<(), String> {
         connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE scan_entries ADD COLUMN skip_reason TEXT; PRAGMA user_version=4; COMMIT;").map_err(|e|format!("スキャン履歴をv4へ移行できません: {e}"))
     }
+    fn migrate_v4_to_v5(connection: &Connection) -> Result<(), String> {
+        connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE scan_entries ADD COLUMN cache_catalog_version TEXT; ALTER TABLE scan_entries ADD COLUMN cache_definition_id TEXT; ALTER TABLE scan_entries ADD COLUMN cache_definition_version INTEGER; CREATE INDEX scan_entries_scan_cache ON scan_entries(scan_id,cache_definition_id); PRAGMA user_version=5; COMMIT;").map_err(|e|format!("スキャン履歴をv5へ移行できません: {e}"))
+    }
     pub fn recover_incomplete_sessions(&self) -> Result<usize, String> {
         let connection = self.connection()?;
         connection.execute("UPDATE scan_sessions SET status='interrupted',completed_at=?1 WHERE status='in_progress'",[unix_time()?]).map_err(|e|format!("未完了のスキャン履歴を復旧できません: {e}"))
@@ -227,7 +239,7 @@ impl ScanRepository {
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|e| e.to_string())?;
         {
-            let mut statement=transaction.prepare_cached("INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,allocated_size,file_count,directory_count,skipped_count,skip_reason,is_directory,file_identity,volume_identity,modified_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)").map_err(|e|e.to_string())?;
+            let mut statement=transaction.prepare_cached("INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,allocated_size,file_count,directory_count,skipped_count,skip_reason,is_directory,file_identity,volume_identity,modified_at,cache_catalog_version,cache_definition_id,cache_definition_version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)").map_err(|e|e.to_string())?;
             for entry in entries {
                 statement
                     .execute(params![
@@ -248,6 +260,18 @@ impl ScanRepository {
                         entry.file_identity,
                         entry.volume_identity,
                         entry.modified_at,
+                        entry
+                            .cache_classification
+                            .as_ref()
+                            .map(|value| value.catalog_version.as_str()),
+                        entry
+                            .cache_classification
+                            .as_ref()
+                            .map(|value| value.definition_id.as_str()),
+                        entry
+                            .cache_classification
+                            .as_ref()
+                            .map(|value| i64::from(value.definition_version)),
                     ])
                     .map_err(|e| format!("スキャン項目を保存できません: {e}"))?;
             }
@@ -325,6 +349,7 @@ impl StreamingScanWriter {
             return;
         }
         let path = &progress.path;
+        let cache_classification = cache_catalog::classify_absolute_path(path);
         let entry = IndexedEntry {
             name: path
                 .file_name()
@@ -358,6 +383,7 @@ impl StreamingScanWriter {
             file_identity: progress.file_identity.clone(),
             volume_identity: progress.volume_identity.clone(),
             modified_at: progress.modified_at,
+            cache_classification,
         };
         let batch = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -539,6 +565,33 @@ mod tests {
         assert_eq!(stored, (1024, 1024, 2048, 2));
         let _ = std::fs::remove_file(repository.path());
     }
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn persists_cache_classification_reference() {
+        let repository = repository("cache-classification");
+        let writer = repository.begin_stream("/tmp/sample").unwrap();
+        #[cfg(target_os = "macos")]
+        let cache_path = PathBuf::from(std::env::var("HOME").unwrap())
+            .join("Library/Caches/Google/Chrome/Default/Cache/data_1");
+        #[cfg(windows)]
+        let cache_path = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap())
+            .join("Google/Chrome/User Data/Default/Cache/data_1");
+        writer.record(&progress(cache_path));
+        writer.complete(&summary(1)).unwrap();
+        let stored: (String, String, i64) = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT cache_catalog_version,cache_definition_id,cache_definition_version FROM scan_entries LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, "2026.08.1");
+        assert_eq!(stored.2, 1);
+        assert!(stored.1.contains("chrome"));
+        let _ = std::fs::remove_file(repository.path());
+    }
     #[test]
     fn buffer_never_retains_a_full_batch() {
         let repository = repository("bounded");
@@ -570,7 +623,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let migrated_paths: (Option<String>, String) = repository
             .connection()
             .unwrap()
