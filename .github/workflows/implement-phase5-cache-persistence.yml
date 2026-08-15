@@ -1,0 +1,163 @@
+name: Implement Phase 5 cache persistence
+
+on:
+  push:
+    branches: [feat/phase5-persist-cache-classification]
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/phase5-persist-cache-classification
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Update SQLite persistence
+        shell: bash
+        run: |
+          cat > /tmp/update.py <<'PY'
+          from pathlib import Path
+
+          path = Path('src-tauri/src/storage.rs')
+          text = path.read_text()
+
+          def replace(old, new):
+              global text
+              if old not in text:
+                  raise SystemExit(f'marker not found: {old[:100]!r}')
+              text = text.replace(old, new, 1)
+
+          replace(
+              'use crate::scanner::{ScanProgress, ScanSummary};',
+              'use crate::cache_catalog::{self, CacheClassificationRef};\nuse crate::scanner::{ScanProgress, ScanSummary};',
+          )
+          replace(
+              '    modified_at: Option<i64>,\n}',
+              '    modified_at: Option<i64>,\n    cache_classification: Option<CacheClassificationRef>,\n}',
+          )
+          replace('            0 => Self::create_v4(&connection)?,', '            0 => Self::create_v5(&connection)?,')
+          replace(
+              '                Self::migrate_v3_to_v4(&connection)?\n            }',
+              '                Self::migrate_v3_to_v4(&connection)?;\n                Self::migrate_v4_to_v5(&connection)?\n            }',
+          )
+          replace(
+              '                Self::migrate_v3_to_v4(&connection)?\n            }',
+              '                Self::migrate_v3_to_v4(&connection)?;\n                Self::migrate_v4_to_v5(&connection)?\n            }',
+          )
+          replace(
+              '                Self::migrate_v3_to_v4(&connection)?\n            }',
+              '                Self::migrate_v3_to_v4(&connection)?;\n                Self::migrate_v4_to_v5(&connection)?\n            }',
+          )
+          replace(
+              '            4 => {}',
+              '            4 => {\n                self.consistent_backup(&connection, "sqlite3.v4-backup")?;\n                Self::migrate_v4_to_v5(&connection)?\n            }\n            5 => {}',
+          )
+          replace('    fn create_v4(connection: &Connection)', '    fn create_v5(connection: &Connection)')
+          replace(
+              'modified_at INTEGER,skip_reason TEXT); CREATE INDEX',
+              'modified_at INTEGER,skip_reason TEXT,cache_catalog_version TEXT,cache_definition_id TEXT,cache_definition_version INTEGER); CREATE INDEX',
+          )
+          replace(
+              'PRAGMA user_version=4;\").map_err(|e|format!(\"スキャン履歴を初期化',
+              'PRAGMA user_version=5;\").map_err(|e|format!(\"スキャン履歴を初期化',
+          )
+          replace(
+              '    pub fn recover_incomplete_sessions(&self) -> Result<usize, String> {',
+              '''    fn migrate_v4_to_v5(connection: &Connection) -> Result<(), String> {
+                  connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE scan_entries ADD COLUMN cache_catalog_version TEXT; ALTER TABLE scan_entries ADD COLUMN cache_definition_id TEXT; ALTER TABLE scan_entries ADD COLUMN cache_definition_version INTEGER; CREATE INDEX scan_entries_scan_cache ON scan_entries(scan_id,cache_definition_id); PRAGMA user_version=5; COMMIT;").map_err(|e|format!("スキャン履歴をv5へ移行できません: {e}"))
+              }
+              pub fn recover_incomplete_sessions(&self) -> Result<usize, String> {''',
+          )
+          replace(
+              'skip_reason,is_directory,file_identity,volume_identity,modified_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)',
+              'skip_reason,is_directory,file_identity,volume_identity,modified_at,cache_catalog_version,cache_definition_id,cache_definition_version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)',
+          )
+          replace(
+              '                        entry.modified_at,\n                    ])',
+              '''                        entry.modified_at,
+                                      entry.cache_classification.as_ref().map(|value| value.catalog_version.as_str()),
+                                      entry.cache_classification.as_ref().map(|value| value.definition_id.as_str()),
+                                      entry.cache_classification.as_ref().map(|value| i64::from(value.definition_version)),
+                                  ])''',
+          )
+          replace(
+              '        let path = &progress.path;\n        let entry = IndexedEntry {',
+              '        let path = &progress.path;\n        let cache_classification = cache_catalog::classify_absolute_path(path);\n        let entry = IndexedEntry {',
+          )
+          replace(
+              '            modified_at: progress.modified_at,\n        };',
+              '            modified_at: progress.modified_at,\n            cache_classification,\n        };',
+          )
+          text = text.replace('assert_eq!(version, 4);', 'assert_eq!(version, 5);')
+
+          marker = '    #[test]\n    fn buffer_never_retains_a_full_batch() {'
+          test = r'''    #[cfg(any(target_os = "macos", windows))]
+              #[test]
+              fn persists_cache_classification_reference() {
+                  let repository = repository("cache-classification");
+                  let writer = repository.begin_stream("/tmp/sample").unwrap();
+                  #[cfg(target_os = "macos")]
+                  let cache_path = PathBuf::from(std::env::var("HOME").unwrap())
+                      .join("Library/Caches/Google/Chrome/Default/Cache/data_1");
+                  #[cfg(windows)]
+                  let cache_path = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap())
+                      .join("Google/Chrome/User Data/Default/Cache/data_1");
+                  writer.record(&progress(cache_path));
+                  writer.complete(&summary(1)).unwrap();
+                  let stored: (String, String, i64) = repository
+                      .connection()
+                      .unwrap()
+                      .query_row(
+                          "SELECT cache_catalog_version,cache_definition_id,cache_definition_version FROM scan_entries LIMIT 1",
+                          [],
+                          |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                      )
+                      .unwrap();
+                  assert_eq!(stored.0, "2026.08.1");
+                  assert_eq!(stored.2, 1);
+                  assert!(stored.1.contains("chrome"));
+                  let _ = std::fs::remove_file(repository.path());
+              }
+              #[test]
+              fn buffer_never_retains_a_full_batch() {'''
+          replace(marker, test)
+          path.write_text(text)
+          PY
+          python /tmp/update.py
+          cargo fmt --manifest-path src-tauri/Cargo.toml
+      - name: Update progress documentation
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('docs/PHASE5_PROGRESS.md')
+          text = path.read_text().replace(
+              '- [ ] スキャン結果へのキャッシュ分類統合',
+              '- [x] スキャン結果へのキャッシュ分類統合\n- [x] 分類定義ID・定義バージョン・カタログバージョンをSQLite v5へ保存',
+          )
+          path.write_text(text)
+          PY
+          cat > docs/SQLITE_SCHEMA_V5.md <<'EOF'
+          # SQLite schema v5
+
+          Phase 5のアプリキャッシュ分類を履歴として再現できるよう、`scan_entries`へ以下を追加する。
+
+          - `cache_catalog_version`: 分類に使った組み込みカタログのバージョン
+          - `cache_definition_id`: 一致したキャッシュ定義ID
+          - `cache_definition_version`: 一致した定義のバージョン
+
+          未分類項目は3列すべて`NULL`とする。v4からの移行前には整合したバックアップを作成し、分類は新規スキャンから記録する。既存履歴を現在の定義で自動再分類しない。
+          EOF
+      - name: Commit implementation
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src-tauri/src/storage.rs docs/PHASE5_PROGRESS.md docs/SQLITE_SCHEMA_V5.md
+          git commit -m "feat: persist cache classification with scan entries"
+          git push
