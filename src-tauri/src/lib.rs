@@ -1,3 +1,4 @@
+pub mod cache_activity;
 mod cache_catalog;
 mod file_metrics;
 mod scan_jobs;
