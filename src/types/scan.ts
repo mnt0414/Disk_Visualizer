@@ -51,6 +51,7 @@ export type SavedScan = {
 
 export type CacheConfidence = 'high' | 'medium' | 'low'
 export type CacheCategory = 'browser' | 'media' | 'operatingSystem'
+export type CacheRuntimeState = 'stable' | 'changing' | 'unknown'
 export type CacheDefinition = {
   id: string
   definitionVersion: number
@@ -76,5 +77,6 @@ export type CacheEntryDetail = {
   cacheCatalogVersion: string
   cacheDefinitionId: string
   cacheDefinitionVersion: number
+  runtimeState: CacheRuntimeState | null
   definition: CacheDefinition | null
 }
