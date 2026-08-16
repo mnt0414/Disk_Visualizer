@@ -1,0 +1,4 @@
+replacement count mismatch: expected 1, got 0: '            modified_at: progress.modified_at,\n  cache_classification,\n'
+status=1
+ src-tauri/src/cache_activity.rs | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
