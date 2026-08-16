@@ -1,0 +1,419 @@
+
+> disk-visualizer@0.1.0 check
+> tsc -b --pretty false
+
+
+> disk-visualizer@0.1.0 test
+> vitest run
+
+
+[1m[46m RUN [49m[22m [36mv3.2.7 [39m[90m/home/runner/work/Disk_Visualizer/Disk_Visualizer[39m
+
+ [32m✓[39m src/App.test.tsx [2m([22m[2m1 test[22m[2m)[22m[32m 128[2mms[22m[39m
+ [31m❯[39m src/features/MockView.test.tsx [2m([22m[2m4 tests[22m[2m | [22m[31m2 failed[39m[2m)[22m[32m 227[2mms[22m[39m
+[31m   [31m×[31m MockView[2m > [22mrenders saved application cache evidence[39m[32m 83[2mms[22m[39m
+[31m     → Found multiple elements with the text: 4.0 KB
+
+Here are the matching elements:
+
+Ignored nodes: comments, script, style
+[36m<strong>[31m
+  [0m4.0 KB[0m
+[36m</strong>[31m
+
+Ignored nodes: comments, script, style
+[36m<td>[31m
+  [0m4.0 KB[0m
+[36m</td>[31m
+
+(If this is intentional, then use the `*AllBy*` variant of the query (like `queryAllByText`, `getAllByText`, or `findAllByText`)).
+
+Ignored nodes: comments, script, style
+[36m<body>[31m
+  [36m<div>[31m
+    [36m<div[31m
+      [33mclass[31m=[32m"mock-stack app-cache-view"[31m
+    [36m>[31m
+      [36m<section[31m
+        [33maria-label[31m=[32m"キャッシュ履歴の選択"[31m
+        [33mclass[31m=[32m"cache-toolbar"[31m
+      [36m>[31m
+        [36m<div>[31m
+          [36m<span[31m
+            [33mclass[31m=[32m"eyebrow"[31m
+          [36m>[31m
+            [0mローカル保存[0m
+          [36m</span>[31m
+          [36m<strong>[31m
+            [0m保存済みスキャンから表示[0m
+          [36m</strong>[31m
+        [36m</div>[31m
+        [36m<label>[31m
+          [36m<span>[31m
+            [0mスキャン履歴[0m
+          [36m</span>[31m
+          [36m<select>[31m
+            [36m<option[31m
+              [33mvalue[31m=[32m"1"[31m
+            [36m>[31m
+              [0m8/15/2024, 5:33:20 AM · /Users/test[0m
+            [36m</option>[31m
+          [36m</select>[31m
+        [36m</label>[31m
+      [36m</section>[31m
+      [36m<div[31m
+        [33maria-live[31m=[32m"polite"[31m
+        [33mclass[31m=[32m"cache-callout"[31m
+      [36m>[31m
+        [36m<strong>[31m
+          [0m4.0 KB[0m
+        [36m</strong>[31m
+        [36m<span>[31m
+          [0m1件のアプリキャッシュ候補を表示[0m
+        [36m</span>[31m
+      [36m</div>[31m
+      [36m<section[31m
+        [33mclass[31m=[32m"panel mock-panel cache-results"[31m
+      [36m>[31m
+        [36m<div[31m
+          [33mclass[31m=[32m"mock-header"[31m
+        [36m>[31m
+          [36m<span[31m
+            [33mclass[31m=[32m"eyebrow"[31m
+          [36m>[31m
+            [0mスキャン結果[0m
+          [36m</span>[31m
+          [36m<h2>[31m
+            [0mキャッシュ候補[0m
+          [36m</h2>[31m
+        [36m</div>[31m
+        [36m<div[31m
+          [33mclass[31m=[32m"cache-table-scroll"[31m
+        [36m>[31m
+          [36m<table>[31m
+            [36m<thead>[31m
+              [36m<tr>[31m
+                [36m<th>[31m
+                  [0mアプリ／分類[0m
+                [36m</th>[31m
+                [36m<th>[31m
+                  [0m場所[0m
+                [36m</th>[31m
+                [36m<th>[31m
+                  [0m実使用量推定[0m
+                [36m</th>[31m
+                [36m<th>[31m
+                  [0m信頼度[0m
+                [36m</th>[31m
+              [36m</tr>[31m
+            [36m</thead>[31m
+            [36m<tbody>[31m
+              [36m<tr>[31m
+                [36m<td>[31m
+                  [36m<strong>[31m
+                    [0mGoogle Chrome[0m
+                  [36m</strong>[31m
+                  [36m<span[31m
+                    [33mclass[31m=[32m"cache-meta"[31m
+                  [36m>[31m
+                    [0mブラウザ[0m
+                  [36m</span>[31m
+                  [36m<details[31m
+                    [33mclass[31m=[32m"cache-details"[31m
+                  [36m>[31m
+                    [36m<summary>[31m
+                      [0m判定根拠と影響[0m
+                    [36m</summary>[31m
+                    [36m<dl>[31m
+                      [36m<div>[31m
+                        [36m<dt>[31m
+                          [0m根拠[0m
+                        [36m</dt>[31m
+                        [36m<dd>[31m
+                          [0m既知のアプリキャッシュパス、OS固有の保存場所[0m
+                        [36m</dd>[31m
+                      [36m</div>[31m
+                      [36m<div>[31m
+                        [36m<dt>[31m
+                          [0m再生成[0m
+                        [36m</dt>[31m
+                        [36m<dd>[31m
+                          [0m再生成可能[0m
+                        [36m</dd>[31m
+                      [36m</div>[31m
+                      [36m<div>[31m
+                        [36m<dt>[31m
+                          [0m整理時の影響[0m
+                        [36m</dt>[31m
+                        [36m<dd>[31m
+                          [0m次回起動後に再生成され、一時的に読み込みが遅くなる場合があります[0m
+                        [36m</dd>[31m
+                      [36m</div>[31m
+                      [36m<div>[31m
+                        [36m<dt>[31m
+                          [0m定義[0m
+                        [36m</dt>[31m
+                        [36m<dd>[31m
+                          [0m2026.08.1[0m
+                          [0m / v[0m
+                          [0m1[0m
+                        [36m</dd>[31m
+                      [36m</div>[31m
+                    [36m</dl>[31m
+                  [36m</details>[31m
+                [36m</td>[31m
+                [36m<td>[31m
+                  [36m<code[31m
+                    [33mtitle[31m=[32m"/Users/test/Library/Caches/Google/Chrome/data_1"[31m
+                  [36m>[31m
+                    [0m/Users/test/Library/Caches/Google/Chrome/data_1[0m
+                  [36m</code>[31m
+                [36m</td>[31m
+                [36m<td>[31m
+                  [0m4.0 KB[0m
+                [36m</td>[31m
+                [36m<td>[31m
+                  [0m高[0m
+                [36m</td>[31m
+              [36m</tr>[31m
+            [36m</tbody>[31m
+          [36m</table>[31m
+        [36m</div>[31m
+      [36m</section>[31m
+      [36m<p[31m
+        [33mclass[31m=[32m"safety-note"[31m
+      [36m>[31m
+        [0m「実使用量推定」は実際に解放できる容量を保証しません。アプリ内では削除せず、Finder／Explorerで場所と影響を確認します。[0m
+      [36m</p>[31m
+    [36m</div>[31m
+  [36m</div>[31m
+[36m</body>[31m[39m
+   [32m✓[39m MockView[2m > [22mrenders an empty state without saved scans[32m 12[2mms[22m[39m
+   [32m✓[39m MockView[2m > [22mopens the native folder picker[32m 76[2mms[22m[39m
+[31m   [31m×[31m MockView[2m > [22mstarts a scan and renders its persisted result[39m[32m 55[2mms[22m[39m
+[31m     → expected [ <strong></strong>, <td></td>, …(2) ] to have a length of 2 but got 4[39m
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 2 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m src/features/MockView.test.tsx[2m > [22mMockView[2m > [22mrenders saved application cache evidence
+[31m[1mTestingLibraryElementError[22m[39m: Found multiple elements with the text: 4.0 KB
+
+Here are the matching elements:
+
+Ignored nodes: comments, script, style
+[36m<strong>[39m
+  [0m4.0 KB[0m
+[36m</strong>[39m
+
+Ignored nodes: comments, script, style
+[36m<td>[39m
+  [0m4.0 KB[0m
+[36m</td>[39m
+
+(If this is intentional, then use the `*AllBy*` variant of the query (like `queryAllByText`, `getAllByText`, or `findAllByText`)).
+
+Ignored nodes: comments, script, style
+[36m<body>[39m
+  [36m<div>[39m
+    [36m<div[39m
+      [33mclass[39m=[32m"mock-stack app-cache-view"[39m
+    [36m>[39m
+      [36m<section[39m
+        [33maria-label[39m=[32m"キャッシュ履歴の選択"[39m
+        [33mclass[39m=[32m"cache-toolbar"[39m
+      [36m>[39m
+        [36m<div>[39m
+          [36m<span[39m
+            [33mclass[39m=[32m"eyebrow"[39m
+          [36m>[39m
+            [0mローカル保存[0m
+          [36m</span>[39m
+          [36m<strong>[39m
+            [0m保存済みスキャンから表示[0m
+          [36m</strong>[39m
+        [36m</div>[39m
+        [36m<label>[39m
+          [36m<span>[39m
+            [0mスキャン履歴[0m
+          [36m</span>[39m
+          [36m<select>[39m
+            [36m<option[39m
+              [33mvalue[39m=[32m"1"[39m
+            [36m>[39m
+              [0m8/15/2024, 5:33:20 AM · /Users/test[0m
+            [36m</option>[39m
+          [36m</select>[39m
+        [36m</label>[39m
+      [36m</section>[39m
+      [36m<div[39m
+        [33maria-live[39m=[32m"polite"[39m
+        [33mclass[39m=[32m"cache-callout"[39m
+      [36m>[39m
+        [36m<strong>[39m
+          [0m4.0 KB[0m
+        [36m</strong>[39m
+        [36m<span>[39m
+          [0m1件のアプリキャッシュ候補を表示[0m
+        [36m</span>[39m
+      [36m</div>[39m
+      [36m<section[39m
+        [33mclass[39m=[32m"panel mock-panel cache-results"[39m
+      [36m>[39m
+        [36m<div[39m
+          [33mclass[39m=[32m"mock-header"[39m
+        [36m>[39m
+          [36m<span[39m
+            [33mclass[39m=[32m"eyebrow"[39m
+          [36m>[39m
+            [0mスキャン結果[0m
+          [36m</span>[39m
+          [36m<h2>[39m
+            [0mキャッシュ候補[0m
+          [36m</h2>[39m
+        [36m</div>[39m
+        [36m<div[39m
+          [33mclass[39m=[32m"cache-table-scroll"[39m
+        [36m>[39m
+          [36m<table>[39m
+            [36m<thead>[39m
+              [36m<tr>[39m
+                [36m<th>[39m
+                  [0mアプリ／分類[0m
+                [36m</th>[39m
+                [36m<th>[39m
+                  [0m場所[0m
+                [36m</th>[39m
+                [36m<th>[39m
+                  [0m実使用量推定[0m
+                [36m</th>[39m
+                [36m<th>[39m
+                  [0m信頼度[0m
+                [36m</th>[39m
+              [36m</tr>[39m
+            [36m</thead>[39m
+            [36m<tbody>[39m
+              [36m<tr>[39m
+                [36m<td>[39m
+                  [36m<strong>[39m
+                    [0mGoogle Chrome[0m
+                  [36m</strong>[39m
+                  [36m<span[39m
+                    [33mclass[39m=[32m"cache-meta"[39m
+                  [36m>[39m
+                    [0mブラウザ[0m
+                  [36m</span>[39m
+                  [36m<details[39m
+                    [33mclass[39m=[32m"cache-details"[39m
+                  [36m>[39m
+                    [36m<summary>[39m
+                      [0m判定根拠と影響[0m
+                    [36m</summary>[39m
+                    [36m<dl>[39m
+                      [36m<div>[39m
+                        [36m<dt>[39m
+                          [0m根拠[0m
+                        [36m</dt>[39m
+                        [36m<dd>[39m
+                          [0m既知のアプリキャッシュパス、OS固有の保存場所[0m
+                        [36m</dd>[39m
+                      [36m</div>[39m
+                      [36m<div>[39m
+                        [36m<dt>[39m
+                          [0m再生成[0m
+                        [36m</dt>[39m
+                        [36m<dd>[39m
+                          [0m再生成可能[0m
+                        [36m</dd>[39m
+                      [36m</div>[39m
+                      [36m<div>[39m
+                        [36m<dt>[39m
+                          [0m整理時の影響[0m
+                        [36m</dt>[39m
+                        [36m<dd>[39m
+                          [0m次回起動後に再生成され、一時的に読み込みが遅くなる場合があります[0m
+                        [36m</dd>[39m
+                      [36m</div>[39m
+                      [36m<div>[39m
+                        [36m<dt>[39m
+                          [0m定義[0m
+                        [36m</dt>[39m
+                        [36m<dd>[39m
+                          [0m2026.08.1[0m
+                          [0m / v[0m
+                          [0m1[0m
+                        [36m</dd>[39m
+                      [36m</div>[39m
+                    [36m</dl>[39m
+                  [36m</details>[39m
+                [36m</td>[39m
+                [36m<td>[39m
+                  [36m<code[39m
+                    [33mtitle[39m=[32m"/Users/test/Library/Caches/Google/Chrome/data_1"[39m
+                  [36m>[39m
+                    [0m/Users/test/Library/Caches/Google/Chrome/data_1[0m
+                  [36m</code>[39m
+                [36m</td>[39m
+                [36m<td>[39m
+                  [0m4.0 KB[0m
+                [36m</td>[39m
+                [36m<td>[39m
+                  [0m高[0m
+                [36m</td>[39m
+              [36m</tr>[39m
+            [36m</tbody>[39m
+          [36m</table>[39m
+        [36m</div>[39m
+      [36m</section>[39m
+      [36m<p[39m
+        [33mclass[39m=[32m"safety-note"[39m
+      [36m>[39m
+        [0m「実使用量推定」は実際に解放できる容量を保証しません。アプリ内では削除せず、Finder／Explorerで場所と影響を確認します。[0m
+      [36m</p>[39m
+    [36m</div>[39m
+  [36m</div>[39m
+[36m</body>[39m
+[90m [2m❯[22m Object.getElementError node_modules/@testing-library/dom/dist/config.js:[2m37:19[22m[39m
+[90m [2m❯[22m getElementError node_modules/@testing-library/dom/dist/query-helpers.js:[2m20:35[22m[39m
+[90m [2m❯[22m getMultipleElementsFoundError node_modules/@testing-library/dom/dist/query-helpers.js:[2m23:10[22m[39m
+[90m [2m❯[22m node_modules/@testing-library/dom/dist/query-helpers.js:[2m55:13[22m[39m
+[90m [2m❯[22m node_modules/@testing-library/dom/dist/query-helpers.js:[2m95:19[22m[39m
+[36m [2m❯[22m src/features/MockView.test.tsx:[2m105:19[22m[39m
+    [90m103| [39m    )
+    [90m104| [39m    expect(await screen.findByText('Google Chrome')).toBeInTheDocument…
+    [90m105| [39m    [34mexpect[39m(screen[33m.[39m[34mgetByText[39m([32m'4.0 KB'[39m))[33m.[39m[34mtoBeInTheDocument[39m()
+    [90m   | [39m                  [31m^[39m
+    [90m106| [39m    [34mexpect[39m(mockedListCacheEntries)[33m.[39m[34mtoHaveBeenCalledWith[39m([34m1[39m[33m,[39m [34m100[39m[33m,[39m [34m0[39m)
+    [90m107| [39m    fireEvent[33m.[39m[34mclick[39m(screen[33m.[39m[34mgetByText[39m([32m'判定根拠と影響'[39m))
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/features/MockView.test.tsx[2m > [22mMockView[2m > [22mstarts a scan and renders its persisted result
+[31m[1mAssertionError[22m: expected [ <strong></strong>, <td></td>, …(2) ] to have a length of 2 but got 4[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 2[39m
+[31m+ 4[39m
+
+[36m [2m❯[22m src/features/MockView.test.tsx:[2m147:43[22m[39m
+    [90m145| [39m      [34mexpect[39m(screen[33m.[39m[34mgetByText[39m([32m'note.txt'[39m))[33m.[39m[34mtoBeInTheDocument[39m()[33m,[39m
+    [90m146| [39m    )
+    [90m147| [39m    [34mexpect[39m(screen[33m.[39m[34mgetAllByText[39m([32m'4.0 KB'[39m))[33m.[39m[34mtoHaveLength[39m([34m2[39m)
+    [90m   | [39m                                          [31m^[39m
+    [90m148| [39m    expect(mockedStartScan).toHaveBeenCalledWith('/Users/test/Document…
+    [90m149| [39m  })
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯[22m[39m
+
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m1 passed[39m[22m[90m (2)[39m
+[2m      Tests [22m [1m[31m2 failed[39m[22m[2m | [22m[1m[32m3 passed[39m[22m[90m (5)[39m
+[2m   Start at [22m 04:58:41
+[2m   Duration [22m 1.35s[2m (transform 275ms, setup 194ms, collect 585ms, tests 355ms, environment 827ms, prepare 206ms)[22m
+
+
+::error file=/home/runner/work/Disk_Visualizer/Disk_Visualizer/src/features/MockView.test.tsx,title=src/features/MockView.test.tsx > MockView > renders saved application cache evidence,line=105,column=19::TestingLibraryElementError: Found multiple elements with the text: 4.0 KB%0A%0AHere are the matching elements:%0A%0AIgnored nodes: comments, script, style%0A<strong>%0A  4.0 KB%0A</strong>%0A%0AIgnored nodes: comments, script, style%0A<td>%0A  4.0 KB%0A</td>%0A%0A(If this is intentional, then use the `*AllBy*` variant of the query (like `queryAllByText`, `getAllByText`, or `findAllByText`)).%0A%0AIgnored nodes: comments, script, style%0A<body>%0A  <div>%0A    <div%0A      class="mock-stack app-cache-view"%0A    >%0A      <section%0A        aria-label="キャッシュ履歴の選択"%0A        class="cache-toolbar"%0A      >%0A        <div>%0A          <span%0A            class="eyebrow"%0A          >%0A            ローカル保存%0A          </span>%0A          <strong>%0A            保存済みスキャンから表示%0A          </strong>%0A        </div>%0A        <label>%0A          <span>%0A            スキャン履歴%0A          </span>%0A          <select>%0A            <option%0A              value="1"%0A            >%0A              8/15/2024, 5:33:20 AM · /Users/test%0A            </option>%0A          </select>%0A        </label>%0A      </section>%0A      <div%0A        aria-live="polite"%0A        class="cache-callout"%0A      >%0A        <strong>%0A          4.0 KB%0A        </strong>%0A        <span>%0A          1件のアプリキャッシュ候補を表示%0A        </span>%0A      </div>%0A      <section%0A        class="panel mock-panel cache-results"%0A      >%0A        <div%0A          class="mock-header"%0A        >%0A          <span%0A            class="eyebrow"%0A          >%0A            スキャン結果%0A          </span>%0A          <h2>%0A            キャッシュ候補%0A          </h2>%0A        </div>%0A        <div%0A          class="cache-table-scroll"%0A        >%0A          <table>%0A            <thead>%0A              <tr>%0A                <th>%0A                  アプリ／分類%0A                </th>%0A                <th>%0A                  場所%0A                </th>%0A                <th>%0A                  実使用量推定%0A                </th>%0A                <th>%0A                  信頼度%0A                </th>%0A              </tr>%0A            </thead>%0A            <tbody>%0A              <tr>%0A                <td>%0A                  <strong>%0A                    Google Chrome%0A                  </strong>%0A                  <span%0A                    class="cache-meta"%0A                  >%0A                    ブラウザ%0A                  </span>%0A                  <details%0A                    class="cache-details"%0A                  >%0A                    <summary>%0A                      判定根拠と影響%0A                    </summary>%0A                    <dl>%0A                      <div>%0A                        <dt>%0A                          根拠%0A                        </dt>%0A                        <dd>%0A                          既知のアプリキャッシュパス、OS固有の保存場所%0A                        </dd>%0A                      </div>%0A                      <div>%0A                        <dt>%0A                          再生成%0A                        </dt>%0A                        <dd>%0A                          再生成可能%0A                        </dd>%0A                      </div>%0A                      <div>%0A                        <dt>%0A                          整理時の影響%0A                        </dt>%0A                        <dd>%0A                          次回起動後に再生成され、一時的に読み込みが遅くなる場合があります%0A                        </dd>%0A                      </div>%0A                      <div>%0A                        <dt>%0A                          定義%0A                        </dt>%0A                        <dd>%0A                          2026.08.1%0A                           / v%0A                          1%0A                        </dd>%0A                      </div>%0A                    </dl>%0A                  </details>%0A                </td>%0A                <td>%0A                  <code%0A                    title="/Users/test/Library/Caches/Google/Chrome/data_1"%0A                  >%0A                    /Users/test/Library/Caches/Google/Chrome/data_1%0A                  </code>%0A                </td>%0A                <td>%0A                  4.0 KB%0A                </td>%0A                <td>%0A                  高%0A                </td>%0A              </tr>%0A            </tbody>%0A          </table>%0A        </div>%0A      </section>%0A      <p%0A        class="safety-note"%0A      >%0A        「実使用量推定」は実際に解放できる容量を保証しません。アプリ内では削除せず、Finder／Explorerで場所と影響を確認します。%0A      </p>%0A    </div>%0A  </div>%0A</body>%0A ❯ Object.getElementError node_modules/@testing-library/dom/dist/config.js:37:19%0A ❯ getElementError node_modules/@testing-library/dom/dist/query-helpers.js:20:35%0A ❯ getMultipleElementsFoundError node_modules/@testing-library/dom/dist/query-helpers.js:23:10%0A ❯ node_modules/@testing-library/dom/dist/query-helpers.js:55:13%0A ❯ node_modules/@testing-library/dom/dist/query-helpers.js:95:19%0A ❯ src/features/MockView.test.tsx:105:19%0A%0A
+
+::error file=/home/runner/work/Disk_Visualizer/Disk_Visualizer/src/features/MockView.test.tsx,title=src/features/MockView.test.tsx > MockView > starts a scan and renders its persisted result,line=147,column=43::AssertionError: expected [ <strong></strong>, <td></td>, …(2) ] to have a length of 2 but got 4%0A%0A- Expected%0A+ Received%0A%0A- 2%0A+ 4%0A%0A ❯ src/features/MockView.test.tsx:147:43%0A%0A
+check_status=0
