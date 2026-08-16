@@ -1,0 +1,37 @@
+name: Temporary isolated v5 backup fix
+
+on:
+  push:
+    branches: [feat/cache-runtime-state-storage]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/cache-runtime-state-storage
+      - name: Patch storage migration
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src-tauri/src/storage.rs')
+          text = path.read_text()
+          old = '            5 => Self::migrate_v5_to_v6(&connection)?,\n'
+          new = '            5 => {\n                self.consistent_backup(&connection, "sqlite3.v5-backup")?;\n                Self::migrate_v5_to_v6(&connection)?\n            }\n'
+          if text.count(old) != 1:
+              raise SystemExit('v5 migration branch not found')
+          path.write_text(text.replace(old, new))
+          PY
+      - name: Format Rust
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/src/storage.rs
+          git commit -m "fix: back up v5 before runtime state migration"
+          git push origin HEAD:feat/cache-runtime-state-storage
