@@ -16,6 +16,25 @@ pub enum CacheRuntimeState {
     Unknown,
 }
 
+impl CacheRuntimeState {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Changing => "changing",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "stable" => Some(Self::Stable),
+            "changing" => Some(Self::Changing),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CacheObservation {
     pub logical_size: Option<u64>,

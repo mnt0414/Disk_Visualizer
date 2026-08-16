@@ -1,3 +1,4 @@
+use crate::cache_activity::CacheRuntimeState;
 use crate::cache_catalog::{self, CacheDefinition};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -25,6 +26,7 @@ pub struct CacheEntryDetail {
     pub cache_catalog_version: String,
     pub cache_definition_id: String,
     pub cache_definition_version: u32,
+    pub runtime_state: Option<CacheRuntimeState>,
     pub definition: Option<CacheDefinition>,
 }
 
@@ -40,6 +42,7 @@ struct StoredCacheEntry {
     cache_catalog_version: String,
     cache_definition_id: String,
     cache_definition_version: i64,
+    runtime_state: Option<String>,
 }
 
 fn to_u64(value: i64, label: &str) -> Result<u64, String> {
@@ -95,7 +98,7 @@ impl CacheQueryRepository {
 
         let mut statement = connection
             .prepare(
-                "SELECT id,scan_id,name,path,size_bytes,logical_size,allocated_size,modified_at,cache_catalog_version,cache_definition_id,cache_definition_version FROM scan_entries WHERE scan_id=?1 AND cache_catalog_version IS NOT NULL AND cache_definition_id IS NOT NULL AND cache_definition_version IS NOT NULL ORDER BY size_bytes DESC,id ASC LIMIT ?2 OFFSET ?3",
+                "SELECT id,scan_id,name,path,size_bytes,logical_size,allocated_size,modified_at,cache_catalog_version,cache_definition_id,cache_definition_version,cache_runtime_state FROM scan_entries WHERE scan_id=?1 AND cache_catalog_version IS NOT NULL AND cache_definition_id IS NOT NULL AND cache_definition_version IS NOT NULL ORDER BY size_bytes DESC,id ASC LIMIT ?2 OFFSET ?3",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
@@ -114,6 +117,7 @@ impl CacheQueryRepository {
                         cache_catalog_version: row.get(8)?,
                         cache_definition_id: row.get(9)?,
                         cache_definition_version: row.get(10)?,
+                        runtime_state: row.get(11)?,
                     })
                 },
             )
@@ -128,6 +132,14 @@ impl CacheQueryRepository {
             .map(|entry| {
                 let definition_version = u32::try_from(entry.cache_definition_version)
                     .map_err(|_| "キャッシュ定義バージョンが不正です".to_owned())?;
+                let runtime_state = entry
+                    .runtime_state
+                    .as_deref()
+                    .map(|value| {
+                        CacheRuntimeState::from_str(value)
+                            .ok_or_else(|| "キャッシュ実行時状態が不正です".to_owned())
+                    })
+                    .transpose()?;
                 let definition = if entry.cache_catalog_version == catalog.catalog_version {
                     catalog
                         .definitions
@@ -152,6 +164,7 @@ impl CacheQueryRepository {
                     cache_catalog_version: entry.cache_catalog_version,
                     cache_definition_id: entry.cache_definition_id,
                     cache_definition_version: definition_version,
+                    runtime_state,
                     definition,
                 })
             })
@@ -176,7 +189,7 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,status TEXT NOT NULL); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL,name TEXT NOT NULL,path TEXT NOT NULL,size_bytes INTEGER NOT NULL,logical_size INTEGER NOT NULL,allocated_size INTEGER,modified_at INTEGER,cache_catalog_version TEXT,cache_definition_id TEXT,cache_definition_version INTEGER);",
+                "CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,status TEXT NOT NULL); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL,name TEXT NOT NULL,path TEXT NOT NULL,size_bytes INTEGER NOT NULL,logical_size INTEGER NOT NULL,allocated_size INTEGER,modified_at INTEGER,cache_catalog_version TEXT,cache_definition_id TEXT,cache_definition_version INTEGER,cache_runtime_state TEXT CHECK(cache_runtime_state IN ('stable','changing','unknown')));",
             )
             .unwrap();
         connection
@@ -189,7 +202,7 @@ mod tests {
         let definition = &catalog.definitions[0];
         connection
             .execute(
-                "INSERT INTO scan_entries (id,scan_id,name,path,size_bytes,logical_size,allocated_size,modified_at,cache_catalog_version,cache_definition_id,cache_definition_version) VALUES (1,1,'cache.bin','/tmp/cache.bin',1024,2048,4096,1723700000,?1,?2,?3)",
+                "INSERT INTO scan_entries (id,scan_id,name,path,size_bytes,logical_size,allocated_size,modified_at,cache_catalog_version,cache_definition_id,cache_definition_version,cache_runtime_state) VALUES (1,1,'cache.bin','/tmp/cache.bin',1024,2048,4096,1723700000,?1,?2,?3,'stable')",
                 params![
                     catalog.catalog_version,
                     definition.id,
@@ -209,6 +222,7 @@ mod tests {
         assert_eq!(entries[0].size_bytes, 1024);
         assert_eq!(entries[0].logical_size, 2048);
         assert_eq!(entries[0].allocated_size, Some(4096));
+        assert_eq!(entries[0].runtime_state, Some(CacheRuntimeState::Stable));
         assert!(entries[0].definition.is_some());
         std::fs::remove_file(repository.database_path).unwrap();
     }
