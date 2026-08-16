@@ -1,4 +1,7 @@
+use crate::file_metrics;
 use serde::Serialize;
+use std::fs;
+use std::path::Path;
 
 /// Runtime state inferred from two metadata observations.
 ///
@@ -26,6 +29,28 @@ impl CacheObservation {
     }
 }
 
+/// Captures a read-only observation of a regular file.
+///
+/// Links, directories, missing paths, and unavailable handle snapshots return
+/// `None` so callers can preserve `unknown` rather than infer a false state.
+pub fn observe_path(path: &Path) -> Option<CacheObservation> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || file_metrics::is_non_followed_link(&metadata) {
+        return None;
+    }
+    let metrics = file_metrics::collect(path, &metadata)?;
+    let file_identity = match (metrics.volume_identity, metrics.file_identity) {
+        (Some(volume), Some(file)) => Some(format!("{volume}:{file}")),
+        (None, Some(file)) => Some(file),
+        _ => None,
+    };
+    Some(CacheObservation {
+        logical_size: Some(metrics.logical_size),
+        modified_at: metrics.modified_at,
+        file_identity,
+    })
+}
+
 /// Compares observations captured around a scan operation.
 ///
 /// Missing observations, or observations with no usable metadata, remain
@@ -51,9 +76,16 @@ pub fn evaluate_runtime_state(
     }
 }
 
+/// Re-observes a path after an earlier observation and evaluates its state.
+pub fn evaluate_path_after(path: &Path, before: Option<&CacheObservation>) -> CacheRuntimeState {
+    let after = observe_path(path);
+    evaluate_runtime_state(before, after.as_ref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn observation() -> CacheObservation {
         CacheObservation {
@@ -61,6 +93,19 @@ mod tests {
             modified_at: Some(1_723_700_000),
             file_identity: Some("volume-7:file-42".to_owned()),
         }
+    }
+
+    fn temporary_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "disk-visualizer-cache-activity-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::write(&path, bytes).unwrap();
+        path
     }
 
     #[test]
@@ -109,6 +154,40 @@ mod tests {
         let empty = CacheObservation::default();
         assert_eq!(
             evaluate_runtime_state(Some(&empty), Some(&empty)),
+            CacheRuntimeState::Unknown
+        );
+    }
+
+    #[test]
+    fn observes_regular_files_without_reading_contents() {
+        let path = temporary_file("observe", b"1234");
+        let observed = observe_path(&path).expect("regular file observation");
+        assert_eq!(observed.logical_size, Some(4));
+        assert!(observed.modified_at.is_some());
+        #[cfg(any(unix, windows))]
+        assert!(observed.file_identity.is_some());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn re_observation_detects_size_changes() {
+        let path = temporary_file("changing", b"1234");
+        let before = observe_path(&path);
+        fs::write(&path, b"12345678").unwrap();
+        assert_eq!(
+            evaluate_path_after(&path, before.as_ref()),
+            CacheRuntimeState::Changing
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn missing_re_observation_remains_unknown() {
+        let path = temporary_file("missing", b"1234");
+        let before = observe_path(&path);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            evaluate_path_after(&path, before.as_ref()),
             CacheRuntimeState::Unknown
         );
     }
