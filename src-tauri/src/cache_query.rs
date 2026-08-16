@@ -147,10 +147,7 @@ impl CacheQueryRepository {
                     path: entry.path,
                     size_bytes: to_u64(entry.size_bytes, "集計サイズ")?,
                     logical_size: to_u64(entry.logical_size, "論理サイズ")?,
-                    allocated_size: optional_to_u64(
-                        entry.allocated_size,
-                        "割り当て済みサイズ",
-                    )?,
+                    allocated_size: optional_to_u64(entry.allocated_size, "割り当て済みサイズ")?,
                     modified_at: entry.modified_at,
                     cache_catalog_version: entry.cache_catalog_version,
                     cache_definition_id: entry.cache_definition_id,
@@ -227,9 +224,7 @@ mod tests {
     fn validates_query_limit() {
         let repository = repository("limit", "complete");
         assert!(repository.list(1, Some(0), None).is_err());
-        assert!(repository
-            .list(1, Some(MAX_QUERY_LIMIT + 1), None)
-            .is_err());
+        assert!(repository.list(1, Some(MAX_QUERY_LIMIT + 1), None).is_err());
         std::fs::remove_file(repository.database_path).unwrap();
     }
 }
