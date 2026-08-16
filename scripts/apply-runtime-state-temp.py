@@ -17,4 +17,9 @@ parameter_patch = '''text = replace(text, "                            .map(|val
 """)
 '''
 script = script[:parameter_start] + parameter_patch + script[parameter_end:]
+field_start = script.index("text = replace(text, '''            modified_at: progress.modified_at,\n")
+field_end = script.index("text = replace(text, '        assert_eq!(version", field_start)
+field_patch = '''text = replace(text, "            cache_classification,\\n", "            cache_classification,\\n            cache_runtime_state,\\n")
+'''
+script = script[:field_start] + field_patch + script[field_end:]
 exec(compile(script, '<runtime-state-integration>', 'exec'), {})
