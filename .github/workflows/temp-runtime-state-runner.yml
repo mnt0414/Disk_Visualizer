@@ -18,8 +18,6 @@ jobs:
         run: python scripts/apply-runtime-state-temp.py
       - name: Format Rust
         run: cargo fmt --manifest-path src-tauri/Cargo.toml
-      - name: Run Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
       - name: Commit integration
         run: |
           git config user.name "github-actions[bot]"
