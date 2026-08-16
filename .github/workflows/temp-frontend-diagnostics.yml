@@ -1,0 +1,37 @@
+name: Temporary frontend diagnostics
+
+on:
+  push:
+    branches: [feat/cache-view-live-data]
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/cache-view-live-data
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - name: Capture frontend diagnostics
+        run: |
+          set +e
+          npm run check > frontend-diagnostics.log 2>&1
+          CHECK_STATUS=$?
+          if [ "$CHECK_STATUS" -eq 0 ]; then
+            npm test >> frontend-diagnostics.log 2>&1
+          fi
+          echo "check_status=$CHECK_STATUS" >> frontend-diagnostics.log
+          exit 0
+      - name: Commit diagnostics
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add frontend-diagnostics.log
+          git commit -m "ci: capture frontend diagnostics"
+          git push origin HEAD:feat/cache-view-live-data
