@@ -1,0 +1,47 @@
+name: Temporary UI QA fixes
+
+on:
+  push:
+    branches: [feat/cache-view-live-data]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/cache-view-live-data
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Apply visual QA fixes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          component = Path('src/features/AppCacheView.tsx')
+          text = component.read_text()
+          text = text.replace('`${entries.length.toLocaleString()}件のアプリキャッシュ候補`', '`${entries.length.toLocaleString()}件のアプリキャッシュ候補を表示`')
+          component.write_text(text)
+          css = Path('src/features/mock-views.css')
+          text = css.read_text()
+          text = text.replace('.cache-results table {\n  min-width: 880px;\n  font-size: 12px;', '.cache-results table {\n  min-width: 880px;\n  font-size: 13px;')
+          text = text.replace('.cache-results th {\n  font-size: 11px;', '.cache-results th {\n  font-size: 12px;')
+          text = text.replace('    11px/1.5 ui-monospace,', '    12px/1.5 ui-monospace,')
+          text = text.replace('.cache-meta {\n  display: block;\n  margin-top: 3px;\n  color: var(--color-text-muted);\n  font-size: 11px;', '.cache-meta {\n  display: block;\n  margin-top: 3px;\n  color: var(--color-text-muted);\n  font-size: 12px;')
+          text = text.replace('.cache-details summary {\n  min-height: 32px;', '.cache-details summary {\n  min-height: 44px;')
+          text = text.replace('grid-template-columns: 76px 1fr;', 'grid-template-columns: 96px 1fr;')
+          text = text.replace('.safety-note {\n  margin: 0;\n  padding: var(--space-3);\n  background: var(--color-surface-muted);\n  color: var(--color-text-muted);\n  font-size: 11px;', '.safety-note {\n  margin: 0;\n  padding: var(--space-3);\n  background: var(--color-surface-muted);\n  color: var(--color-text-muted);\n  font-size: 12px;')
+          css.write_text(text)
+          PY
+      - name: Format changed files
+        run: npx --yes prettier --write src/features/AppCacheView.tsx src/features/mock-views.css
+      - name: Commit QA fixes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/features/AppCacheView.tsx src/features/mock-views.css
+          git commit -m "fix: improve app cache view readability"
+          git push origin HEAD:feat/cache-view-live-data
