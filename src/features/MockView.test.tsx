@@ -55,6 +55,15 @@ const result = {
     },
   ],
 }
+const savedScan = {
+  id: 1,
+  rootPath: '/Users/test',
+  totalSizeBytes: 1024,
+  fileCount: 1,
+  directoryCount: 0,
+  skippedCount: 0,
+  completedAt: 1723700000,
+}
 const cacheEntry = {
   id: 10,
   scanId: 1,
@@ -67,6 +76,7 @@ const cacheEntry = {
   cacheCatalogVersion: '2026.08.1',
   cacheDefinitionId: 'chrome.macos.cache',
   cacheDefinitionVersion: 1,
+  runtimeState: 'stable' as const,
   definition: {
     id: 'chrome.macos.cache',
     definitionVersion: 1,
@@ -86,29 +96,36 @@ const cacheEntry = {
   },
 }
 describe('MockView', () => {
-  it('renders saved application cache evidence', async () => {
-    mockedListSavedScans.mockResolvedValue([
-      {
-        id: 1,
-        rootPath: '/Users/test',
-        totalSizeBytes: 1024,
-        fileCount: 1,
-        directoryCount: 0,
-        skippedCount: 0,
-        completedAt: 1723700000,
-      },
-    ])
+  it('renders saved application cache evidence and runtime state', async () => {
+    mockedListSavedScans.mockResolvedValue([savedScan])
     mockedListCacheEntries.mockResolvedValue([cacheEntry])
     render(
       <MockView viewId="app-cache" label="アプリキャッシュ" description="" />,
     )
     expect(await screen.findByText('Google Chrome')).toBeInTheDocument()
     expect(screen.getAllByText('4.0 KB')).toHaveLength(2)
+    expect(screen.getByText('変化なし')).toBeInTheDocument()
     expect(mockedListCacheEntries).toHaveBeenCalledWith(1, 100, 0)
     fireEvent.click(screen.getByText('判定根拠と影響'))
     expect(
+      screen.getByText(
+        '観測中にメタデータの変化はありませんでした。未使用を保証する状態ではありません。',
+      ),
+    ).toBeInTheDocument()
+    expect(
       screen.getByText('既知のアプリキャッシュパス、OS固有の保存場所'),
     ).toBeInTheDocument()
+  })
+  it('distinguishes unrecorded runtime state from unknown', async () => {
+    mockedListSavedScans.mockResolvedValue([savedScan])
+    mockedListCacheEntries.mockResolvedValue([
+      { ...cacheEntry, id: 11, runtimeState: null },
+    ])
+    render(
+      <MockView viewId="app-cache" label="アプリキャッシュ" description="" />,
+    )
+    expect(await screen.findByText('未記録')).toBeInTheDocument()
+    expect(screen.queryByText('判定できず')).not.toBeInTheDocument()
   })
   it('renders an empty state without saved scans', async () => {
     render(

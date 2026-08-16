@@ -1,0 +1,55 @@
+.app-cache-view .cache-results table {
+  min-width: 1040px;
+}
+
+.app-cache-view .cache-results td:nth-child(1) {
+  width: 27%;
+}
+
+.app-cache-view .cache-results td:nth-child(2) {
+  width: 35%;
+}
+
+.app-cache-view .cache-results td:nth-child(3) {
+  width: 13%;
+  white-space: nowrap;
+}
+
+.app-cache-view .cache-results td:nth-child(4) {
+  width: 14%;
+  white-space: nowrap;
+}
+
+.app-cache-view .cache-results td:nth-child(5) {
+  width: 11%;
+}
+
+.cache-state {
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  padding: 3px var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.cache-state-stable {
+  border-color: color-mix(in srgb, var(--color-success) 35%, transparent);
+  background: var(--color-success-soft);
+  color: var(--color-success);
+}
+
+.cache-state-changing {
+  border-color: color-mix(in srgb, var(--color-warning) 35%, transparent);
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+}
+
+.cache-state-unknown,
+.cache-state-unrecorded {
+  border-color: var(--color-border);
+  background: var(--color-surface-muted);
+  color: var(--color-text-secondary);
+}

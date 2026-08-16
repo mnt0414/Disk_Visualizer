@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { listCacheEntries, listSavedScans } from '../services/scan'
-import type { CacheEntryDetail, SavedScan } from '../types/scan'
+import type {
+  CacheEntryDetail,
+  CacheRuntimeState,
+  SavedScan,
+} from '../types/scan'
+import './app-cache-state.css'
 
 const evidenceLabels: Record<string, string> = {
   knownApplicationCachePath: '既知のアプリキャッシュパス',
@@ -16,6 +21,31 @@ const categoryLabels = {
   operatingSystem: 'OS',
 }
 const confidenceLabels = { high: '高', medium: '中', low: '低' }
+const runtimeStateLabels: Record<
+  CacheRuntimeState,
+  { label: string; description: string }
+> = {
+  stable: {
+    label: '変化なし',
+    description:
+      '観測中にメタデータの変化はありませんでした。未使用を保証する状態ではありません。',
+  },
+  changing: {
+    label: '変化を検出',
+    description:
+      '観測中にidentity、サイズ、または更新時刻の変化を検出しました。整理前にアプリの動作を確認してください。',
+  },
+  unknown: {
+    label: '判定できず',
+    description:
+      'パスの消失や再観測失敗などにより、比較に必要な情報が不足しました。',
+  },
+}
+const unrecordedState = {
+  label: '未記録',
+  description:
+    'この履歴では実行時状態を記録していません。過去の結果を現在の情報で補完していません。',
+}
 
 function formatBytes(bytes: number) {
   if (!bytes) return '0 B'
@@ -31,6 +61,20 @@ function describeScan(scan: SavedScan) {
 }
 function displaySize(entry: CacheEntryDetail) {
   return entry.allocatedSize ?? entry.sizeBytes
+}
+function describeRuntimeState(state: CacheRuntimeState | null) {
+  return state ? runtimeStateLabels[state] : unrecordedState
+}
+function RuntimeStateBadge({ state }: { state: CacheRuntimeState | null }) {
+  const display = describeRuntimeState(state)
+  return (
+    <span
+      className={`cache-state cache-state-${state ?? 'unrecorded'}`}
+      title={display.description}
+    >
+      {display.label}
+    </span>
+  )
 }
 
 export function AppCacheView() {
@@ -148,12 +192,14 @@ export function AppCacheView() {
                   <th>アプリ／分類</th>
                   <th>場所</th>
                   <th>実使用量推定</th>
+                  <th>観測状態</th>
                   <th>信頼度</th>
                 </tr>
               </thead>
               <tbody>
                 {entries.map((entry) => {
                   const definition = entry.definition
+                  const runtimeState = describeRuntimeState(entry.runtimeState)
                   return (
                     <tr key={entry.id}>
                       <td>
@@ -168,52 +214,65 @@ export function AppCacheView() {
                         </span>
                         <details className="cache-details">
                           <summary>判定根拠と影響</summary>
-                          {definition ? (
-                            <dl>
-                              <div>
-                                <dt>根拠</dt>
-                                <dd>
-                                  {definition.evidence
-                                    .map(
-                                      (value) => evidenceLabels[value] ?? value,
-                                    )
-                                    .join('、')}
-                                </dd>
-                              </div>
-                              <div>
-                                <dt>再生成</dt>
-                                <dd>
-                                  {definition.regenerable
-                                    ? '再生成可能'
-                                    : '再生成可否は未確認'}
-                                </dd>
-                              </div>
-                              <div>
-                                <dt>整理時の影響</dt>
-                                <dd>
-                                  {impactLabels[definition.cleanupImpact] ??
-                                    definition.cleanupImpact}
-                                </dd>
-                              </div>
+                          <dl>
+                            <div>
+                              <dt>観測状態</dt>
+                              <dd>{runtimeState.description}</dd>
+                            </div>
+                            {definition ? (
+                              <>
+                                <div>
+                                  <dt>根拠</dt>
+                                  <dd>
+                                    {definition.evidence
+                                      .map(
+                                        (value) =>
+                                          evidenceLabels[value] ?? value,
+                                      )
+                                      .join('、')}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>再生成</dt>
+                                  <dd>
+                                    {definition.regenerable
+                                      ? '再生成可能'
+                                      : '再生成可否は未確認'}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>整理時の影響</dt>
+                                  <dd>
+                                    {impactLabels[definition.cleanupImpact] ??
+                                      definition.cleanupImpact}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>定義</dt>
+                                  <dd>
+                                    {entry.cacheCatalogVersion} / v
+                                    {entry.cacheDefinitionVersion}
+                                  </dd>
+                                </div>
+                              </>
+                            ) : (
                               <div>
                                 <dt>定義</dt>
                                 <dd>
-                                  {entry.cacheCatalogVersion} / v
-                                  {entry.cacheDefinitionVersion}
+                                  保存時と現在のカタログ版が異なるため、定義詳細を読み替えずに表示しています。
                                 </dd>
                               </div>
-                            </dl>
-                          ) : (
-                            <p>
-                              保存時と現在のカタログ版が異なるため、定義詳細を読み替えずに表示しています。
-                            </p>
-                          )}
+                            )}
+                          </dl>
                         </details>
                       </td>
                       <td>
                         <code title={entry.path}>{entry.path}</code>
                       </td>
                       <td>{formatBytes(displaySize(entry))}</td>
+                      <td>
+                        <RuntimeStateBadge state={entry.runtimeState} />
+                      </td>
                       <td>
                         {definition
                           ? confidenceLabels[definition.confidence]
@@ -228,7 +287,7 @@ export function AppCacheView() {
         )}
       </section>
       <p className="safety-note">
-        「実使用量推定」は実際に解放できる容量を保証しません。アプリ内では削除せず、Finder／Explorerで場所と影響を確認します。
+        「実使用量推定」は実際に解放できる容量を保証しません。「変化なし」は未使用を意味しません。アプリ内では削除せず、Finder／Explorerで場所と影響を確認します。
       </p>
     </div>
   )
