@@ -128,15 +128,18 @@ impl CacheQueryRepository {
             .map(|entry| {
                 let definition_version = u32::try_from(entry.cache_definition_version)
                     .map_err(|_| "キャッシュ定義バージョンが不正です".to_owned())?;
-                let definition = (entry.cache_catalog_version == catalog.catalog_version)
-                    .then(|| {
-                        catalog.definitions.iter().find(|definition| {
+                let definition = if entry.cache_catalog_version == catalog.catalog_version {
+                    catalog
+                        .definitions
+                        .iter()
+                        .find(|definition| {
                             definition.id == entry.cache_definition_id
                                 && definition.definition_version == definition_version
                         })
-                    })
-                    .flatten()
-                    .cloned();
+                        .cloned()
+                } else {
+                    None
+                };
                 Ok(CacheEntryDetail {
                     id: entry.id,
                     scan_id: entry.scan_id,
