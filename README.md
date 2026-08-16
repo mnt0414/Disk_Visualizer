@@ -2,7 +2,7 @@
 
 A lightweight, fast, offline disk usage visualizer for macOS and Windows.
 
-> Status: Phase 0 bootstrap. The application shell and build infrastructure are being established.
+> Status: Phase 5 application-cache recognition is in progress. Read-only scanning, saved history, cache classification, and runtime-state display are available for manual testing.
 
 ## Targets
 
@@ -16,9 +16,11 @@ A lightweight, fast, offline disk usage visualizer for macOS and Windows.
 - React
 - TypeScript
 - Vite
-- SQLite (introduced in a later phase)
+- SQLite
 
 ## Development
+
+Use Node.js 22 and the stable Rust toolchain.
 
 ```bash
 npm install
@@ -26,6 +28,8 @@ npm run tauri dev
 ```
 
 PNG and ICO assets required by Tauri are generated locally from the versioned icon source before development and production builds.
+
+For a safe first run and the current expected behavior, see [`docs/MANUAL_TESTING.md`](docs/MANUAL_TESTING.md).
 
 Quality checks:
 
