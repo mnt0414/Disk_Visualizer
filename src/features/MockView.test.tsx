@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { chooseFolder } from '../services/folderPicker'
 import { listCacheEntries, listSavedScans, startScan } from '../services/scan'
 import { MockView } from './MockView'
@@ -26,6 +26,7 @@ beforeEach(() => {
   mockedListSavedScans.mockResolvedValue([])
   mockedListCacheEntries.mockResolvedValue([])
 })
+afterEach(cleanup)
 const result = {
   rootPath: '/Users/test/Documents',
   totalSizeBytes: 1024,
@@ -102,7 +103,7 @@ describe('MockView', () => {
       <MockView viewId="app-cache" label="アプリキャッシュ" description="" />,
     )
     expect(await screen.findByText('Google Chrome')).toBeInTheDocument()
-    expect(screen.getByText('4.0 KB')).toBeInTheDocument()
+    expect(screen.getAllByText('4.0 KB')).toHaveLength(2)
     expect(mockedListCacheEntries).toHaveBeenCalledWith(1, 100, 0)
     fireEvent.click(screen.getByText('判定根拠と影響'))
     expect(
