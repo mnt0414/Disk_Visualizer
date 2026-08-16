@@ -124,7 +124,7 @@ export function AppCacheView() {
         <span>
           {loadingEntries
             ? 'キャッシュ候補を読み込んでいます…'
-            : `${entries.length.toLocaleString()}件のアプリキャッシュ候補`}
+            : `${entries.length.toLocaleString()}件のアプリキャッシュ候補を表示`}
         </span>
       </div>
       <section className="panel mock-panel cache-results">

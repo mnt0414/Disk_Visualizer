@@ -139,10 +139,10 @@
 }
 .cache-results table {
   min-width: 880px;
-  font-size: 12px;
+  font-size: 13px;
 }
 .cache-results th {
-  font-size: 11px;
+  font-size: 12px;
 }
 .cache-results td {
   vertical-align: top;
@@ -160,7 +160,7 @@
   overflow: hidden;
   color: var(--color-text-secondary);
   font:
-    11px/1.5 ui-monospace,
+    12px/1.5 ui-monospace,
     SFMono-Regular,
     Menlo,
     monospace;
@@ -171,13 +171,13 @@
   display: block;
   margin-top: 3px;
   color: var(--color-text-muted);
-  font-size: 11px;
+  font-size: 12px;
 }
 .cache-details {
   margin-top: var(--space-2);
 }
 .cache-details summary {
-  min-height: 32px;
+  min-height: 44px;
   display: flex;
   align-items: center;
   color: var(--color-accent);
@@ -192,7 +192,7 @@
 }
 .cache-details dl div {
   display: grid;
-  grid-template-columns: 76px 1fr;
+  grid-template-columns: 96px 1fr;
   gap: var(--space-2);
 }
 .cache-details dt {
@@ -270,7 +270,7 @@
   padding: var(--space-3);
   background: var(--color-surface-muted);
   color: var(--color-text-muted);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.6;
 }
 @media (max-width: 1120px) {
