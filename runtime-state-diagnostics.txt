@@ -1,0 +1,4 @@
+replacement count mismatch: expected 1, got 2: 'CREATE INDEX scan_entries_scan_cache ON scan_entries(scan_id,cache_definition_id'
+status=1
+ src-tauri/src/cache_activity.rs | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
