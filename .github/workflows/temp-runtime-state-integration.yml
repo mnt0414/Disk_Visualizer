@@ -1,0 +1,203 @@
+name: Temporary runtime state integration
+
+on:
+  push:
+    branches: [feat/cache-runtime-state-storage]
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/cache-runtime-state-storage
+      - name: Apply runtime state storage changes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace(text, old, new, count=None):
+              actual = text.count(old)
+              expected = 1 if count is None else count
+              if actual != expected:
+                  raise SystemExit(f'replacement count mismatch: expected {expected}, got {actual}: {old[:80]!r}')
+              return text.replace(old, new)
+
+          activity = Path('src-tauri/src/cache_activity.rs')
+          text = activity.read_text()
+          text = replace(text, '''pub enum CacheRuntimeState {
+    Stable,
+    Changing,
+    Unknown,
+}
+''', '''pub enum CacheRuntimeState {
+    Stable,
+    Changing,
+    Unknown,
+}
+
+impl CacheRuntimeState {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Changing => "changing",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "stable" => Some(Self::Stable),
+            "changing" => Some(Self::Changing),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+''')
+          activity.write_text(text)
+
+          storage = Path('src-tauri/src/storage.rs')
+          text = storage.read_text()
+          text = replace(text, 'use crate::cache_catalog::{self, CacheClassificationRef};\n', 'use crate::cache_activity::{self, CacheObservation, CacheRuntimeState};\nuse crate::cache_catalog::{self, CacheClassificationRef};\n')
+          text = replace(text, '    cache_classification: Option<CacheClassificationRef>,\n', '    cache_classification: Option<CacheClassificationRef>,\n    cache_runtime_state: Option<CacheRuntimeState>,\n')
+          text = replace(text, '            0 => Self::create_v5(&connection)?,\n', '            0 => Self::create_v6(&connection)?,\n')
+          text = replace(text, '                Self::migrate_v4_to_v5(&connection)?\n', '                Self::migrate_v4_to_v5(&connection)?;\n                Self::migrate_v5_to_v6(&connection)?\n', 4)
+          text = replace(text, '            5 => {}\n', '            5 => Self::migrate_v5_to_v6(&connection)?,\n            6 => {}\n')
+          text = replace(text, '    fn create_v5(connection: &Connection) -> Result<(), String> {\n', '    fn create_v6(connection: &Connection) -> Result<(), String> {\n')
+          text = replace(text, 'cache_definition_version INTEGER); CREATE INDEX scan_entries_scan_size', "cache_definition_version INTEGER,cache_runtime_state TEXT CHECK(cache_runtime_state IN ('stable','changing','unknown'))); CREATE INDEX scan_entries_scan_size")
+          text = replace(text, 'CREATE INDEX scan_entries_scan_cache ON scan_entries(scan_id,cache_definition_id); PRAGMA user_version=5;', 'CREATE INDEX scan_entries_scan_cache ON scan_entries(scan_id,cache_definition_id); PRAGMA user_version=6;', 1)
+          migration = '''    fn migrate_v4_to_v5(connection: &Connection) -> Result<(), String> {
+        connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE scan_entries ADD COLUMN cache_catalog_version TEXT; ALTER TABLE scan_entries ADD COLUMN cache_definition_id TEXT; ALTER TABLE scan_entries ADD COLUMN cache_definition_version INTEGER; CREATE INDEX scan_entries_scan_cache ON scan_entries(scan_id,cache_definition_id); PRAGMA user_version=5; COMMIT;").map_err(|e|format!("スキャン履歴をv5へ移行できません: {e}"))
+    }
+'''
+          text = replace(text, migration, migration + '''    fn migrate_v5_to_v6(connection: &Connection) -> Result<(), String> {
+        connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE scan_entries ADD COLUMN cache_runtime_state TEXT CHECK(cache_runtime_state IN ('stable','changing','unknown')); PRAGMA user_version=6; COMMIT;").map_err(|e|format!("スキャン履歴をv6へ移行できません: {e}"))
+    }
+''')
+          text = replace(text, 'cache_catalog_version,cache_definition_id,cache_definition_version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)', 'cache_catalog_version,cache_definition_id,cache_definition_version,cache_runtime_state) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)')
+          text = replace(text, '''                        entry
+                            .cache_classification
+                            .as_ref()
+                            .map(|value| i64::from(value.definition_version)),
+''', '''                        entry
+                            .cache_classification
+                            .as_ref()
+                            .map(|value| i64::from(value.definition_version)),
+                        entry
+                            .cache_runtime_state
+                            .as_ref()
+                            .map(CacheRuntimeState::as_str),
+''')
+          text = replace(text, 'impl StreamingScanWriter {\n', '''fn observation_from_progress(progress: &ScanProgress) -> Option<CacheObservation> {
+    if progress.file_count != 1 || progress.skipped_count != 0 {
+        return None;
+    }
+    let file_identity = match (
+        progress.volume_identity.as_ref(),
+        progress.file_identity.as_ref(),
+    ) {
+        (Some(volume), Some(file)) => Some(format!("{volume}:{file}")),
+        (None, Some(file)) => Some(file.clone()),
+        _ => None,
+    };
+    Some(CacheObservation {
+        logical_size: Some(progress.logical_size_bytes),
+        modified_at: progress.modified_at,
+        file_identity,
+    })
+}
+
+impl StreamingScanWriter {
+''')
+          text = replace(text, '''        let cache_classification = cache_catalog::classify_absolute_path(path);
+        let entry = IndexedEntry {
+''', '''        let cache_classification = cache_catalog::classify_absolute_path(path);
+        let before = cache_classification
+            .as_ref()
+            .and_then(|_| observation_from_progress(progress));
+        let cache_runtime_state = cache_classification
+            .as_ref()
+            .map(|_| cache_activity::evaluate_path_after(path, before.as_ref()));
+        let entry = IndexedEntry {
+''')
+          text = replace(text, '''            modified_at: progress.modified_at,
+            cache_classification,
+''', '''            modified_at: progress.modified_at,
+            cache_classification,
+            cache_runtime_state,
+''')
+          text = replace(text, '        assert_eq!(version, 5);\n', '        assert_eq!(version, 6);\n')
+          text = replace(text, '''        assert_eq!(stored.2, 1);
+        assert!(stored.1.contains("chrome"));
+''', '''        assert_eq!(stored.2, 1);
+        assert!(stored.1.contains("chrome"));
+        let runtime_state: String = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT cache_runtime_state FROM scan_entries LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runtime_state, "unknown");
+''')
+          storage.write_text(text)
+
+          query = Path('src-tauri/src/cache_query.rs')
+          text = query.read_text()
+          text = replace(text, 'use crate::cache_catalog::{self, CacheDefinition};\n', 'use crate::cache_activity::CacheRuntimeState;\nuse crate::cache_catalog::{self, CacheDefinition};\n')
+          text = replace(text, '    pub cache_definition_version: u32,\n    pub definition:', '    pub cache_definition_version: u32,\n    pub runtime_state: Option<CacheRuntimeState>,\n    pub definition:')
+          text = replace(text, '    cache_definition_version: i64,\n}', '    cache_definition_version: i64,\n    runtime_state: Option<String>,\n}')
+          text = replace(text, 'cache_catalog_version,cache_definition_id,cache_definition_version FROM scan_entries', 'cache_catalog_version,cache_definition_id,cache_definition_version,cache_runtime_state FROM scan_entries')
+          text = replace(text, '                        cache_definition_version: row.get(10)?,\n', '                        cache_definition_version: row.get(10)?,\n                        runtime_state: row.get(11)?,\n')
+          text = replace(text, '''                let definition = if entry.cache_catalog_version == catalog.catalog_version {
+''', '''                let runtime_state = entry
+                    .runtime_state
+                    .as_deref()
+                    .map(|value| {
+                        CacheRuntimeState::from_str(value)
+                            .ok_or_else(|| "キャッシュ実行時状態が不正です".to_owned())
+                    })
+                    .transpose()?;
+                let definition = if entry.cache_catalog_version == catalog.catalog_version {
+''')
+          text = replace(text, '                    cache_definition_version: definition_version,\n                    definition,', '                    cache_definition_version: definition_version,\n                    runtime_state,\n                    definition,')
+          text = replace(text, 'cache_definition_version INTEGER);",', "cache_definition_version INTEGER,cache_runtime_state TEXT CHECK(cache_runtime_state IN ('stable','changing','unknown')));\",")
+          text = replace(text, 'cache_definition_id,cache_definition_version) VALUES (1,1', "cache_definition_id,cache_definition_version,cache_runtime_state) VALUES (1,1")
+          text = replace(text, '1723700000,?1,?2,?3)\",', "1723700000,?1,?2,?3,'stable')\",")
+          text = replace(text, '''        assert!(entries[0].definition.is_some());
+''', '''        assert_eq!(entries[0].runtime_state, Some(CacheRuntimeState::Stable));
+        assert!(entries[0].definition.is_some());
+''')
+          query.write_text(text)
+
+          docs = Path('docs/SQLITE_SCHEMA_V6.md')
+          docs.write_text('''# SQLite schema v6
+
+Phase 5のキャッシュ実行時状態を履歴として再現できるよう、`scan_entries`へ以下を追加する。
+
+- `cache_runtime_state`: `stable`／`changing`／`unknown`
+
+新規スキャンでは、キャッシュ分類された項目だけに状態を保存する。ファイルの最初のメタデータsnapshotと、保存直前の読み取り専用再観測を比較し、identity・論理サイズ・更新時刻のいずれかが変化した場合は`changing`、同一なら`stable`、比較材料が不足した場合は`unknown`とする。
+
+`stable`は「別プロセスが使用していない」ことを保証しない。アプリはファイル内容を読まず、排他ロックも取得しない。
+
+v5以前の履歴は再観測できないため、移行後も`NULL`のまま保持する。過去履歴へ`unknown`を補完せず、「未記録」と「観測したが不明」を区別する。v5からの移行前には整合したバックアップを作成する。
+''')
+          PY
+      - name: Format Rust
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Commit integration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/src/cache_activity.rs src-tauri/src/storage.rs src-tauri/src/cache_query.rs docs/SQLITE_SCHEMA_V6.md
+          git commit -m "feat: persist cache runtime state"
+          git push origin HEAD:feat/cache-runtime-state-storage
