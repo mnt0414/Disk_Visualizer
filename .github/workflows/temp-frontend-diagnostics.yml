@@ -21,17 +21,17 @@ jobs:
       - name: Capture frontend diagnostics
         run: |
           set +e
-          npm run check > frontend-diagnostics.log 2>&1
+          npm run check > frontend-diagnostics.txt 2>&1
           CHECK_STATUS=$?
           if [ "$CHECK_STATUS" -eq 0 ]; then
-            npm test >> frontend-diagnostics.log 2>&1
+            npm test >> frontend-diagnostics.txt 2>&1
           fi
-          echo "check_status=$CHECK_STATUS" >> frontend-diagnostics.log
+          echo "check_status=$CHECK_STATUS" >> frontend-diagnostics.txt
           exit 0
       - name: Commit diagnostics
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add frontend-diagnostics.log
+          git add frontend-diagnostics.txt
           git commit -m "ci: capture frontend diagnostics"
           git push origin HEAD:feat/cache-view-live-data
