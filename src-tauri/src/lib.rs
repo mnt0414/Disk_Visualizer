@@ -1,11 +1,13 @@
 pub mod cache_activity;
 mod cache_catalog;
+mod cache_query;
 mod file_metrics;
 mod scan_jobs;
 mod scanner;
 mod storage;
 
 use cache_catalog::{CacheCatalog, CacheDefinition, CachePathRoot, Platform};
+use cache_query::{CacheEntryDetail, CacheQueryRepository};
 use scan_jobs::{ScanJobSnapshot, ScanManager};
 use scanner::ScanSummary;
 use serde::Serialize;
@@ -74,6 +76,15 @@ fn list_saved_scans(repository: State<'_, ScanRepository>) -> Result<Vec<SavedSc
     repository.list()
 }
 #[tauri::command]
+fn list_cache_entries(
+    scan_id: i64,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    repository: State<'_, CacheQueryRepository>,
+) -> Result<Vec<CacheEntryDetail>, String> {
+    repository.list(scan_id, limit, offset)
+}
+#[tauri::command]
 fn delete_saved_scan(id: i64, repository: State<'_, ScanRepository>) -> Result<(), String> {
     repository.delete(id)
 }
@@ -85,9 +96,11 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let database_path = app.path().app_data_dir()?.join("scan-index.sqlite3");
+            let cache_query_repository = CacheQueryRepository::new(database_path.clone());
             let repository = ScanRepository::new(database_path);
             repository.initialize().map_err(std::io::Error::other)?;
             app.manage(ScanManager::new(repository.clone()));
+            app.manage(cache_query_repository);
             app.manage(repository);
             Ok(())
         })
@@ -103,6 +116,7 @@ pub fn run() {
             resume_scan,
             cancel_scan,
             list_saved_scans,
+            list_cache_entries,
             delete_saved_scan,
             check_scan_index
         ])
