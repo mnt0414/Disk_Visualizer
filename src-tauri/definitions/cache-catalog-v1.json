@@ -1,5 +1,5 @@
 {
-  "catalogVersion": "2026.08.1",
+  "catalogVersion": "2026.08.2",
   "definitions": [
     {
       "id": "safari.macos.web-cache",
@@ -8,7 +8,11 @@
       "applicationName": "Safari",
       "versionConstraint": "*",
       "category": "browser",
-      "path": { "root": "home", "relativePath": "Library/Caches/com.apple.Safari", "source": "fixed" },
+      "path": {
+        "root": "home",
+        "relativePath": "Library/Caches/com.apple.Safari",
+        "source": "fixed"
+      },
       "confidence": "high",
       "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
       "regenerable": true,
@@ -21,7 +25,11 @@
       "applicationName": "Google Chrome",
       "versionConstraint": "*",
       "category": "browser",
-      "path": { "root": "home", "relativePath": "Library/Caches/Google/Chrome", "source": "fixed" },
+      "path": {
+        "root": "home",
+        "relativePath": "Library/Caches/Google/Chrome",
+        "source": "fixed"
+      },
       "confidence": "high",
       "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
       "regenerable": true,
@@ -34,7 +42,11 @@
       "applicationName": "Firefox",
       "versionConstraint": "*",
       "category": "browser",
-      "path": { "root": "home", "relativePath": "Library/Caches/Firefox/Profiles", "source": "fixed" },
+      "path": {
+        "root": "home",
+        "relativePath": "Library/Caches/Firefox/Profiles",
+        "source": "fixed"
+      },
       "confidence": "high",
       "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
       "regenerable": true,
@@ -47,7 +59,11 @@
       "applicationName": "Google Chrome",
       "versionConstraint": "*",
       "category": "browser",
-      "path": { "root": "localAppData", "relativePath": "Google/Chrome/User Data/Default/Cache", "source": "fixed" },
+      "path": {
+        "root": "localAppData",
+        "relativePath": "Google/Chrome/User Data/Default/Cache",
+        "source": "fixed"
+      },
       "confidence": "high",
       "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
       "regenerable": true,
@@ -60,7 +76,11 @@
       "applicationName": "Microsoft Edge",
       "versionConstraint": "*",
       "category": "browser",
-      "path": { "root": "localAppData", "relativePath": "Microsoft/Edge/User Data/Default/Cache", "source": "fixed" },
+      "path": {
+        "root": "localAppData",
+        "relativePath": "Microsoft/Edge/User Data/Default/Cache",
+        "source": "fixed"
+      },
       "confidence": "high",
       "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
       "regenerable": true,
@@ -73,11 +93,117 @@
       "applicationName": "Firefox",
       "versionConstraint": "*",
       "category": "browser",
-      "path": { "root": "localAppData", "relativePath": "Mozilla/Firefox/Profiles", "source": "fixed" },
+      "path": {
+        "root": "localAppData",
+        "relativePath": "Mozilla/Firefox/Profiles",
+        "source": "fixed"
+      },
       "confidence": "high",
       "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
       "regenerable": true,
       "cleanupImpact": "browserMayRebuildCacheAndLoadSlower"
+    },
+    {
+      "id": "adobe.macos.media-cache-files",
+      "definitionVersion": 1,
+      "platform": "macos",
+      "applicationName": "Adobe Media Cache",
+      "versionConstraint": "*",
+      "category": "media",
+      "path": {
+        "root": "home",
+        "relativePath": "Library/Application Support/Adobe/Common/Media Cache Files",
+        "source": "fixed"
+      },
+      "confidence": "high",
+      "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
+      "regenerable": true,
+      "cleanupImpact": "mediaCacheWillBeRecreatedAndPlaybackMayBeSlower"
+    },
+    {
+      "id": "adobe.macos.media-cache-database",
+      "definitionVersion": 1,
+      "platform": "macos",
+      "applicationName": "Adobe Media Cache",
+      "versionConstraint": "*",
+      "category": "media",
+      "path": {
+        "root": "home",
+        "relativePath": "Library/Application Support/Adobe/Common/Media Cache",
+        "source": "fixed"
+      },
+      "confidence": "high",
+      "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
+      "regenerable": true,
+      "cleanupImpact": "mediaCacheWillBeRecreatedAndPlaybackMayBeSlower"
+    },
+    {
+      "id": "adobe.windows.media-cache-files",
+      "definitionVersion": 1,
+      "platform": "windows",
+      "applicationName": "Adobe Media Cache",
+      "versionConstraint": "*",
+      "category": "media",
+      "path": {
+        "root": "roamingAppData",
+        "relativePath": "Adobe/Common/Media Cache Files",
+        "source": "fixed"
+      },
+      "confidence": "high",
+      "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
+      "regenerable": true,
+      "cleanupImpact": "mediaCacheWillBeRecreatedAndPlaybackMayBeSlower"
+    },
+    {
+      "id": "adobe.windows.media-cache-database",
+      "definitionVersion": 1,
+      "platform": "windows",
+      "applicationName": "Adobe Media Cache",
+      "versionConstraint": "*",
+      "category": "media",
+      "path": {
+        "root": "roamingAppData",
+        "relativePath": "Adobe/Common/Media Cache",
+        "source": "fixed"
+      },
+      "confidence": "high",
+      "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
+      "regenerable": true,
+      "cleanupImpact": "mediaCacheWillBeRecreatedAndPlaybackMayBeSlower"
+    },
+    {
+      "id": "blender.macos.asset-library-cache",
+      "definitionVersion": 1,
+      "platform": "macos",
+      "applicationName": "Blender Asset Library Cache",
+      "versionConstraint": "*",
+      "category": "media",
+      "path": {
+        "root": "systemCache",
+        "relativePath": "Library/Caches/Blender",
+        "source": "fixed"
+      },
+      "confidence": "high",
+      "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
+      "regenerable": true,
+      "cleanupImpact": "assetLibraryCacheWillBeReindexed"
+    },
+    {
+      "id": "blender.windows.asset-library-cache",
+      "definitionVersion": 1,
+      "platform": "windows",
+      "applicationName": "Blender Asset Library Cache",
+      "versionConstraint": "*",
+      "category": "media",
+      "path": {
+        "root": "localAppData",
+        "relativePath": "Blender Foundation/Blender/Cache",
+        "source": "fixed"
+      },
+      "confidence": "high",
+      "evidence": ["knownApplicationCachePath", "platformSpecificPath"],
+      "regenerable": true,
+      "cleanupImpact": "assetLibraryCacheWillBeReindexed"
     }
   ]
 }

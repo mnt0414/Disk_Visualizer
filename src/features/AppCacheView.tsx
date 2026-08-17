@@ -14,6 +14,10 @@ const evidenceLabels: Record<string, string> = {
 const impactLabels: Record<string, string> = {
   browserMayRebuildCacheAndLoadSlower:
     '次回起動後に再生成され、一時的に読み込みが遅くなる場合があります',
+  mediaCacheWillBeRecreatedAndPlaybackMayBeSlower:
+    '必要に応じて再生成され、次回の読み込みや再生が一時的に遅くなる場合があります',
+  assetLibraryCacheWillBeReindexed:
+    'アセットライブラリの索引が再作成され、次回の検索に時間がかかる場合があります',
 }
 const categoryLabels = {
   browser: 'ブラウザ',
