@@ -630,7 +630,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(stored.0, "2026.08.1");
+        assert_eq!(stored.0, "2026.08.2");
         assert_eq!(stored.2, 1);
         assert!(stored.1.contains("chrome"));
         let runtime_state: String = repository

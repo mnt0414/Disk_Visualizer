@@ -329,23 +329,21 @@ mod tests {
     fn matches_adobe_media_cache_defaults() {
         let catalog = bundled_catalog().unwrap();
         assert_eq!(
-            catalog
-                .classify(
-                    Platform::Macos,
-                    CachePathRoot::Home,
-                    "Library/Application Support/Adobe/Common/Media Cache Files/peak.pek",
-                )[0]
-                .id,
+            catalog.classify(
+                Platform::Macos,
+                CachePathRoot::Home,
+                "Library/Application Support/Adobe/Common/Media Cache Files/peak.pek",
+            )[0]
+            .id,
             "adobe.macos.media-cache-files"
         );
         assert_eq!(
-            catalog
-                .classify(
-                    Platform::Windows,
-                    CachePathRoot::RoamingAppData,
-                    "adobe/common/media cache/index.db",
-                )[0]
-                .id,
+            catalog.classify(
+                Platform::Windows,
+                CachePathRoot::RoamingAppData,
+                "adobe/common/media cache/index.db",
+            )[0]
+            .id,
             "adobe.windows.media-cache-database"
         );
     }
@@ -366,23 +364,21 @@ mod tests {
     fn matches_blender_asset_library_cache_defaults() {
         let catalog = bundled_catalog().unwrap();
         assert_eq!(
-            catalog
-                .classify(
-                    Platform::Macos,
-                    CachePathRoot::SystemCache,
-                    "Library/Caches/Blender/assets/index.db",
-                )[0]
-                .id,
+            catalog.classify(
+                Platform::Macos,
+                CachePathRoot::SystemCache,
+                "Library/Caches/Blender/assets/index.db",
+            )[0]
+            .id,
             "blender.macos.asset-library-cache"
         );
         assert_eq!(
-            catalog
-                .classify(
-                    Platform::Windows,
-                    CachePathRoot::LocalAppData,
-                    "Blender Foundation/Blender/Cache/assets/index.db",
-                )[0]
-                .id,
+            catalog.classify(
+                Platform::Windows,
+                CachePathRoot::LocalAppData,
+                "Blender Foundation/Blender/Cache/assets/index.db",
+            )[0]
+            .id,
             "blender.windows.asset-library-cache"
         );
     }
