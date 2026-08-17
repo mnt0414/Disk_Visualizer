@@ -2,7 +2,7 @@
 
 A lightweight, fast, offline disk usage visualizer for macOS and Windows.
 
-> Status: Phase 5 application-cache recognition is in progress. Read-only scanning, saved history, cache classification, and runtime-state display are available for manual testing.
+> Status: Phase 5 application-cache recognition is complete. Read-only scanning, saved history, versioned cache classification, and runtime-state display are available for manual testing. Phase 6 incremental scanning is next.
 
 ## Targets
 
