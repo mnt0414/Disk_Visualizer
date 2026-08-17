@@ -236,24 +236,27 @@ fn current_platform() -> Option<Platform> {
 }
 
 fn configured_roots(platform: Platform) -> Vec<(CachePathRoot, PathBuf)> {
-    let variables: &[(CachePathRoot, &str)] = match platform {
-        Platform::Macos => &[
-            (CachePathRoot::Home, "HOME"),
-            (CachePathRoot::SystemCache, "HOME"),
-        ],
-        Platform::Windows => &[
+    match platform {
+        Platform::Macos => {
+            let mut roots = Vec::new();
+            if let Some(home) = std::env::var_os("HOME") {
+                roots.push((CachePathRoot::Home, home.into()));
+            }
+            roots.push((CachePathRoot::SystemCache, PathBuf::from("/")));
+            roots
+        }
+        Platform::Windows => [
             (CachePathRoot::Home, "USERPROFILE"),
             (CachePathRoot::LocalAppData, "LOCALAPPDATA"),
             (CachePathRoot::RoamingAppData, "APPDATA"),
             (CachePathRoot::SystemCache, "WINDIR"),
-        ],
-    };
-    variables
+        ]
         .iter()
         .filter_map(|(root, variable)| {
             std::env::var_os(variable).map(|value| (*root, value.into()))
         })
-        .collect()
+        .collect(),
+    }
 }
 
 static BUNDLED_CATALOG: OnceLock<Result<CacheCatalog, String>> = OnceLock::new();
@@ -284,8 +287,8 @@ mod tests {
     #[test]
     fn bundled_catalog_is_valid_and_versioned() {
         let catalog = bundled_catalog().unwrap();
-        assert_eq!(catalog.catalog_version, "2026.08.1");
-        assert!(catalog.definitions.len() >= 6);
+        assert_eq!(catalog.catalog_version, "2026.08.2");
+        assert!(catalog.definitions.len() >= 12);
     }
 
     #[test]
@@ -323,6 +326,68 @@ mod tests {
     }
 
     #[test]
+    fn matches_adobe_media_cache_defaults() {
+        let catalog = bundled_catalog().unwrap();
+        assert_eq!(
+            catalog
+                .classify(
+                    Platform::Macos,
+                    CachePathRoot::Home,
+                    "Library/Application Support/Adobe/Common/Media Cache Files/peak.pek",
+                )[0]
+                .id,
+            "adobe.macos.media-cache-files"
+        );
+        assert_eq!(
+            catalog
+                .classify(
+                    Platform::Windows,
+                    CachePathRoot::RoamingAppData,
+                    "adobe/common/media cache/index.db",
+                )[0]
+                .id,
+            "adobe.windows.media-cache-database"
+        );
+    }
+
+    #[test]
+    fn does_not_classify_adobe_common_parent() {
+        let catalog = bundled_catalog().unwrap();
+        assert!(catalog
+            .classify(
+                Platform::Macos,
+                CachePathRoot::Home,
+                "Library/Application Support/Adobe/Common/Preferences/settings.xml",
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn matches_blender_asset_library_cache_defaults() {
+        let catalog = bundled_catalog().unwrap();
+        assert_eq!(
+            catalog
+                .classify(
+                    Platform::Macos,
+                    CachePathRoot::SystemCache,
+                    "Library/Caches/Blender/assets/index.db",
+                )[0]
+                .id,
+            "blender.macos.asset-library-cache"
+        );
+        assert_eq!(
+            catalog
+                .classify(
+                    Platform::Windows,
+                    CachePathRoot::LocalAppData,
+                    "Blender Foundation/Blender/Cache/assets/index.db",
+                )[0]
+                .id,
+            "blender.windows.asset-library-cache"
+        );
+    }
+
+    #[test]
     fn resolves_absolute_paths_against_explicit_roots() {
         let catalog = bundled_catalog().unwrap();
         let roots = vec![(
@@ -339,6 +404,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(definition.id, "chrome.windows.default-cache");
+    }
+
+    #[test]
+    fn resolves_macos_system_cache_from_filesystem_root() {
+        let catalog = bundled_catalog().unwrap();
+        let roots = vec![(CachePathRoot::SystemCache, PathBuf::from("/"))];
+        let definition = catalog
+            .classify_absolute_with_roots(
+                Platform::Macos,
+                Path::new("/Library/Caches/Blender/assets/index.db"),
+                &roots,
+            )
+            .unwrap();
+        assert_eq!(definition.id, "blender.macos.asset-library-cache");
     }
 
     #[test]

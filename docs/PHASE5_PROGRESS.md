@@ -17,7 +17,11 @@
   - [x] UIで実行時状態を表示
   - [ ] OS固有の使用中判定を導入する場合の意味と失敗条件の定義
 - [x] UIで定義バージョン、根拠、信頼度、整理時影響を表示
-- [ ] Adobe、DaVinci Resolve、Autodesk Flame、Blender定義
+- [ ] 追加アプリ定義
+  - [x] Adobe Media CacheのmacOS／Windows既定パス
+  - [x] Blender Asset Library CacheのmacOS／Windows既定パス
+  - [ ] DaVinci Resolveの設定依存Cache／Proxy／Galleryパス
+  - [ ] Autodesk FlameのProject Home／Media Cache設定パス
 
 ## 使用中・変動中判定の方針
 
@@ -45,6 +49,16 @@ Linux上の一時検証環境ではTauriが必要とするGTK／GDK開発ライ�
 - `NULL`: 「未記録」。v5以前など、実行時状態を保存していない履歴
 
 状態は色だけに依存せず、ラベルと展開説明を併記する。安全注記でも「変化なし」は未使用を意味しないことを明示する。
+
+## 追加アプリ定義
+
+カタログ`2026.08.2`でAdobe Media CacheとBlender Asset Library Cacheを追加した。
+
+AdobeはmacOSの`~/Library/Application Support/Adobe/Common`とWindowsの`%APPDATA%/Adobe/Common`配下について、`Media Cache Files`と`Media Cache`だけを分類する。`Adobe/Common`全体や設定で変更された場所は分類しない。整理後は必要に応じてキャッシュが再生成され、次回の読み込みや再生が一時的に遅くなる可能性を表示する。
+
+Blenderは公式資料のAsset Library索引キャッシュだけを分類する。macOSの`/Library/Caches/Blender`はファイルシステムルート基準の`systemCache`として解決し、Windowsは`%LOCALAPPDATA%/Blender Foundation/Blender/Cache`を使う。物理シミュレーション、レンダー一時データ、自動保存、外部キャッシュは対象外とする。
+
+DaVinci ResolveとAutodesk Flameは保存場所がプロジェクト・ユーザー設定や共有ストレージ構成に依存するため、設定を読み取れるまで固定パス定義を追加しない。
 
 ## 保存済みキャッシュ分類query
 
