@@ -55,7 +55,9 @@ impl IndexCheckpointRepository {
                 if !backup.exists() {
                     connection
                         .execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
-                        .map_err(|error| format!("v7移行前バックアップを作成できません: {error}"))?;
+                        .map_err(|error| {
+                            format!("v7移行前バックアップを作成できません: {error}")
+                        })?;
                     let backup_connection = Connection::open(&backup)
                         .map_err(|error| format!("v7移行前バックアップを開けません: {error}"))?;
                     let check: String = backup_connection
@@ -69,7 +71,11 @@ impl IndexCheckpointRepository {
                 connection.execute_batch("BEGIN IMMEDIATE; CREATE TABLE index_checkpoints (root_path TEXT PRIMARY KEY,platform TEXT NOT NULL CHECK(platform IN ('macos','windows')),volume_identity TEXT NOT NULL,root_identity TEXT NOT NULL,history_source TEXT NOT NULL CHECK(history_source IN ('fsevents','usn')),history_token TEXT NOT NULL,updated_at INTEGER NOT NULL); PRAGMA user_version=7; COMMIT;").map_err(|error|format!("スキャン履歴をv7へ移行できません: {error}"))?;
             }
             7 => {}
-            other => return Err(format!("checkpoint移行元として未対応のDBバージョンです: {other}")),
+            other => {
+                return Err(format!(
+                    "checkpoint移行元として未対応のDBバージョンです: {other}"
+                ))
+            }
         }
         Ok(())
     }
@@ -167,9 +173,15 @@ mod tests {
     fn saves_loads_and_updates_checkpoint_by_root() {
         let repository = repository("upsert");
         repository.save(&checkpoint("100")).unwrap();
-        assert_eq!(repository.load("/Volumes/Data").unwrap(), Some(checkpoint("100")));
+        assert_eq!(
+            repository.load("/Volumes/Data").unwrap(),
+            Some(checkpoint("100"))
+        );
         repository.save(&checkpoint("200")).unwrap();
-        assert_eq!(repository.load("/Volumes/Data").unwrap(), Some(checkpoint("200")));
+        assert_eq!(
+            repository.load("/Volumes/Data").unwrap(),
+            Some(checkpoint("200"))
+        );
     }
 
     #[test]
