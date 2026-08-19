@@ -2,7 +2,7 @@ pub mod cache_activity;
 mod cache_catalog;
 mod cache_query;
 mod file_metrics;
-mod index_trust;
+pub mod index_trust;
 mod scan_jobs;
 mod scanner;
 mod storage;
