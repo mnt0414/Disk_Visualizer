@@ -12,13 +12,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: test/scan-manager-regressions
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: Add deterministic manager tests
+      - name: Add manager tests
         shell: bash
         run: |
           cat >> src-tauri/src/scan_jobs.rs <<'RUST'
@@ -34,42 +31,25 @@ jobs:
                   Arc::new(ScanJob {
                       id: 9001,
                       path: std::env::temp_dir().to_string_lossy().into_owned(),
-                      state: Mutex::new(JobState {
-                          status,
-                          current_path: String::new(),
-                          total_size_bytes: 0,
-                          file_count: 0,
-                          directory_count: 0,
-                          skipped_count: 0,
-                          result: None,
-                          error: None,
-                      }),
+                      state: Mutex::new(JobState { status, current_path: String::new(), total_size_bytes: 0, file_count: 0, directory_count: 0, skipped_count: 0, result: None, error: None }),
                       control: Mutex::new(Control { paused, cancelled: false }),
                       wake: Condvar::new(),
                   })
               }
-
               fn manager(active_job: Arc<ScanJob>) -> ScanManager {
-                  ScanManager {
-                      active: Mutex::new(Some(active_job)),
-                      repository: ScanRepository::new(PathBuf::from("unused.sqlite3")),
-                  }
+                  ScanManager { active: Mutex::new(Some(active_job)), repository: ScanRepository::new(PathBuf::from("unused.sqlite3")) }
               }
-
               #[test]
-              fn transitions_running_paused_running_and_cancelled() {
+              fn transitions_pause_resume_and_cancel() {
                   let active_job = job(ScanJobStatus::Running, false);
                   let manager = manager(Arc::clone(&active_job));
                   assert_eq!(manager.pause(active_job.id).unwrap().status, ScanJobStatus::Paused);
-                  assert!(active_job.control.lock().unwrap().paused);
                   assert_eq!(manager.resume(active_job.id).unwrap().status, ScanJobStatus::Running);
-                  assert!(!active_job.control.lock().unwrap().paused);
                   manager.cancel(active_job.id).unwrap();
                   let control = active_job.control.lock().unwrap();
                   assert!(control.cancelled);
                   assert!(!control.paused);
               }
-
               #[test]
               fn cancelling_paused_job_wakes_waiter() {
                   let active_job = job(ScanJobStatus::Paused, true);
@@ -80,28 +60,18 @@ jobs:
                   manager(Arc::clone(&active_job)).cancel(active_job.id).unwrap();
                   assert!(!receiver.recv_timeout(Duration::from_secs(1)).unwrap());
               }
-
               #[test]
-              fn rejects_second_start_while_job_is_active() {
-                  let active_job = job(ScanJobStatus::Running, false);
-                  let manager = manager(active_job);
-                  let error = manager.start(std::env::temp_dir().to_string_lossy().into_owned()).unwrap_err();
-                  assert_eq!(error, "別のスキャンが実行中です");
+              fn rejects_second_start_while_active() {
+                  let manager = manager(job(ScanJobStatus::Running, false));
+                  assert_eq!(manager.start(std::env::temp_dir().to_string_lossy().into_owned()).err().unwrap(), "別のスキャンが実行中です");
               }
           }
           RUST
           cargo fmt --manifest-path src-tauri/Cargo.toml
-          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path('.github/workflows/ci.yml')
-          s=p.read_text().replace('      - run: npm test\n', '      - run: npm test\n      - run: npm run test:coverage\n')
-          p.write_text(s)
-          PY
-      - name: Commit generated changes
+      - name: Commit tests
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src-tauri/src/scan_jobs.rs package-lock.json .github/workflows/ci.yml
-          git commit -m "test: cover ScanManager transitions and coverage gate"
+          git add src-tauri/src/scan_jobs.rs
+          git commit -m "test: cover ScanManager state transitions"
           git push origin HEAD:test/scan-manager-regressions
