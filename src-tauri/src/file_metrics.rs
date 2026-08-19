@@ -42,24 +42,6 @@ pub fn is_non_followed_link(metadata: &Metadata) -> bool {
 }
 
 #[cfg(unix)]
-pub fn volume_identity(_path: &Path, metadata: &Metadata) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-    Some(metadata.dev().to_string())
-}
-#[cfg(windows)]
-pub fn volume_identity(path: &Path, metadata: &Metadata) -> Option<String> {
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
-    let snapshot = windows_snapshot(path)?;
-    let is_directory = snapshot.information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-    (is_directory == metadata.is_dir())
-        .then(|| snapshot.information.dwVolumeSerialNumber.to_string())
-}
-#[cfg(not(any(unix, windows)))]
-pub fn volume_identity(_path: &Path, _metadata: &Metadata) -> Option<String> {
-    None
-}
-
-#[cfg(unix)]
 pub fn volume_identity_from_open_file(file: &File) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     Some(file.metadata().ok()?.dev().to_string())
