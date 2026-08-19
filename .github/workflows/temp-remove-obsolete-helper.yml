@@ -1,0 +1,38 @@
+name: Temporary remove obsolete helper
+on:
+  push:
+    branches: [fix/ecc-review-findings]
+permissions:
+  contents: write
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/ecc-review-findings
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Remove obsolete path helper
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          path = Path('src-tauri/src/file_metrics.rs')
+          text = path.read_text()
+          pattern = r'\n#\[cfg\(unix\)\]\npub fn volume_identity\(.*?\n#\[cfg\(not\(any\(unix, windows\)\)\)\]\npub fn volume_identity\(.*?\n\}\n'
+          updated, count = re.subn(pattern, '\n', text, count=1, flags=re.S)
+          if count != 1: raise SystemExit('obsolete helper block not found')
+          path.write_text(updated)
+          PY
+          cargo fmt --manifest-path src-tauri/Cargo.toml
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/src/file_metrics.rs
+          git commit -m "refactor: remove obsolete volume identity helper"
+          git push origin HEAD:fix/ecc-review-findings
