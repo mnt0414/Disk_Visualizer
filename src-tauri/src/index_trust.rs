@@ -92,7 +92,10 @@ mod tests {
     fn requires_full_scan_without_baseline() {
         let mut evidence = trusted_evidence();
         evidence.has_baseline = false;
-        assert_eq!(evaluate(evidence).state, IndexTrustState::InitialScanRequired);
+        assert_eq!(
+            evaluate(evidence).state,
+            IndexTrustState::InitialScanRequired
+        );
         assert_eq!(evaluate(evidence).recommendation, ScanRecommendation::Full);
     }
 
@@ -108,14 +111,20 @@ mod tests {
             evaluate(discontinuous).state,
             IndexTrustState::HistoryDiscontinuous
         );
-        assert_eq!(evaluate(discontinuous).recommendation, ScanRecommendation::Full);
+        assert_eq!(
+            evaluate(discontinuous).recommendation,
+            ScanRecommendation::Full
+        );
     }
 
     #[test]
     fn requires_full_scan_when_target_identity_changes() {
         let mut volume_changed = trusted_evidence();
         volume_changed.volume_matches = false;
-        assert_eq!(evaluate(volume_changed).state, IndexTrustState::VolumeChanged);
+        assert_eq!(
+            evaluate(volume_changed).state,
+            IndexTrustState::VolumeChanged
+        );
 
         let mut root_changed = trusted_evidence();
         root_changed.root_matches = false;
