@@ -2,6 +2,7 @@ pub mod cache_activity;
 mod cache_catalog;
 mod cache_query;
 mod file_metrics;
+pub mod index_checkpoint;
 pub mod index_trust;
 mod scan_jobs;
 mod scanner;
@@ -9,6 +10,7 @@ mod storage;
 
 use cache_catalog::{CacheCatalog, CacheDefinition, CachePathRoot, Platform};
 use cache_query::{CacheEntryDetail, CacheQueryRepository};
+use index_checkpoint::IndexCheckpointRepository;
 use scan_jobs::{ScanJobSnapshot, ScanManager};
 use scanner::ScanSummary;
 use serde::Serialize;
@@ -98,9 +100,14 @@ pub fn run() {
         .setup(|app| {
             let database_path = app.path().app_data_dir()?.join("scan-index.sqlite3");
             let cache_query_repository = CacheQueryRepository::new(database_path.clone());
+            let checkpoint_repository = IndexCheckpointRepository::new(database_path.clone());
             let repository = ScanRepository::new(database_path);
             repository.initialize().map_err(std::io::Error::other)?;
+            checkpoint_repository
+                .initialize()
+                .map_err(std::io::Error::other)?;
             app.manage(ScanManager::new(repository.clone()));
+            app.manage(checkpoint_repository);
             app.manage(cache_query_repository);
             app.manage(repository);
             Ok(())

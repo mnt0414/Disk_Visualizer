@@ -129,7 +129,7 @@ impl ScanRepository {
                 self.consistent_backup(&connection, "sqlite3.v5-backup")?;
                 Self::migrate_v5_to_v6(&connection)?
             }
-            6 => {}
+            6 | 7 => {}
             other => return Err(format!("未対応のスキャン履歴バージョンです: {other}")),
         }
         let check: String = connection
