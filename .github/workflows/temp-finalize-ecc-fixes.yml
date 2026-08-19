@@ -23,22 +23,17 @@ jobs:
         run: |
           from pathlib import Path
           import struct, zlib
-
           metrics = Path('src-tauri/src/file_metrics.rs')
           text = metrics.read_text()
           old = '        let file = File::open(&root).unwrap();\n        assert!(volume_identity_from_open_file(&file).is_some());'
           new = '        let directory = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();\n        let file = directory.into_std_file();\n        assert!(volume_identity_from_open_file(&file).is_some());'
-          if text.count(old) != 1:
-              raise SystemExit('directory test replacement did not match exactly once')
+          if text.count(old) != 1: raise SystemExit('test replacement mismatch')
           metrics.write_text(text.replace(old, new))
-
           ci = Path('.github/workflows/ci.yml')
           text = ci.read_text().replace('npm install --no-audit --no-fund', 'npm ci --no-audit --no-fund')
-          text = text.replace('cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings', 'cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings')
-          text = text.replace('cargo test --manifest-path src-tauri/Cargo.toml', 'cargo test --locked --manifest-path src-tauri/Cargo.toml')
-          text = text.replace('npm run tauri build -- --debug --target ${{ matrix.target }}', 'npm run tauri build -- --debug --locked --target ${{ matrix.target }}')
+          text = text.replace('cargo clippy --manifest-path', 'cargo clippy --locked --manifest-path')
+          text = text.replace('cargo test --manifest-path', 'cargo test --locked --manifest-path')
           ci.write_text(text)
-
           icon = Path('src-tauri/icons/icon.png')
           icon.parent.mkdir(parents=True, exist_ok=True)
           width = height = 32
@@ -46,8 +41,7 @@ jobs:
           def chunk(kind, data):
               return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data) & 0xffffffff)
           icon.write_bytes(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(rows, 9)) + chunk(b'IEND', b''))
-      - name: Format
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml
       - name: Commit
         run: |
           git config user.name "github-actions[bot]"
