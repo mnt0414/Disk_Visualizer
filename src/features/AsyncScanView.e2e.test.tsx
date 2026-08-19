@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AsyncScanView } from './AsyncScanView'
 
@@ -47,7 +47,6 @@ const running = {
 
 describe('AsyncScanView desktop flow', () => {
   beforeEach(() => {
-    vi.useFakeTimers()
     scanApi.startScan.mockResolvedValue(running)
     scanApi.getScanStatus.mockResolvedValue({
       ...running,
@@ -58,8 +57,8 @@ describe('AsyncScanView desktop flow', () => {
       result: summary,
     })
   })
+
   afterEach(() => {
-    vi.useRealTimers()
     vi.clearAllMocks()
   })
 
@@ -71,13 +70,16 @@ describe('AsyncScanView desktop flow', () => {
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'スキャン開始' }))
     })
+
     expect(scanApi.startScan).toHaveBeenCalledWith('/tmp/sample')
-    expect(await screen.findByText('スキャン中')).toBeInTheDocument()
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(250)
-    })
-    expect(scanApi.getScanStatus).toHaveBeenCalledWith(7)
-    expect(screen.getByText('完了')).toBeInTheDocument()
+    expect(screen.getByText('スキャン中')).toBeInTheDocument()
+
+    await waitFor(
+      () => expect(scanApi.getScanStatus).toHaveBeenCalledWith(7),
+      { timeout: 1000 },
+    )
+    await waitFor(() => expect(screen.getByText('完了')).toBeInTheDocument())
+
     expect(screen.getByRole('heading', { name: '/tmp/sample' })).toBeInTheDocument()
     expect(screen.getByText('1.0 KB')).toBeInTheDocument()
   })
