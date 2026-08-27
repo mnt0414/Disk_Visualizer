@@ -84,7 +84,9 @@ pub fn evaluate_continuity(
                 latest_event_id,
             },
         ) => {
-            if earliest_event_id == 0 || earliest_event_id > latest_event_id || event_id > latest_event_id
+            if earliest_event_id == 0
+                || earliest_event_id > latest_event_id
+                || event_id > latest_event_id
             {
                 HistoryContinuity::InvalidRange
             } else if event_id < earliest_event_id {
