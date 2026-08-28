@@ -4,6 +4,7 @@ mod cache_query;
 pub mod change_history;
 mod file_metrics;
 pub mod fsevents_callback;
+pub mod fsevents_history;
 pub mod index_checkpoint;
 pub mod index_trust;
 pub mod macos_fsevents;
