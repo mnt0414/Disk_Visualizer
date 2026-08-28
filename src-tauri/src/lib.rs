@@ -8,6 +8,7 @@ pub mod index_trust;
 mod scan_jobs;
 mod scanner;
 mod storage;
+pub mod windows_usn;
 
 use cache_catalog::{CacheCatalog, CacheDefinition, CachePathRoot, Platform};
 use cache_query::{CacheEntryDetail, CacheQueryRepository};
