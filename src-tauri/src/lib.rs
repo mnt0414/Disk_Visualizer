@@ -5,6 +5,7 @@ pub mod change_history;
 mod file_metrics;
 pub mod index_checkpoint;
 pub mod index_trust;
+pub mod macos_fsevents;
 mod scan_jobs;
 mod scanner;
 mod storage;
