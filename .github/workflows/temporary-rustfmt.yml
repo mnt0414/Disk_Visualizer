@@ -1,0 +1,31 @@
+name: Temporary Rustfmt
+
+on:
+  push:
+    branches: [feat/macos-index-trust-evaluation]
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/macos-index-trust-evaluation
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml
+      - name: Commit formatting
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri
+          git commit -m "chore: format macOS trust integration"
+          git push
