@@ -1,6 +1,7 @@
 pub mod cache_activity;
 mod cache_catalog;
 mod cache_query;
+pub mod change_history;
 mod file_metrics;
 pub mod index_checkpoint;
 pub mod index_trust;
