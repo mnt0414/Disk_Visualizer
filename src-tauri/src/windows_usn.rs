@@ -42,17 +42,17 @@ pub fn query_available_history(root: &Path) -> Result<AvailableHistory, String> 
     use std::mem::{size_of, zeroed};
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ,
-        OPEN_EXISTING,
+        CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
-    use windows_sys::Win32::System::Ioctl::FSCTL_QUERY_USN_JOURNAL;
     use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_QUERY_USN_JOURNAL;
 
+    const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
     let device_path = volume_device_path(root)?;
     let handle = unsafe {
         CreateFileW(
             device_path.as_ptr(),
-            GENERIC_READ,
+            GENERIC_READ_ACCESS,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
             OPEN_EXISTING,
