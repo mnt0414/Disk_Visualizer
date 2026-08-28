@@ -85,13 +85,23 @@ fn evaluate_history(
             decision: evidence_decision(true, true, true, true, true),
             changes: read.changes,
             rescan_subtrees: false,
-            next_history_token: Some(HistoryToken::Fsevents { event_id: next_event_id }.encode()),
+            next_history_token: Some(
+                HistoryToken::Fsevents {
+                    event_id: next_event_id,
+                }
+                .encode(),
+            ),
         },
         FseventsBatchDecision::RescanSubtrees { next_event_id } => MacosIndexTrustAssessment {
             decision: evidence_decision(true, true, true, true, true),
             changes: read.changes,
             rescan_subtrees: true,
-            next_history_token: Some(HistoryToken::Fsevents { event_id: next_event_id }.encode()),
+            next_history_token: Some(
+                HistoryToken::Fsevents {
+                    event_id: next_event_id,
+                }
+                .encode(),
+            ),
         },
         FseventsBatchDecision::FullScan {
             reason: FseventsFallbackReason::RootChanged,
@@ -314,13 +324,9 @@ mod tests {
     #[test]
     fn reports_unsupported_platform_without_reading_history() {
         let repository = IndexCheckpointRepository::new("unused.sqlite3".into());
-        let assessment = assess_macos_index_trust(
-            Path::new("/"),
-            &repository,
-            Some(4),
-            Duration::from_secs(1),
-        )
-        .unwrap();
+        let assessment =
+            assess_macos_index_trust(Path::new("/"), &repository, Some(4), Duration::from_secs(1))
+                .unwrap();
         assert_eq!(assessment.decision.state, IndexTrustState::Unsupported);
     }
 }
