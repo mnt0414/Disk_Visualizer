@@ -32,10 +32,7 @@ pub enum FseventsBatchDecision {
     FullScan { reason: FseventsFallbackReason },
 }
 
-pub fn evaluate_batch(
-    checkpoint_event_id: u64,
-    events: &[FseventsEvent],
-) -> FseventsBatchDecision {
+pub fn evaluate_batch(checkpoint_event_id: u64, events: &[FseventsEvent]) -> FseventsBatchDecision {
     if checkpoint_event_id == 0 || checkpoint_event_id == u64::MAX {
         return FseventsBatchDecision::FullScan {
             reason: FseventsFallbackReason::InvalidEventId,
@@ -62,10 +59,7 @@ pub fn evaluate_batch(
     let mut next_event_id = checkpoint_event_id;
     let mut rescan_subtrees = false;
     for event in events {
-        if event.event_id == 0
-            || event.event_id == u64::MAX
-            || event.event_id < next_event_id
-        {
+        if event.event_id == 0 || event.event_id == u64::MAX || event.event_id < next_event_id {
             return FseventsBatchDecision::FullScan {
                 reason: FseventsFallbackReason::InvalidEventId,
             };
