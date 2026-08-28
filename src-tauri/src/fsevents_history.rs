@@ -12,19 +12,16 @@ pub struct FseventsHistoryRead {
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
-    use crate::fsevents_callback::{
-        FseventsCallbackCollector, FseventsCallbackFailure,
-    };
+    use crate::fsevents_callback::{FseventsCallbackCollector, FseventsCallbackFailure};
     use crate::macos_fsevents::{evaluate_batch, FseventsEvent};
     use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
     use objc2_core_foundation::{CFArray, CFRetained, CFString};
     use objc2_core_services::{
         kFSEventStreamCreateFlagFileEvents, kFSEventStreamCreateFlagNoDefer,
-        kFSEventStreamCreateFlagWatchRoot, ConstFSEventStreamRef,
-        FSEventStreamContext, FSEventStreamCreateRelativeToDevice,
-        FSEventStreamEventFlags, FSEventStreamEventId, FSEventStreamInvalidate,
-        FSEventStreamRef, FSEventStreamRelease, FSEventStreamSetDispatchQueue,
-        FSEventStreamStart, FSEventStreamStop,
+        kFSEventStreamCreateFlagWatchRoot, ConstFSEventStreamRef, FSEventStreamContext,
+        FSEventStreamCreateRelativeToDevice, FSEventStreamEventFlags, FSEventStreamEventId,
+        FSEventStreamInvalidate, FSEventStreamRef, FSEventStreamRelease,
+        FSEventStreamSetDispatchQueue, FSEventStreamStart, FSEventStreamStop,
     };
     use std::ffi::{c_void, CStr, CString, OsStr};
     use std::os::unix::ffi::OsStrExt;
@@ -63,7 +60,8 @@ mod platform {
         event_flags: NonNull<FSEventStreamEventFlags>,
         event_ids: NonNull<FSEventStreamEventId>,
     ) {
-        let Some(collector) = (unsafe { (info as *const FseventsCallbackCollector).as_ref() }) else {
+        let Some(collector) = (unsafe { (info as *const FseventsCallbackCollector).as_ref() })
+        else {
             return;
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -73,9 +71,7 @@ mod platform {
                     event_count,
                 )
             };
-            let flags = unsafe {
-                std::slice::from_raw_parts(event_flags.as_ptr(), event_count)
-            };
+            let flags = unsafe { std::slice::from_raw_parts(event_flags.as_ptr(), event_count) };
             let ids = unsafe { std::slice::from_raw_parts(event_ids.as_ptr(), event_count) };
             let mut path_bytes = Vec::with_capacity(event_count);
             let mut events = Vec::with_capacity(event_count);
@@ -247,7 +243,10 @@ mod platform {
                     .unwrap(),
                 "work"
             );
-            assert_eq!(device_relative_root(Path::new("/"), Path::new("/")).unwrap(), "");
+            assert_eq!(
+                device_relative_root(Path::new("/"), Path::new("/")).unwrap(),
+                ""
+            );
             assert!(device_relative_root(Path::new("/other"), Path::new("/Volumes/Data")).is_err());
         }
     }
