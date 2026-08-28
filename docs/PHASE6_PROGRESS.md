@@ -50,9 +50,20 @@ macOSではフルスキャン開始前にFSEvents checkpointとdirectory handle�
 - キャンセル、走査失敗、永続化失敗ではcheckpointを保存しない
 - FSEvents checkpointを取得できない環境ではフルスキャン自体を妨げず、推測したtokenは保存しない
 
+## 部分再走査計画
+
+信頼済みFSEvents変更を、そのままファイルシステム操作へ渡さず、決定論的で有界な再走査targetへ変換する純粋ロジックを追加した。
+
+- device-relative pathを再検証し、絶対path・親参照・root逸脱表現をfail closedで拒否する
+- 重複targetと祖先配下のtargetを統合し、同じsubtreeを重複走査しない
+- `RescanSubtrees`ではtargetを再帰走査対象として保持する
+- volume root `.` は一つの再帰targetとして表現する
+- target数が設定上限を超えた場合は部分更新を許可せずフルスキャンへ戻す
+- SQLite差分適用とjob統合は次の実装境界とする
+
 ## 次の実装
 
-1. 信頼できる変更pathだけを部分再走査し、`RescanSubtrees`はsubtree単位へ拡張する
+1. 部分再走査計画をscanner／SQLite差分適用へ接続する
 2. Windows USN変更record読取adapterを追加する
 3. 信頼状態をUIへ表示し、差分不可時は理由付きでフルスキャンを提案する
 4. 外付け媒体の切断・再接続、スリープ復帰でidentityを再評価する
