@@ -124,6 +124,9 @@ fn validated_relative_path(bytes: &[u8]) -> Result<PathBuf, FseventsCallbackFail
         return Err(FseventsCallbackFailure::InvalidPath);
     }
     let text = std::str::from_utf8(bytes).map_err(|_| FseventsCallbackFailure::InvalidPath)?;
+    if text == "." {
+        return Ok(PathBuf::from("."));
+    }
     let path = Path::new(text);
     if path.is_absolute()
         || path
@@ -214,6 +217,16 @@ mod tests {
                 }],
                 history_done: true,
             }
+        );
+    }
+
+    #[test]
+    fn accepts_volume_root_as_a_normal_change() {
+        let collector = FseventsCallbackCollector::new(Some(1)).unwrap();
+        collector.ingest(&[b"."], &[event(11, 0)]).unwrap();
+        assert_eq!(
+            collector.snapshot().unwrap().changes[0].relative_path,
+            PathBuf::from(".")
         );
     }
 
