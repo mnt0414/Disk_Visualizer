@@ -73,10 +73,7 @@ fn observation(entry: &IncrementalEntry) -> Option<CacheObservation> {
     if entry.file_count != 1 || entry.skipped_count != 0 {
         return None;
     }
-    let file_identity = match (
-        entry.volume_identity.as_ref(),
-        entry.file_identity.as_ref(),
-    ) {
+    let file_identity = match (entry.volume_identity.as_ref(), entry.file_identity.as_ref()) {
         (Some(volume), Some(file)) => Some(format!("{volume}:{file}")),
         (None, Some(file)) => Some(file.clone()),
         _ => None,
@@ -175,7 +172,9 @@ pub fn apply_incremental_snapshot(
     connection
         .execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
         .map_err(|error| error.to_string())?;
-    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
     let baseline_root: Option<String> = transaction
         .query_row(
             "SELECT root_path FROM scan_sessions WHERE id=?1 AND status='complete'",
@@ -187,7 +186,12 @@ pub fn apply_incremental_snapshot(
     if baseline_root.as_deref() != Some(root_path.to_string_lossy().as_ref()) {
         return Err("一致する完了済み基準スキャンがありません".to_owned());
     }
-    transaction.execute("INSERT INTO scan_sessions (root_path,status,started_at) VALUES (?1,'in_progress',?2)",params![root_path.to_string_lossy().as_ref(),unix_time()?]).map_err(|error|format!("部分更新sessionを開始できません: {error}"))?;
+    transaction
+        .execute(
+            "INSERT INTO scan_sessions (root_path,status,started_at) VALUES (?1,'in_progress',?2)",
+            params![root_path.to_string_lossy().as_ref(), unix_time()?],
+        )
+        .map_err(|error| format!("部分更新sessionを開始できません: {error}"))?;
     let scan_id = transaction.last_insert_rowid();
     transaction.execute("INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,allocated_size,file_count,directory_count,skipped_count,skip_reason,is_directory,file_identity,volume_identity,modified_at,cache_catalog_version,cache_definition_id,cache_definition_version,cache_runtime_state) SELECT ?1,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,allocated_size,file_count,directory_count,skipped_count,skip_reason,is_directory,file_identity,volume_identity,modified_at,cache_catalog_version,cache_definition_id,cache_definition_version,cache_runtime_state FROM scan_entries WHERE scan_id=?2",params![scan_id,baseline_scan_id]).map_err(|error|format!("基準スキャンを複製できません: {error}"))?;
     for target in &normalized_targets {
@@ -200,7 +204,12 @@ pub fn apply_incremental_snapshot(
             let prefix = format!("{}{sep}", relative, sep = std::path::MAIN_SEPARATOR);
             transaction.execute("DELETE FROM scan_entries WHERE scan_id=?1 AND (relative_path=?2 OR instr(relative_path,?3)=1)",params![scan_id,relative.as_ref(),prefix]).map_err(|error|format!("部分再走査範囲を置換できません: {error}"))?;
         } else {
-            transaction.execute("DELETE FROM scan_entries WHERE scan_id=?1 AND relative_path=?2",params![scan_id,target.relative_path.to_string_lossy().as_ref()]).map_err(|error|format!("部分再走査項目を置換できません: {error}"))?;
+            transaction
+                .execute(
+                    "DELETE FROM scan_entries WHERE scan_id=?1 AND relative_path=?2",
+                    params![scan_id, target.relative_path.to_string_lossy().as_ref()],
+                )
+                .map_err(|error| format!("部分再走査項目を置換できません: {error}"))?;
         }
     }
     for entry in replacements {
@@ -285,12 +294,27 @@ mod tests {
         .unwrap();
         let connection = Connection::open(&path).unwrap();
         let baseline_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM scan_entries WHERE scan_id=1", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM scan_entries WHERE scan_id=1",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         let updated: (String, i64, i64) = connection
-            .query_row("SELECT status,total_size_bytes,file_count FROM scan_sessions WHERE id=?1",[scan_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+            .query_row(
+                "SELECT status,total_size_bytes,file_count FROM scan_sessions WHERE id=?1",
+                [scan_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
         let updated_paths: String = connection.query_row("SELECT group_concat(relative_path,',') FROM (SELECT relative_path FROM scan_entries WHERE scan_id=?1 ORDER BY relative_path)",[scan_id],|row|row.get(0)).unwrap();
-        let token: String = connection.query_row("SELECT history_token FROM index_checkpoints WHERE root_path='/tmp/sample'",[],|row|row.get(0)).unwrap();
+        let token: String = connection
+            .query_row(
+                "SELECT history_token FROM index_checkpoints WHERE root_path='/tmp/sample'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(baseline_count, 4);
         assert_eq!(updated, ("complete".to_owned(), 6, 2));
         assert_eq!(updated_paths, "keep,old");
@@ -301,9 +325,19 @@ mod tests {
     #[test]
     fn rolls_back_when_replacement_is_outside_target() {
         let path = database("outside");
-        assert!(apply_incremental_snapshot(&path,1,Path::new("/tmp/sample"),&[target("old",false)],&[entry("/tmp/sample/other",5)],&checkpoint("fsevents:v1:20")).is_err());
+        assert!(apply_incremental_snapshot(
+            &path,
+            1,
+            Path::new("/tmp/sample"),
+            &[target("old", false)],
+            &[entry("/tmp/sample/other", 5)],
+            &checkpoint("fsevents:v1:20")
+        )
+        .is_err());
         let connection = Connection::open(&path).unwrap();
-        let sessions: i64 = connection.query_row("SELECT COUNT(*) FROM scan_sessions",[],|row|row.get(0)).unwrap();
+        let sessions: i64 = connection
+            .query_row("SELECT COUNT(*) FROM scan_sessions", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(sessions, 1);
         let _ = std::fs::remove_file(path);
     }
@@ -311,9 +345,19 @@ mod tests {
     #[test]
     fn rolls_back_snapshot_when_checkpoint_is_invalid() {
         let path = database("checkpoint");
-        assert!(apply_incremental_snapshot(&path,1,Path::new("/tmp/sample"),&[target("old",false)],&[],&checkpoint("")).is_err());
+        assert!(apply_incremental_snapshot(
+            &path,
+            1,
+            Path::new("/tmp/sample"),
+            &[target("old", false)],
+            &[],
+            &checkpoint("")
+        )
+        .is_err());
         let connection = Connection::open(&path).unwrap();
-        let sessions: i64 = connection.query_row("SELECT COUNT(*) FROM scan_sessions",[],|row|row.get(0)).unwrap();
+        let sessions: i64 = connection
+            .query_row("SELECT COUNT(*) FROM scan_sessions", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(sessions, 1);
         let _ = std::fs::remove_file(path);
     }
