@@ -474,6 +474,7 @@ impl StreamingScanWriter {
         };
         self.write(batch)
     }
+    #[cfg(test)]
     pub fn complete(&self, summary: &ScanSummary) -> Result<(), String> {
         self.complete_with_checkpoint(summary, None)
     }
