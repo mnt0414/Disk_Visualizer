@@ -20,8 +20,12 @@ pub struct IncrementalRescanTarget {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IncrementalRescanPlan {
-    Partial { targets: Vec<IncrementalRescanTarget> },
-    Full { reason: FullRescanReason },
+    Partial {
+        targets: Vec<IncrementalRescanTarget>,
+    },
+    Full {
+        reason: FullRescanReason,
+    },
 }
 
 fn normalize_relative(path: &Path) -> Option<PathBuf> {
