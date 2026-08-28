@@ -1,5 +1,6 @@
 use crate::cache_activity::{self, CacheObservation, CacheRuntimeState};
 use crate::cache_catalog::{self, CacheClassificationRef};
+use crate::index_checkpoint::{upsert_checkpoint, IndexCheckpoint};
 use crate::scanner::{ScanProgress, ScanSummary};
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -295,9 +296,24 @@ impl ScanRepository {
         }
         transaction.commit().map_err(|e| e.to_string())
     }
-    fn finish_stream(&self, scan_id: i64, summary: &ScanSummary) -> Result<(), String> {
-        self.connection()?.execute("UPDATE scan_sessions SET status='complete',total_size_bytes=?2,file_count=?3,directory_count=?4,skipped_count=?5,elapsed_milliseconds=?6,completed_at=?7 WHERE id=?1 AND status='in_progress'",params![scan_id,to_i64(summary.total_size_bytes,"合計サイズ")?,to_i64(summary.file_count,"ファイル数")?,to_i64(summary.directory_count,"フォルダ数")?,to_i64(summary.skipped_count,"読み飛ばし数")?,elapsed_to_i64(summary.elapsed_milliseconds)?,unix_time()?]).map_err(|e|format!("スキャン履歴を確定できません: {e}"))?;
-        Ok(())
+    fn finish_stream(
+        &self,
+        scan_id: i64,
+        summary: &ScanSummary,
+        checkpoint: Option<&IndexCheckpoint>,
+    ) -> Result<(), String> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(|e| e.to_string())?;
+        let changed = transaction.execute("UPDATE scan_sessions SET status='complete',total_size_bytes=?2,file_count=?3,directory_count=?4,skipped_count=?5,elapsed_milliseconds=?6,completed_at=?7 WHERE id=?1 AND status='in_progress'",params![scan_id,to_i64(summary.total_size_bytes,"合計サイズ")?,to_i64(summary.file_count,"ファイル数")?,to_i64(summary.directory_count,"フォルダ数")?,to_i64(summary.skipped_count,"読み飛ばし数")?,elapsed_to_i64(summary.elapsed_milliseconds)?,unix_time()?]).map_err(|e|format!("スキャン履歴を確定できません: {e}"))?;
+        if changed != 1 {
+            return Err("実行中のスキャン履歴を確定できません".to_owned());
+        }
+        if let Some(checkpoint) = checkpoint {
+            upsert_checkpoint(&transaction, checkpoint)?;
+        }
+        transaction
+            .commit()
+            .map_err(|e| format!("スキャン結果とcheckpointを確定できません: {e}"))
     }
     fn stop_stream(&self, scan_id: i64, status: &str) -> Result<(), String> {
         self.connection()?.execute("UPDATE scan_sessions SET status=?2,completed_at=?3 WHERE id=?1 AND status='in_progress'",params![scan_id,status,unix_time()?]).map_err(|e|e.to_string())?;
@@ -459,12 +475,26 @@ impl StreamingScanWriter {
         self.write(batch)
     }
     pub fn complete(&self, summary: &ScanSummary) -> Result<(), String> {
+        self.complete_with_checkpoint(summary, None)
+    }
+    pub fn complete_with_checkpoint(
+        &self,
+        summary: &ScanSummary,
+        checkpoint: Option<&IndexCheckpoint>,
+    ) -> Result<(), String> {
         self.flush();
         if let Some(error) = self.error.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             self.repository.stop_stream(self.scan_id, "failed")?;
             return Err(error);
         }
-        self.repository.finish_stream(self.scan_id, summary)
+        if let Err(error) = self
+            .repository
+            .finish_stream(self.scan_id, summary, checkpoint)
+        {
+            let _ = self.repository.stop_stream(self.scan_id, "failed");
+            return Err(error);
+        }
+        Ok(())
     }
     pub fn interrupt(&self, failed: bool) -> Result<(), String> {
         self.pending
@@ -534,6 +564,67 @@ mod tests {
         writer.complete(&summary(1)).unwrap();
         assert_eq!(repository.list().unwrap().len(), 1);
         assert!(repository.integrity_check().unwrap());
+        let _ = std::fs::remove_file(repository.path());
+    }
+    #[test]
+    fn atomically_completes_scan_and_saves_checkpoint() {
+        let repository = repository("atomic-checkpoint");
+        let checkpoint_repository = crate::index_checkpoint::IndexCheckpointRepository::new(
+            repository.path().to_path_buf(),
+        );
+        checkpoint_repository.initialize().unwrap();
+        let writer = repository.begin_stream("/tmp/sample").unwrap();
+        writer.record(&progress(PathBuf::from("/tmp/sample/file.bin")));
+        let checkpoint = IndexCheckpoint {
+            root_path: "/tmp/sample".to_owned(),
+            platform: "macos".to_owned(),
+            volume_identity: "7".to_owned(),
+            root_identity: "42".to_owned(),
+            history_source: "fsevents".to_owned(),
+            history_token: "fsevents:v1:10".to_owned(),
+            updated_at: 1234,
+        };
+        writer
+            .complete_with_checkpoint(&summary(1), Some(&checkpoint))
+            .unwrap();
+        assert_eq!(
+            checkpoint_repository.load("/tmp/sample").unwrap(),
+            Some(checkpoint)
+        );
+        assert_eq!(repository.list().unwrap().len(), 1);
+        let _ = std::fs::remove_file(repository.path());
+    }
+    #[test]
+    fn rolls_back_completion_when_checkpoint_is_invalid() {
+        let repository = repository("checkpoint-rollback");
+        let checkpoint_repository = crate::index_checkpoint::IndexCheckpointRepository::new(
+            repository.path().to_path_buf(),
+        );
+        checkpoint_repository.initialize().unwrap();
+        let writer = repository.begin_stream("/tmp/sample").unwrap();
+        let mut checkpoint = IndexCheckpoint {
+            root_path: "/tmp/sample".to_owned(),
+            platform: "macos".to_owned(),
+            volume_identity: "7".to_owned(),
+            root_identity: "42".to_owned(),
+            history_source: "fsevents".to_owned(),
+            history_token: String::new(),
+            updated_at: 1234,
+        };
+        assert!(writer
+            .complete_with_checkpoint(&summary(0), Some(&checkpoint))
+            .is_err());
+        let status: String = repository
+            .connection()
+            .unwrap()
+            .query_row("SELECT status FROM scan_sessions LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert!(checkpoint_repository.load("/tmp/sample").unwrap().is_none());
+        checkpoint.history_token = "fsevents:v1:10".to_owned();
+        assert!(checkpoint_repository.save(&checkpoint).is_ok());
         let _ = std::fs::remove_file(repository.path());
     }
     #[test]
