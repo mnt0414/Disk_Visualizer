@@ -61,7 +61,10 @@ impl FseventsCallbackCollector {
         if paths.len() != events.len() {
             return self.fail(FseventsCallbackFailure::MalformedBatch);
         }
-        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if let Some(failure) = state.failure {
             return Err(failure);
         }
@@ -92,7 +95,10 @@ impl FseventsCallbackCollector {
     }
 
     pub fn snapshot(&self) -> Result<CollectedFseventsBatch, FseventsCallbackFailure> {
-        let state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if let Some(failure) = state.failure {
             return Err(failure);
         }
@@ -103,7 +109,10 @@ impl FseventsCallbackCollector {
     }
 
     fn fail(&self, failure: FseventsCallbackFailure) -> Result<(), FseventsCallbackFailure> {
-        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         state.changes.clear();
         state.failure = Some(failure);
         Err(failure)
@@ -159,9 +168,7 @@ pub mod native {
             let _ = collector.fail(FseventsCallbackFailure::MalformedBatch);
             return;
         }
-        let paths = unsafe {
-            std::slice::from_raw_parts(event_paths as *const *const i8, count)
-        };
+        let paths = unsafe { std::slice::from_raw_parts(event_paths as *const *const i8, count) };
         let flags = unsafe { std::slice::from_raw_parts(event_flags, count) };
         let ids = unsafe { std::slice::from_raw_parts(event_ids, count) };
         let mut path_bytes = Vec::with_capacity(count);
