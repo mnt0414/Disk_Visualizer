@@ -59,11 +59,23 @@ macOSではフルスキャン開始前にFSEvents checkpointとdirectory handle�
 - `RescanSubtrees`ではtargetを再帰走査対象として保持する
 - volume root `.` は一つの再帰targetとして表現する
 - target数が設定上限を超えた場合は部分更新を許可せずフルスキャンへ戻す
-- SQLite差分適用とjob統合は次の実装境界とする
+
+## SQLiteへの原子的な差分適用
+
+直前の完了済みスキャンを新しいsessionへ複製し、部分再走査targetに含まれる既存entryだけを置換するtransaction primitiveを追加した。
+
+- 基準スキャンを直接更新せず、新しいスナップショットとして履歴を保持する
+- exact targetは一致pathだけ、recursive targetは対象と子孫を削除してreplacementへ置換する
+- replacementがroot外またはtarget外を指す場合、重複pathを含む場合はfail closedで拒否する
+- 空replacementで削除済みpathを表現する
+- 更新後のサイズ・file・directory・skip集計をSQLite内容から再計算する
+- 新sessionのcomplete化と次の履歴checkpoint更新を同じtransactionで確定する
+- checkpoint不正を含む途中失敗では新sessionとentryをすべてrollbackする
+- scannerによるtargetの実走査とScanManager統合は次の実装境界とする
 
 ## 次の実装
 
-1. 部分再走査計画をscanner／SQLite差分適用へ接続する
+1. capability-based scannerで部分再走査targetを収集し、原子的なSQLite差分適用へ接続する
 2. Windows USN変更record読取adapterを追加する
 3. 信頼状態をUIへ表示し、差分不可時は理由付きでフルスキャンを提案する
 4. 外付け媒体の切断・再接続、スリープ復帰でidentityを再評価する
