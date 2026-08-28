@@ -1,0 +1,38 @@
+name: Temporary rescan plan formatter
+on:
+  push:
+    branches: [feat/incremental-rescan-plan]
+permissions:
+  contents: write
+jobs:
+  format:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/incremental-rescan-plan
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Update docs and format
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          path = Path('docs/PHASE6_PROGRESS.md')
+          text = path.read_text()
+          marker = '## 次の実装\n'
+          section = '''## 部分再走査計画\n\n信頼済みFSEvents変更を、そのままファイルシステム操作へ渡さず、決定論的で有界な再走査targetへ変換する純粋ロジックを追加した。\n\n- device-relative pathを再検証し、絶対path・親参照・root逸脱表現をfail closedで拒否する\n- 重複targetと祖先配下のtargetを統合し、同じsubtreeを重複走査しない\n- `RescanSubtrees`ではtargetを再帰走査対象として保持する\n- volume root `.` は一つの再帰targetとして表現する\n- target数が設定上限を超えた場合は部分更新を許可せずフルスキャンへ戻す\n- SQLite差分適用とjob統合は次の実装境界とする\n\n'''
+          if text.count(marker) != 1:
+              raise SystemExit('next implementation marker mismatch')
+          text = text.replace(marker, section + marker)
+          text = text.replace('1. 信頼できる変更pathだけを部分再走査し、`RescanSubtrees`はsubtree単位へ拡張する\n2. Windows USN変更record読取adapterを追加する\n3. 信頼状態をUIへ表示し、差分不可時は理由付きでフルスキャンを提案する\n4. 外付け媒体の切断・再接続、スリープ復帰でidentityを再評価する', '1. 部分再走査計画をscanner／SQLite差分適用へ接続する\n2. Windows USN変更record読取adapterを追加する\n3. 信頼状態をUIへ表示し、差分不可時は理由付きでフルスキャンを提案する\n4. 外付け媒体の切断・再接続、スリープ復帰でidentityを再評価する')
+          path.write_text(text)
+          PY
+          cargo fmt --manifest-path src-tauri/Cargo.toml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/src/incremental_rescan.rs src-tauri/src/lib.rs docs/PHASE6_PROGRESS.md
+          git commit -m "chore: format and document rescan planning"
+          git push
