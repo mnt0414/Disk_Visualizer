@@ -231,7 +231,11 @@ pub fn apply_incremental_snapshot(
 mod tests {
     use super::*;
 
-    fn database(name: &str) -> PathBuf {
+    fn root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("disk-visualizer-root-{name}"))
+    }
+
+    fn database(name: &str, root: &Path) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -241,7 +245,18 @@ mod tests {
             std::process::id()
         ));
         let connection = Connection::open(&path).unwrap();
-        connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,root_path TEXT NOT NULL,status TEXT NOT NULL,total_size_bytes INTEGER NOT NULL DEFAULT 0,file_count INTEGER NOT NULL DEFAULT 0,directory_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,elapsed_milliseconds INTEGER NOT NULL DEFAULT 0,started_at INTEGER NOT NULL,completed_at INTEGER); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,parent_path TEXT,relative_path TEXT NOT NULL,entry_type TEXT NOT NULL,size_bytes INTEGER NOT NULL,logical_size INTEGER NOT NULL,allocated_size INTEGER,file_count INTEGER NOT NULL,directory_count INTEGER NOT NULL,skipped_count INTEGER NOT NULL DEFAULT 0,is_directory INTEGER NOT NULL,file_identity TEXT,volume_identity TEXT,modified_at INTEGER,skip_reason TEXT,cache_catalog_version TEXT,cache_definition_id TEXT,cache_definition_version INTEGER,cache_runtime_state TEXT); CREATE TABLE index_checkpoints (root_path TEXT PRIMARY KEY,platform TEXT NOT NULL,volume_identity TEXT NOT NULL,root_identity TEXT NOT NULL,history_source TEXT NOT NULL,history_token TEXT NOT NULL,updated_at INTEGER NOT NULL); INSERT INTO scan_sessions (id,root_path,status,total_size_bytes,file_count,directory_count,skipped_count,started_at,completed_at) VALUES (1,'/tmp/sample','complete',6,3,1,0,1,1); INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,file_count,directory_count,skipped_count,is_directory) VALUES (1,'keep','/tmp/sample/keep','/tmp/sample','keep','file',1,1,1,0,0,0),(1,'old','/tmp/sample/old','/tmp/sample','old','file',2,2,1,0,0,0),(1,'dir','/tmp/sample/dir','/tmp/sample','dir','directory',0,0,0,1,0,1),(1,'nested','/tmp/sample/dir/nested','/tmp/sample/dir','dir/nested','file',3,3,1,0,0,0);").unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,root_path TEXT NOT NULL,status TEXT NOT NULL,total_size_bytes INTEGER NOT NULL DEFAULT 0,file_count INTEGER NOT NULL DEFAULT 0,directory_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,elapsed_milliseconds INTEGER NOT NULL DEFAULT 0,started_at INTEGER NOT NULL,completed_at INTEGER); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,parent_path TEXT,relative_path TEXT NOT NULL,entry_type TEXT NOT NULL,size_bytes INTEGER NOT NULL,logical_size INTEGER NOT NULL,allocated_size INTEGER,file_count INTEGER NOT NULL,directory_count INTEGER NOT NULL,skipped_count INTEGER NOT NULL DEFAULT 0,is_directory INTEGER NOT NULL,file_identity TEXT,volume_identity TEXT,modified_at INTEGER,skip_reason TEXT,cache_catalog_version TEXT,cache_definition_id TEXT,cache_definition_version INTEGER,cache_runtime_state TEXT); CREATE TABLE index_checkpoints (root_path TEXT PRIMARY KEY,platform TEXT NOT NULL,volume_identity TEXT NOT NULL,root_identity TEXT NOT NULL,history_source TEXT NOT NULL,history_token TEXT NOT NULL,updated_at INTEGER NOT NULL);").unwrap();
+        connection.execute("INSERT INTO scan_sessions (id,root_path,status,total_size_bytes,file_count,directory_count,skipped_count,started_at,completed_at) VALUES (1,?1,'complete',6,3,1,0,1,1)",[root.to_string_lossy().as_ref()]).unwrap();
+        let rows = [
+            ("keep", "keep", 1, 1, 0),
+            ("old", "old", 2, 1, 0),
+            ("dir", "dir", 0, 0, 1),
+            ("nested", "dir/nested", 3, 1, 0),
+        ];
+        for (name, relative, size, files, directories) in rows {
+            let absolute = root.join(relative);
+            connection.execute("INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,file_count,directory_count,skipped_count,is_directory) VALUES (1,?1,?2,?3,?4,?5,?6,?6,?7,?8,0,?9)", params![name,absolute.to_string_lossy().as_ref(),absolute.parent().map(|value|value.to_string_lossy().into_owned()),PathBuf::from(relative).to_string_lossy().as_ref(),if directories > 0 { "directory" } else { "file" },size,files,directories,if directories > 0 { 1 } else { 0 }]).unwrap();
+        }
         path
     }
 
@@ -252,9 +267,9 @@ mod tests {
         }
     }
 
-    fn entry(path: &str, size: u64) -> IncrementalEntry {
+    fn entry(path: PathBuf, size: u64) -> IncrementalEntry {
         IncrementalEntry {
-            path: path.into(),
+            path,
             file_count: 1,
             directory_count: 0,
             skipped_count: 0,
@@ -268,9 +283,9 @@ mod tests {
         }
     }
 
-    fn checkpoint(token: &str) -> IndexCheckpoint {
+    fn checkpoint(root: &Path, token: &str) -> IndexCheckpoint {
         IndexCheckpoint {
-            root_path: "/tmp/sample".to_owned(),
+            root_path: root.to_string_lossy().into_owned(),
             platform: "macos".to_owned(),
             volume_identity: "volume-1".to_owned(),
             root_identity: "root-1".to_owned(),
@@ -282,14 +297,15 @@ mod tests {
 
     #[test]
     fn creates_new_snapshot_and_preserves_baseline() {
-        let path = database("success");
+        let root = root("success");
+        let path = database("success", &root);
         let scan_id = apply_incremental_snapshot(
             &path,
             1,
-            Path::new("/tmp/sample"),
+            &root,
             &[target("old", false), target("dir", true)],
-            &[entry("/tmp/sample/old", 5)],
-            &checkpoint("fsevents:v1:20"),
+            &[entry(root.join("old"), 5)],
+            &checkpoint(&root, "fsevents:v1:20"),
         )
         .unwrap();
         let connection = Connection::open(&path).unwrap();
@@ -307,31 +323,32 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        let updated_paths: String = connection.query_row("SELECT group_concat(relative_path,',') FROM (SELECT relative_path FROM scan_entries WHERE scan_id=?1 ORDER BY relative_path)",[scan_id],|row|row.get(0)).unwrap();
+        let updated_paths: String = connection.query_row("SELECT group_concat(relative_path,',') FROM (SELECT relative_path FROM scan_entries WHERE scan_id=?1 ORDER BY relative_path)", [scan_id], |row| row.get(0)).unwrap();
         let token: String = connection
             .query_row(
-                "SELECT history_token FROM index_checkpoints WHERE root_path='/tmp/sample'",
-                [],
+                "SELECT history_token FROM index_checkpoints WHERE root_path=?1",
+                [root.to_string_lossy().as_ref()],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(baseline_count, 4);
         assert_eq!(updated, ("complete".to_owned(), 6, 2));
-        assert_eq!(updated_paths, "keep,old");
+        assert_eq!(updated_paths, format!("keep,old"));
         assert_eq!(token, "fsevents:v1:20");
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn rolls_back_when_replacement_is_outside_target() {
-        let path = database("outside");
+        let root = root("outside");
+        let path = database("outside", &root);
         assert!(apply_incremental_snapshot(
             &path,
             1,
-            Path::new("/tmp/sample"),
+            &root,
             &[target("old", false)],
-            &[entry("/tmp/sample/other", 5)],
-            &checkpoint("fsevents:v1:20")
+            &[entry(root.join("other"), 5)],
+            &checkpoint(&root, "fsevents:v1:20")
         )
         .is_err());
         let connection = Connection::open(&path).unwrap();
@@ -344,14 +361,15 @@ mod tests {
 
     #[test]
     fn rolls_back_snapshot_when_checkpoint_is_invalid() {
-        let path = database("checkpoint");
+        let root = root("checkpoint");
+        let path = database("checkpoint", &root);
         assert!(apply_incremental_snapshot(
             &path,
             1,
-            Path::new("/tmp/sample"),
+            &root,
             &[target("old", false)],
             &[],
-            &checkpoint("")
+            &checkpoint(&root, "")
         )
         .is_err());
         let connection = Connection::open(&path).unwrap();
