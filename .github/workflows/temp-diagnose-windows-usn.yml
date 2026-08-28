@@ -1,0 +1,26 @@
+name: Temporary diagnose Windows USN
+on:
+  push:
+    branches: [feat/windows-usn-adapter]
+permissions:
+  contents: write
+jobs:
+  diagnose:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/windows-usn-adapter
+      - uses: dtolnay/rust-toolchain@stable
+      - shell: pwsh
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml *>&1 | Tee-Object -FilePath windows-usn-diagnostics.txt
+          exit 0
+      - shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add windows-usn-diagnostics.txt
+          git commit -m "ci: capture Windows USN diagnostics"
+          git push origin HEAD:feat/windows-usn-adapter
