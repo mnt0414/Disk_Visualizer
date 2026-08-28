@@ -45,8 +45,8 @@ pub fn query_available_history(root: &Path) -> Result<AvailableHistory, String> 
         CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ,
         OPEN_EXISTING,
     };
-    use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::FSCTL_QUERY_USN_JOURNAL;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
 
     let device_path = volume_device_path(root)?;
     let handle = unsafe {
