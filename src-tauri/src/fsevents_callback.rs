@@ -1,26 +1,24 @@
 use crate::macos_fsevents::FseventsEvent;
-use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 const FLAG_HISTORY_DONE: u32 = 0x0000_0010;
 const DEFAULT_MAX_CHANGES: usize = 4_096;
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectedFseventsChange {
     pub relative_path: PathBuf,
     pub event: FseventsEvent,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FseventsCallbackFailure {
     MalformedBatch,
     InvalidPath,
     CapacityExceeded,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectedFseventsBatch {
     pub changes: Vec<CollectedFseventsChange>,
     pub history_done: bool,
@@ -135,6 +133,13 @@ pub mod native {
 
     pub type FseventStreamRef = *mut c_void;
 
+    /// Receives one CoreServices FSEvents callback batch.
+    ///
+    /// # Safety
+    ///
+    /// `info` must point to a live `FseventsCallbackCollector`. For nonzero
+    /// `count`, all three callback arrays must be valid for `count` elements
+    /// and every path pointer must reference a NUL-terminated C string.
     pub unsafe extern "C" fn callback(
         _stream: FseventStreamRef,
         info: *mut c_void,
@@ -146,7 +151,7 @@ pub mod native {
         if info.is_null() {
             return;
         }
-        let collector = &*(info as *const FseventsCallbackCollector);
+        let collector = unsafe { &*(info as *const FseventsCallbackCollector) };
         if count == 0 {
             return;
         }
@@ -154,9 +159,11 @@ pub mod native {
             let _ = collector.fail(FseventsCallbackFailure::MalformedBatch);
             return;
         }
-        let paths = std::slice::from_raw_parts(event_paths as *const *const i8, count);
-        let flags = std::slice::from_raw_parts(event_flags, count);
-        let ids = std::slice::from_raw_parts(event_ids, count);
+        let paths = unsafe {
+            std::slice::from_raw_parts(event_paths as *const *const i8, count)
+        };
+        let flags = unsafe { std::slice::from_raw_parts(event_flags, count) };
+        let ids = unsafe { std::slice::from_raw_parts(event_ids, count) };
         let mut path_bytes = Vec::with_capacity(count);
         let mut events = Vec::with_capacity(count);
         for index in 0..count {
@@ -164,7 +171,7 @@ pub mod native {
                 let _ = collector.fail(FseventsCallbackFailure::MalformedBatch);
                 return;
             };
-            path_bytes.push(CStr::from_ptr(path).to_bytes());
+            path_bytes.push(unsafe { CStr::from_ptr(path) }.to_bytes());
             events.push(FseventsEvent {
                 event_id: ids[index],
                 flags: flags[index],
