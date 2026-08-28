@@ -1,13 +1,19 @@
 use crate::fsevents_callback::CollectedFseventsChange;
-use crate::fsevents_history::FseventsHistoryRead;
-use crate::index_checkpoint::{IndexCheckpoint, IndexCheckpointRepository};
-use crate::index_trust::{
-    evaluate, IndexTrustDecision, IndexTrustEvidence, IndexTrustState, ScanRecommendation,
-};
-use crate::macos_fsevents::{FseventsBatchDecision, FseventsFallbackReason};
-use crate::{change_history::HistoryToken, fsevents_history};
+use crate::index_checkpoint::IndexCheckpointRepository;
+use crate::index_trust::{IndexTrustDecision, IndexTrustState, ScanRecommendation};
 use std::path::Path;
 use std::time::Duration;
+
+#[cfg(any(target_os = "macos", test))]
+use crate::change_history::HistoryToken;
+#[cfg(any(target_os = "macos", test))]
+use crate::fsevents_history::FseventsHistoryRead;
+#[cfg(any(target_os = "macos", test))]
+use crate::index_checkpoint::IndexCheckpoint;
+#[cfg(any(target_os = "macos", test))]
+use crate::index_trust::{evaluate, IndexTrustEvidence};
+#[cfg(any(target_os = "macos", test))]
+use crate::macos_fsevents::{FseventsBatchDecision, FseventsFallbackReason};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MacosIndexTrustAssessment {
@@ -29,6 +35,7 @@ fn full_assessment(state: IndexTrustState) -> MacosIndexTrustAssessment {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn evidence_decision(
     has_baseline: bool,
     history_available: bool,
@@ -46,6 +53,7 @@ fn evidence_decision(
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn checkpoint_event_id(checkpoint: &IndexCheckpoint) -> Result<u64, IndexTrustDecision> {
     if checkpoint.platform != "macos" || checkpoint.history_source != "fsevents" {
         return Err(evidence_decision(true, true, false, true, true));
@@ -56,6 +64,7 @@ fn checkpoint_event_id(checkpoint: &IndexCheckpoint) -> Result<u64, IndexTrustDe
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn evaluate_history(
     checkpoint: &IndexCheckpoint,
     current_volume_identity: &str,
@@ -146,7 +155,7 @@ pub fn assess_macos_index_trust(
         if checkpoint.root_identity != current_root_identity {
             return Ok(full_assessment(IndexTrustState::RootChanged));
         }
-        let history = fsevents_history::read_history(
+        let history = crate::fsevents_history::read_history(
             &canonical_root,
             checkpoint_event_id,
             max_changes,
@@ -194,6 +203,18 @@ mod tests {
             }],
             decision,
         })
+    }
+
+    #[test]
+    fn represents_missing_baseline_as_initial_full_scan() {
+        let assessment = full_assessment(IndexTrustState::InitialScanRequired);
+        assert_eq!(
+            assessment.decision.state,
+            IndexTrustState::InitialScanRequired
+        );
+        assert_eq!(assessment.decision.recommendation, ScanRecommendation::Full);
+        assert!(assessment.changes.is_empty());
+        assert!(assessment.next_history_token.is_none());
     }
 
     #[test]
