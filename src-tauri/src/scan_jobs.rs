@@ -1,3 +1,4 @@
+use crate::index_checkpoint::capture_full_scan_checkpoint;
 use crate::scanner::{self, ScanProgress, ScanSummary};
 use crate::storage::ScanRepository;
 use serde::Serialize;
@@ -109,6 +110,9 @@ impl ScanManager {
                 return Err("別のスキャンが実行中です".to_owned());
             }
         }
+        let checkpoint = capture_full_scan_checkpoint(Path::new(&path))
+            .ok()
+            .flatten();
         let stream = self.repository.begin_stream(&path)?;
         let job = Arc::new(ScanJob {
             id: NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed),
@@ -150,7 +154,7 @@ impl ScanManager {
                 .cancelled;
             match result {
                 Ok(summary) if !cancelled => {
-                    let persisted = stream.complete(&summary);
+                    let persisted = stream.complete_with_checkpoint(&summary, checkpoint.as_ref());
                     let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
                     match persisted {
                         Ok(()) => {

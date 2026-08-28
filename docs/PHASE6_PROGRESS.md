@@ -41,10 +41,18 @@ SQLite v7の保存済みcheckpoint、現在のdirectory handleから取得した
 - 信頼できる結果だけが変更pathと次のFSEvents tokenを返す
 - volume root `.` が通常変更eventとして届く場合を安全な相対pathとして受け入れる
 
+## フルスキャンcheckpointの原子的確定
+
+macOSではフルスキャン開始前にFSEvents checkpointとdirectory handle由来のvolume／root identityを取得する。開始前の位置を使うことで、走査中に発生した変更は次回の履歴読取で再取得され、取りこぼしを避ける。
+
+- scan sessionの`complete`更新と`index_checkpoints`のupsertを同じSQLite transactionで確定する
+- checkpoint検証・保存に失敗した場合はtransactionをrollbackし、sessionを`failed`へ遷移する
+- キャンセル、走査失敗、永続化失敗ではcheckpointを保存しない
+- FSEvents checkpointを取得できない環境ではフルスキャン自体を妨げず、推測したtokenは保存しない
+
 ## 次の実装
 
-1. 完了したフルスキャンと同じtransaction境界でvolume／root identityとOS履歴checkpointを確定する
-2. 信頼できる変更pathだけを部分再走査し、`RescanSubtrees`はsubtree単位へ拡張する
-3. Windows USN変更record読取adapterを追加する
-4. 信頼状態をUIへ表示し、差分不可時は理由付きでフルスキャンを提案する
-5. 外付け媒体の切断・再接続、スリープ復帰でidentityを再評価する
+1. 信頼できる変更pathだけを部分再走査し、`RescanSubtrees`はsubtree単位へ拡張する
+2. Windows USN変更record読取adapterを追加する
+3. 信頼状態をUIへ表示し、差分不可時は理由付きでフルスキャンを提案する
+4. 外付け媒体の切断・再接続、スリープ復帰でidentityを再評価する

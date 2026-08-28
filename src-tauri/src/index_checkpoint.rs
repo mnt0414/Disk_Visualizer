@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -28,6 +28,65 @@ fn unix_time() -> Result<i64, String> {
             .as_secs(),
     )
     .map_err(|_| "現在時刻が保存可能な範囲を超えています".to_owned())
+}
+
+pub(crate) fn validate_checkpoint(checkpoint: &IndexCheckpoint) -> Result<(), String> {
+    if checkpoint.root_path.is_empty()
+        || checkpoint.volume_identity.is_empty()
+        || checkpoint.root_identity.is_empty()
+        || checkpoint.history_token.is_empty()
+    {
+        return Err("差分更新checkpointのidentityまたはtokenが不足しています".to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) fn upsert_checkpoint(
+    connection: &Connection,
+    checkpoint: &IndexCheckpoint,
+) -> Result<(), String> {
+    validate_checkpoint(checkpoint)?;
+    connection.execute("INSERT INTO index_checkpoints (root_path,platform,volume_identity,root_identity,history_source,history_token,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(root_path) DO UPDATE SET platform=excluded.platform,volume_identity=excluded.volume_identity,root_identity=excluded.root_identity,history_source=excluded.history_source,history_token=excluded.history_token,updated_at=excluded.updated_at",params![checkpoint.root_path,checkpoint.platform,checkpoint.volume_identity,checkpoint.root_identity,checkpoint.history_source,checkpoint.history_token,checkpoint.updated_at]).map_err(|error|format!("差分更新checkpointを保存できません: {error}"))?;
+    Ok(())
+}
+
+pub fn capture_full_scan_checkpoint(root: &Path) -> Result<Option<IndexCheckpoint>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use cap_std::{ambient_authority, fs::Dir};
+        use std::os::unix::fs::MetadataExt;
+
+        if !root.is_absolute() {
+            return Err("checkpoint取得には絶対pathが必要です".to_owned());
+        }
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|error| format!("checkpoint対象を解決できません: {error}"))?;
+        if !canonical_root.is_dir() {
+            return Err("checkpoint対象はdirectoryである必要があります".to_owned());
+        }
+        let directory = Dir::open_ambient_dir(&canonical_root, ambient_authority())
+            .map_err(|error| format!("checkpoint対象を安全に開けません: {error}"))?;
+        let metadata = directory
+            .into_std_file()
+            .metadata()
+            .map_err(|error| format!("checkpoint対象のidentityを取得できません: {error}"))?;
+        let history_token = crate::macos_fsevents::query_checkpoint(&canonical_root)?.encode();
+        Ok(Some(IndexCheckpoint {
+            root_path: canonical_root.to_string_lossy().into_owned(),
+            platform: "macos".to_owned(),
+            volume_identity: metadata.dev().to_string(),
+            root_identity: metadata.ino().to_string(),
+            history_source: "fsevents".to_owned(),
+            history_token,
+            updated_at: unix_time()?,
+        }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = root;
+        Ok(None)
+    }
 }
 
 impl IndexCheckpointRepository {
@@ -81,15 +140,7 @@ impl IndexCheckpointRepository {
     }
 
     pub fn save(&self, checkpoint: &IndexCheckpoint) -> Result<(), String> {
-        if checkpoint.root_path.is_empty()
-            || checkpoint.volume_identity.is_empty()
-            || checkpoint.root_identity.is_empty()
-            || checkpoint.history_token.is_empty()
-        {
-            return Err("差分更新checkpointのidentityまたはtokenが不足しています".to_owned());
-        }
-        self.connection()?.execute("INSERT INTO index_checkpoints (root_path,platform,volume_identity,root_identity,history_source,history_token,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(root_path) DO UPDATE SET platform=excluded.platform,volume_identity=excluded.volume_identity,root_identity=excluded.root_identity,history_source=excluded.history_source,history_token=excluded.history_token,updated_at=excluded.updated_at",params![checkpoint.root_path,checkpoint.platform,checkpoint.volume_identity,checkpoint.root_identity,checkpoint.history_source,checkpoint.history_token,checkpoint.updated_at]).map_err(|error|format!("差分更新checkpointを保存できません: {error}"))?;
-        Ok(())
+        upsert_checkpoint(&self.connection()?, checkpoint)
     }
 
     pub fn save_current(
