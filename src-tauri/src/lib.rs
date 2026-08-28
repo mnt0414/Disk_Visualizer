@@ -5,6 +5,7 @@ pub mod change_history;
 mod file_metrics;
 pub mod fsevents_callback;
 pub mod fsevents_history;
+pub mod incremental_rescan;
 pub mod incremental_trust;
 pub mod index_checkpoint;
 pub mod index_trust;
