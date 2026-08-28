@@ -333,7 +333,7 @@ mod tests {
             .unwrap();
         assert_eq!(baseline_count, 4);
         assert_eq!(updated, ("complete".to_owned(), 6, 2));
-        assert_eq!(updated_paths, format!("keep,old"));
+        assert_eq!(updated_paths, "keep,old");
         assert_eq!(token, "fsevents:v1:20");
         let _ = std::fs::remove_file(path);
     }
