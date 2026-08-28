@@ -87,10 +87,7 @@ pub fn query_available_history(root: &Path) -> Result<AvailableHistory, String> 
             std::io::Error::last_os_error()
         ));
     }
-    if data.journal_id == 0
-        || data.lowest_valid_usn < 0
-        || data.lowest_valid_usn > data.next_usn
-    {
+    if data.journal_id == 0 || data.lowest_valid_usn < 0 || data.lowest_valid_usn > data.next_usn {
         return Err("USN Journal metadataの範囲が不正です".to_owned());
     }
     Ok(AvailableHistory::Usn {
