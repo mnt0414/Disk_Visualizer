@@ -255,7 +255,7 @@ mod tests {
         ];
         for (name, relative, size, files, directories) in rows {
             let absolute = root.join(relative);
-            connection.execute("INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,file_count,directory_count,skipped_count,is_directory) VALUES (1,?1,?2,?3,?4,?5,?6,?6,?7,?8,0,?9)", params![name,absolute.to_string_lossy().as_ref(),absolute.parent().map(|value|value.to_string_lossy().into_owned()),PathBuf::from(relative).to_string_lossy().as_ref(),if directories > 0 { "directory" } else { "file" },size,files,directories,if directories > 0 { 1 } else { 0 }]).unwrap();
+            connection.execute("INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,file_count,directory_count,skipped_count,is_directory) VALUES (1,?1,?2,?3,?4,?5,?6,?6,?7,?8,0,?9)", params![name,absolute.to_string_lossy().as_ref(),absolute.parent().map(|value|value.to_string_lossy().into_owned()),absolute.strip_prefix(root).unwrap().to_string_lossy().as_ref(),if directories > 0 { "directory" } else { "file" },size,files,directories,if directories > 0 { 1 } else { 0 }]).unwrap();
         }
         path
     }
