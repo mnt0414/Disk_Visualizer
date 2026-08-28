@@ -1,0 +1,117 @@
+name: Temporary incremental Windows test fix
+
+on:
+  push:
+    branches:
+      - feat/atomic-incremental-storage
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/atomic-incremental-storage
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          path = Path('src-tauri/src/incremental_storage.rs')
+          text = path.read_text()
+          marker = '#[cfg(test)]\nmod tests {'
+          prefix = text.split(marker, 1)[0]
+          tests = r'''#[cfg(test)]
+          mod tests {
+              use super::*;
+
+              fn root(name: &str) -> PathBuf {
+                  std::env::temp_dir().join(format!("disk-visualizer-root-{name}"))
+              }
+
+              fn database(name: &str, root: &Path) -> PathBuf {
+                  let unique = SystemTime::now()
+                      .duration_since(UNIX_EPOCH)
+                      .unwrap()
+                      .as_nanos();
+                  let path = std::env::temp_dir().join(format!(
+                      "disk-visualizer-incremental-{name}-{}-{unique}.sqlite3",
+                      std::process::id()
+                  ));
+                  let connection = Connection::open(&path).unwrap();
+                  connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE scan_sessions (id INTEGER PRIMARY KEY,root_path TEXT NOT NULL,status TEXT NOT NULL,total_size_bytes INTEGER NOT NULL DEFAULT 0,file_count INTEGER NOT NULL DEFAULT 0,directory_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,elapsed_milliseconds INTEGER NOT NULL DEFAULT 0,started_at INTEGER NOT NULL,completed_at INTEGER); CREATE TABLE scan_entries (id INTEGER PRIMARY KEY,scan_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,name TEXT NOT NULL,path TEXT NOT NULL,parent_path TEXT,relative_path TEXT NOT NULL,entry_type TEXT NOT NULL,size_bytes INTEGER NOT NULL,logical_size INTEGER NOT NULL,allocated_size INTEGER,file_count INTEGER NOT NULL,directory_count INTEGER NOT NULL,skipped_count INTEGER NOT NULL DEFAULT 0,is_directory INTEGER NOT NULL,file_identity TEXT,volume_identity TEXT,modified_at INTEGER,skip_reason TEXT,cache_catalog_version TEXT,cache_definition_id TEXT,cache_definition_version INTEGER,cache_runtime_state TEXT); CREATE TABLE index_checkpoints (root_path TEXT PRIMARY KEY,platform TEXT NOT NULL,volume_identity TEXT NOT NULL,root_identity TEXT NOT NULL,history_source TEXT NOT NULL,history_token TEXT NOT NULL,updated_at INTEGER NOT NULL);").unwrap();
+                  connection.execute("INSERT INTO scan_sessions (id,root_path,status,total_size_bytes,file_count,directory_count,skipped_count,started_at,completed_at) VALUES (1,?1,'complete',6,3,1,0,1,1)",[root.to_string_lossy().as_ref()]).unwrap();
+                  let rows = [("keep", "keep", 1, 1, 0), ("old", "old", 2, 1, 0), ("dir", "dir", 0, 0, 1), ("nested", "dir/nested", 3, 1, 0)];
+                  for (name, relative, size, files, directories) in rows {
+                      let absolute = root.join(relative);
+                      connection.execute("INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,file_count,directory_count,skipped_count,is_directory) VALUES (1,?1,?2,?3,?4,?5,?6,?6,?7,?8,0,?9)", params![name,absolute.to_string_lossy().as_ref(),absolute.parent().map(|value|value.to_string_lossy().into_owned()),PathBuf::from(relative).to_string_lossy().as_ref(),if directories > 0 { "directory" } else { "file" },size,files,directories,if directories > 0 { 1 } else { 0 }]).unwrap();
+                  }
+                  path
+              }
+
+              fn target(path: &str, recursive: bool) -> IncrementalRescanTarget {
+                  IncrementalRescanTarget { relative_path: path.into(), recursive }
+              }
+
+              fn entry(path: PathBuf, size: u64) -> IncrementalEntry {
+                  IncrementalEntry { path, file_count: 1, directory_count: 0, skipped_count: 0, skip_reason: None, counted_size_bytes: size, logical_size_bytes: size, allocated_size_bytes: Some(size), file_identity: Some(format!("file-{size}")), volume_identity: Some("volume-1".to_owned()), modified_at: Some(2) }
+              }
+
+              fn checkpoint(root: &Path, token: &str) -> IndexCheckpoint {
+                  IndexCheckpoint { root_path: root.to_string_lossy().into_owned(), platform: "macos".to_owned(), volume_identity: "volume-1".to_owned(), root_identity: "root-1".to_owned(), history_source: "fsevents".to_owned(), history_token: token.to_owned(), updated_at: 2 }
+              }
+
+              #[test]
+              fn creates_new_snapshot_and_preserves_baseline() {
+                  let root = root("success");
+                  let path = database("success", &root);
+                  let scan_id = apply_incremental_snapshot(&path, 1, &root, &[target("old", false), target("dir", true)], &[entry(root.join("old"), 5)], &checkpoint(&root, "fsevents:v1:20")).unwrap();
+                  let connection = Connection::open(&path).unwrap();
+                  let baseline_count: i64 = connection.query_row("SELECT COUNT(*) FROM scan_entries WHERE scan_id=1", [], |row| row.get(0)).unwrap();
+                  let updated: (String, i64, i64) = connection.query_row("SELECT status,total_size_bytes,file_count FROM scan_sessions WHERE id=?1", [scan_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+                  let updated_paths: String = connection.query_row("SELECT group_concat(relative_path,',') FROM (SELECT relative_path FROM scan_entries WHERE scan_id=?1 ORDER BY relative_path)", [scan_id], |row| row.get(0)).unwrap();
+                  let token: String = connection.query_row("SELECT history_token FROM index_checkpoints WHERE root_path=?1", [root.to_string_lossy().as_ref()], |row| row.get(0)).unwrap();
+                  assert_eq!(baseline_count, 4);
+                  assert_eq!(updated, ("complete".to_owned(), 6, 2));
+                  assert_eq!(updated_paths, format!("keep,old"));
+                  assert_eq!(token, "fsevents:v1:20");
+                  let _ = std::fs::remove_file(path);
+              }
+
+              #[test]
+              fn rolls_back_when_replacement_is_outside_target() {
+                  let root = root("outside");
+                  let path = database("outside", &root);
+                  assert!(apply_incremental_snapshot(&path, 1, &root, &[target("old", false)], &[entry(root.join("other"), 5)], &checkpoint(&root, "fsevents:v1:20")).is_err());
+                  let connection = Connection::open(&path).unwrap();
+                  let sessions: i64 = connection.query_row("SELECT COUNT(*) FROM scan_sessions", [], |row| row.get(0)).unwrap();
+                  assert_eq!(sessions, 1);
+                  let _ = std::fs::remove_file(path);
+              }
+
+              #[test]
+              fn rolls_back_snapshot_when_checkpoint_is_invalid() {
+                  let root = root("checkpoint");
+                  let path = database("checkpoint", &root);
+                  assert!(apply_incremental_snapshot(&path, 1, &root, &[target("old", false)], &[], &checkpoint(&root, "")).is_err());
+                  let connection = Connection::open(&path).unwrap();
+                  let sessions: i64 = connection.query_row("SELECT COUNT(*) FROM scan_sessions", [], |row| row.get(0)).unwrap();
+                  assert_eq!(sessions, 1);
+                  let _ = std::fs::remove_file(path);
+              }
+          }
+          '''
+          path.write_text(prefix + tests)
+          PY
+          cargo fmt --manifest-path src-tauri/Cargo.toml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/src/incremental_storage.rs
+          git commit -m "test: use portable incremental storage paths"
+          git push
