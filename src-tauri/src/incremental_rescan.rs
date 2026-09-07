@@ -65,6 +65,7 @@ pub fn plan_incremental_rescan(
     max_targets: usize,
 ) -> IncrementalRescanPlan {
     let mut paths = BTreeSet::new();
+    let mut includes_root = false;
     for change in changes {
         let Some(path) = normalize_relative(&change.relative_path) else {
             return IncrementalRescanPlan::Full {
@@ -72,16 +73,33 @@ pub fn plan_incremental_rescan(
             };
         };
         if path == Path::new(".") {
-            return IncrementalRescanPlan::Partial {
+            includes_root = true;
+            paths.clear();
+        } else if !includes_root {
+            paths.insert(path);
+        }
+        // rootがあっても、後続の不正pathを検査するまで計画を確定しない。
+    }
+    if includes_root {
+        return if max_targets == 0 {
+            IncrementalRescanPlan::Full {
+                reason: FullRescanReason::TooManyTargets,
+            }
+        } else {
+            IncrementalRescanPlan::Partial {
                 targets: vec![IncrementalRescanTarget {
-                    relative_path: path,
+                    relative_path: PathBuf::from("."),
                     recursive: true,
                 }],
-            };
-        }
-        paths.insert(path);
+            }
+        };
     }
-    let paths = collapse_targets(paths);
+    // exact targetは子孫を走査・置換しない。祖先による統合は再帰時だけ行う。
+    let paths = if rescan_subtrees {
+        collapse_targets(paths)
+    } else {
+        paths.into_iter().collect()
+    };
     if paths.len() > max_targets {
         return IncrementalRescanPlan::Full {
             reason: FullRescanReason::TooManyTargets,
@@ -193,5 +211,149 @@ mod tests {
                 reason: FullRescanReason::TooManyTargets,
             }
         );
+    }
+
+    fn partial(targets: &[(&str, bool)]) -> IncrementalRescanPlan {
+        IncrementalRescanPlan::Partial {
+            targets: targets
+                .iter()
+                .map(|(path, recursive)| IncrementalRescanTarget {
+                    relative_path: PathBuf::from(*path),
+                    recursive: *recursive,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn preserves_descendants_of_exact_targets() {
+        let changes = [change("dir/file"), change("dir"), change("dir/file")];
+        assert_eq!(
+            plan_incremental_rescan(&changes, false, 8),
+            partial(&[("dir", false), ("dir/file", false)])
+        );
+    }
+
+    #[test]
+    fn exact_descendants_count_toward_the_target_limit() {
+        assert_eq!(
+            plan_incremental_rescan(&[change("dir"), change("dir/file")], false, 1),
+            IncrementalRescanPlan::Full {
+                reason: FullRescanReason::TooManyTargets,
+            }
+        );
+        assert_eq!(
+            plan_incremental_rescan(&[change("dir"), change("dir/file")], true, 1),
+            partial(&[("dir", true)])
+        );
+    }
+
+    #[test]
+    fn validates_unsafe_changes_before_and_after_root() {
+        for unsafe_path in ["", "../outside", "/outside", "dir/../outside"] {
+            for recursive in [false, true] {
+                for root_first in [false, true] {
+                    let changes = if root_first {
+                        vec![change("."), change(unsafe_path)]
+                    } else {
+                        vec![change(unsafe_path), change(".")]
+                    };
+                    assert_eq!(
+                        plan_incremental_rescan(&changes, recursive, 8),
+                        IncrementalRescanPlan::Full {
+                            reason: FullRescanReason::InvalidChangePath,
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_budget_allows_only_an_empty_plan() {
+        for recursive in [false, true] {
+            assert_eq!(plan_incremental_rescan(&[], recursive, 0), partial(&[]));
+            for path in [".", "file", "dir/file"] {
+                assert_eq!(
+                    plan_incremental_rescan(&[change(path)], recursive, 0),
+                    IncrementalRescanPlan::Full {
+                        reason: FullRescanReason::TooManyTargets,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn root_collapses_valid_changes_independent_of_order() {
+        for recursive in [false, true] {
+            for changes in [
+                vec![change("."), change("dir/file"), change(".")],
+                vec![change("dir/file"), change("."), change(".")],
+            ] {
+                assert_eq!(
+                    plan_incremental_rescan(&changes, recursive, 1),
+                    partial(&[(".", true)])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn does_not_collapse_sibling_with_a_common_text_prefix() {
+        assert_eq!(
+            plan_incremental_rescan(&[change("dir/file"), change("directory/file")], true, 2),
+            partial(&[("dir/file", true), ("directory/file", true)])
+        );
+    }
+
+    #[test]
+    fn plans_are_independent_of_input_order() {
+        let orders = [
+            ["dir", "dir/file", "other"],
+            ["dir", "other", "dir/file"],
+            ["dir/file", "dir", "other"],
+            ["dir/file", "other", "dir"],
+            ["other", "dir", "dir/file"],
+            ["other", "dir/file", "dir"],
+        ];
+        for recursive in [false, true] {
+            let expected = if recursive {
+                partial(&[("dir", true), ("other", true)])
+            } else {
+                partial(&[("dir", false), ("dir/file", false), ("other", false)])
+            };
+            for order in &orders {
+                let changes: Vec<_> = order.iter().map(|path| change(path)).collect();
+                assert_eq!(plan_incremental_rescan(&changes, recursive, 8), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn every_valid_change_remains_covered_by_the_plan() {
+        let paths = ["a", "a/b", "a/b/c", "ab", "z"];
+        for mask in 0..(1_usize << paths.len()) {
+            let changes: Vec<_> = paths
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1_usize << *index) != 0)
+                .map(|(_, path)| change(path))
+                .collect();
+            for recursive in [false, true] {
+                let IncrementalRescanPlan::Partial { targets } =
+                    plan_incremental_rescan(&changes, recursive, paths.len())
+                else {
+                    panic!("有効な変更は上限内の部分計画になる必要があります");
+                };
+                for change in &changes {
+                    assert!(targets.iter().any(|target| {
+                        change.relative_path == target.relative_path
+                            || (target.recursive
+                                && change.relative_path.starts_with(&target.relative_path))
+                    }));
+                }
+            }
+        }
     }
 }
