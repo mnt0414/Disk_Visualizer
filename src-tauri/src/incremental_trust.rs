@@ -24,8 +24,12 @@ pub struct MacosIndexTrustAssessment {
     pub next_history_token: Option<String>,
     /// 差分更新の基準となる完了済みscan session。checkpointが明示的に指したものだけを載せる。
     pub baseline_scan_id: Option<i64>,
-    /// 検証に使ったcheckpointそのもの。差分適用時に読み直さず、この対応のまま更新する。
+    /// 検証に使ったcheckpointそのもの。差分適用時の前提として、確定transaction内で
+    /// 保存済みcheckpointと突き合わせる。
     pub checkpoint: Option<IndexCheckpoint>,
+    /// scan rootの祖先に対して部分木全体の再走査要求が届いた。root配下の変更範囲を
+    /// 保証できないため、差分更新ではなくフルスキャンへ戻す必要がある。
+    pub ancestor_rescan_required: bool,
 }
 
 fn full_assessment(state: IndexTrustState) -> MacosIndexTrustAssessment {
@@ -39,6 +43,7 @@ fn full_assessment(state: IndexTrustState) -> MacosIndexTrustAssessment {
         next_history_token: None,
         baseline_scan_id: None,
         checkpoint: None,
+        ancestor_rescan_required: false,
     }
 }
 
@@ -73,14 +78,16 @@ fn checkpoint_event_id(checkpoint: &IndexCheckpoint) -> Result<u64, IndexTrustDe
 
 /// device-relative pathの変更を、走査root基準の相対pathへ読み替える。
 ///
-/// root外の変更は走査結果に現れないため落とす。相対pathとして解釈できない変更は
-/// 範囲を推測せず、fail closedでフルスキャンへ戻せるようエラーにする。
+/// root外の変更は走査結果に現れないため落とす。祖先への変更は落とすが、落としたことを
+/// 呼び出し側へ伝える。相対pathとして解釈できない変更は範囲を推測せず、fail closedで
+/// フルスキャンへ戻せるようエラーにする。
 #[cfg(any(target_os = "macos", test))]
 fn to_scan_root_changes(
     device_relative_root: &Path,
     changes: Vec<CollectedFseventsChange>,
-) -> Result<Vec<CollectedFseventsChange>, String> {
+) -> Result<(Vec<CollectedFseventsChange>, bool), String> {
     let mut converted = Vec::with_capacity(changes.len());
+    let mut ancestor_changed = false;
     for change in changes {
         match crate::incremental_paths::to_scan_root_relative(
             device_relative_root,
@@ -90,11 +97,12 @@ fn to_scan_root_changes(
                 relative_path,
                 ..change
             }),
+            ChangeScope::Ancestor => ancestor_changed = true,
             ChangeScope::Outside => {}
             ChangeScope::Invalid => return Err("変更pathを走査root基準で解釈できません".to_owned()),
         }
     }
-    Ok(converted)
+    Ok((converted, ancestor_changed))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -128,9 +136,10 @@ fn evaluate_history(
             return Ok(full_assessment(IndexTrustState::HistoryDiscontinuous))
         }
     };
+    let (changes, ancestor_changed) = to_scan_root_changes(device_relative_root, read.changes)?;
     Ok(MacosIndexTrustAssessment {
         decision: evidence_decision(true, true, true, true, true),
-        changes: to_scan_root_changes(device_relative_root, read.changes)?,
+        changes,
         rescan_subtrees,
         next_history_token: Some(
             HistoryToken::Fsevents {
@@ -140,6 +149,8 @@ fn evaluate_history(
         ),
         baseline_scan_id: Some(baseline_scan_id),
         checkpoint: Some(checkpoint.clone()),
+        // 祖先への部分木再走査要求は、root配下の変更を列挙し切れないことを意味する。
+        ancestor_rescan_required: ancestor_changed && rescan_subtrees,
     })
 }
 
@@ -188,6 +199,7 @@ pub fn assess_macos_index_trust(
                     next_history_token: None,
                     baseline_scan_id: None,
                     checkpoint: None,
+                    ancestor_rescan_required: false,
                 })
             }
         };
@@ -303,6 +315,43 @@ mod tests {
         ));
         assert_eq!(assessment.decision.state, IndexTrustState::Trusted);
         assert!(assessment.rescan_subtrees);
+    }
+
+    /// 祖先へのMustScanSubDirsは「その配下すべてを走査し直せ」という指示で、
+    /// root配下の個別変更は列挙されない。落として差分更新を続けると取りこぼす。
+    #[test]
+    fn requires_a_full_scan_when_an_ancestor_demands_a_subtree_rescan() {
+        for ancestor in ["Volumes", "."] {
+            let assessment = unwrapped(evaluate_history(
+                &checkpoint(),
+                ("volume-1", "root-1"),
+                Path::new(DEVICE_RELATIVE_ROOT),
+                changed_history(
+                    FseventsBatchDecision::RescanSubtrees { next_event_id: 11 },
+                    ancestor,
+                ),
+            ));
+            assert!(assessment.ancestor_rescan_required, "{ancestor}");
+            assert!(assessment.changes.is_empty(), "{ancestor}");
+        }
+    }
+
+    /// 部分木再走査要求を伴わない祖先の変更は、root配下の内容を変えない。
+    /// これは無視してよく、無視したことでフルスキャンへ倒す必要もない。
+    #[test]
+    fn ignores_ancestor_changes_without_a_subtree_rescan() {
+        let assessment = unwrapped(evaluate_history(
+            &checkpoint(),
+            ("volume-1", "root-1"),
+            Path::new(DEVICE_RELATIVE_ROOT),
+            changed_history(
+                FseventsBatchDecision::Incremental { next_event_id: 11 },
+                "Volumes",
+            ),
+        ));
+        assert_eq!(assessment.decision.state, IndexTrustState::Trusted);
+        assert!(!assessment.ancestor_rescan_required);
+        assert!(assessment.changes.is_empty());
     }
 
     #[test]

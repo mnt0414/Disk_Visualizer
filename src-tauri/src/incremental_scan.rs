@@ -292,7 +292,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::incremental_storage::apply_staged_snapshot;
+    use crate::incremental_storage::{apply_staged_snapshot, CheckpointTransition};
     use crate::index_checkpoint::{IndexCheckpoint, IndexCheckpointRepository};
     use crate::storage::ScanRepository;
     use rusqlite::Connection;
@@ -482,23 +482,88 @@ mod tests {
             .unwrap()
     }
 
-    /// ハードリンクの計上元が入れ替わると勝者行が変わりうるため、行ごとの
-    /// 計上サイズは比較せず、論理サイズと種別・件数を比較する。
-    fn snapshot(database: &Path, scan_id: i64) -> Vec<(String, String, i64, i64, i64, i64)> {
+    /// 走査結果1行分のうち、走査経路によらず一致すべき列。
+    ///
+    /// 比較から外した列と理由:
+    /// - `id`・`scan_id`: snapshotごとに必ず変わる代理キー。
+    /// - `name`・`path`・`parent_path`: `relative_path` から一意に決まる冗長表現。
+    /// - `cache_*`: bundled catalogがpathから決める分類で、走査経路に依存しない。
+    #[derive(Debug, PartialEq, Eq)]
+    struct EntryRow {
+        relative_path: String,
+        entry_type: String,
+        is_directory: i64,
+        size_bytes: i64,
+        logical_size: i64,
+        allocated_size: Option<i64>,
+        file_count: i64,
+        directory_count: i64,
+        skipped_count: i64,
+        skip_reason: Option<String>,
+        modified_at: Option<i64>,
+        file_identity: Option<String>,
+        volume_identity: Option<String>,
+    }
+
+    /// 同じ実体を指すpathが複数ある場合の、identity単位の集計。
+    ///
+    /// どのpathを計上元にするかはsnapshotの行順で決まり、走査経路で変わりうる。
+    /// そこで行ごとの `size_bytes` は比較せず、identityごとの合計だけを比較する。
+    /// 論理サイズと割り当てサイズはリンク間で一致するはずなので、最小と最大の
+    /// 両方を取り、snapshot内での食い違いも検出する。
+    #[derive(Debug, PartialEq, Eq)]
+    struct LinkGroup {
+        volume_identity: String,
+        file_identity: String,
+        paths: String,
+        logical_size: (i64, i64),
+        allocated_size: (Option<i64>, Option<i64>),
+        modified_at: (Option<i64>, Option<i64>),
+        counted_size: i64,
+    }
+
+    /// 計上元pathが1つしかない行。ハードリンクの正規化を挟まず、そのまま比較できる。
+    fn unique_rows(database: &Path, scan_id: i64) -> Vec<EntryRow> {
         let connection = Connection::open(database).unwrap();
-        let mut statement = connection
-            .prepare("SELECT relative_path,entry_type,logical_size,file_count,directory_count,skipped_count FROM scan_entries WHERE scan_id=?1 ORDER BY relative_path")
-            .unwrap();
+        let mut statement = connection.prepare("SELECT relative_path,entry_type,is_directory,size_bytes,logical_size,allocated_size,file_count,directory_count,skipped_count,skip_reason,modified_at,file_identity,volume_identity FROM scan_entries e WHERE e.scan_id=?1 AND (e.file_identity IS NULL OR e.volume_identity IS NULL OR (SELECT COUNT(*) FROM scan_entries s WHERE s.scan_id=e.scan_id AND s.volume_identity=e.volume_identity AND s.file_identity=e.file_identity)=1) ORDER BY relative_path").unwrap();
         let rows = statement
             .query_map([scan_id], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
+                Ok(EntryRow {
+                    relative_path: row.get(0)?,
+                    entry_type: row.get(1)?,
+                    is_directory: row.get(2)?,
+                    size_bytes: row.get(3)?,
+                    logical_size: row.get(4)?,
+                    allocated_size: row.get(5)?,
+                    file_count: row.get(6)?,
+                    directory_count: row.get(7)?,
+                    skipped_count: row.get(8)?,
+                    skip_reason: row.get(9)?,
+                    modified_at: row.get(10)?,
+                    file_identity: row.get(11)?,
+                    volume_identity: row.get(12)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    fn link_groups(database: &Path, scan_id: i64) -> Vec<LinkGroup> {
+        let connection = Connection::open(database).unwrap();
+        let mut statement = connection.prepare("SELECT volume_identity,file_identity,group_concat(relative_path,'|'),MIN(logical_size),MAX(logical_size),MIN(allocated_size),MAX(allocated_size),MIN(modified_at),MAX(modified_at),SUM(size_bytes) FROM (SELECT * FROM scan_entries WHERE scan_id=?1 AND file_identity IS NOT NULL AND volume_identity IS NOT NULL ORDER BY relative_path) GROUP BY volume_identity,file_identity HAVING COUNT(*)>1 ORDER BY volume_identity,file_identity").unwrap();
+        let rows = statement
+            .query_map([scan_id], |row| {
+                Ok(LinkGroup {
+                    volume_identity: row.get(0)?,
+                    file_identity: row.get(1)?,
+                    paths: row.get(2)?,
+                    logical_size: (row.get(3)?, row.get(4)?),
+                    allocated_size: (row.get(5)?, row.get(6)?),
+                    modified_at: (row.get(7)?, row.get(8)?),
+                    counted_size: row.get(9)?,
+                })
             })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -517,15 +582,30 @@ mod tests {
             .unwrap()
     }
 
+    fn recursive_target(path: &str) -> IncrementalRescanTarget {
+        IncrementalRescanTarget {
+            relative_path: PathBuf::from(path),
+            recursive: true,
+        }
+    }
+
+    /// 差分更新の結果が、同じ状態を新規にフルスキャンした結果と一致することを確かめる。
+    ///
+    /// 含める変更: 内容変更・削除・追加・ハードリンクの計上元削除・未変更リンク経由の
+    /// サイズ変更・directoryからfileへの型変更。
     #[test]
     fn matches_a_fresh_full_scan_after_changes_stop() {
         let root = temporary_root("equivalence");
         fs::create_dir_all(root.join("dir")).unwrap();
+        fs::create_dir_all(root.join("typechanged")).unwrap();
+        fs::write(root.join("typechanged/inner.bin"), [0_u8; 3]).unwrap();
         fs::write(root.join("dir/kept.bin"), [0_u8; 8]).unwrap();
         fs::write(root.join("changed.bin"), [0_u8; 4]).unwrap();
         fs::write(root.join("removed.bin"), [0_u8; 4]).unwrap();
         fs::write(root.join("source.bin"), [0_u8; 16]).unwrap();
-        fs::hard_link(root.join("source.bin"), root.join("dir/copy.bin")).unwrap();
+        fs::hard_link(root.join("source.bin"), root.join("copy.bin")).unwrap();
+        fs::write(root.join("linked.bin"), [0_u8; 6]).unwrap();
+        fs::hard_link(root.join("linked.bin"), root.join("linked-copy.bin")).unwrap();
 
         let database = temporary_database("equivalence");
         let repository = ScanRepository::new(database.clone());
@@ -551,28 +631,53 @@ mod tests {
         fs::write(root.join("changed.bin"), [0_u8; 32]).unwrap();
         fs::remove_file(root.join("removed.bin")).unwrap();
         fs::write(root.join("dir/added.bin"), [0_u8; 2]).unwrap();
+        // 計上元を消しても、残ったリンクへ計上が移る。
         fs::remove_file(root.join("source.bin")).unwrap();
+        // 同じinodeを書き換える。再走査しないlinked-copy.bin側にも反映されるはず。
+        fs::write(root.join("linked.bin"), [0_u8; 64]).unwrap();
+        // directoryをfileへ差し替える。古い子孫が残ってはいけない。
+        fs::remove_dir_all(root.join("typechanged")).unwrap();
+        fs::write(root.join("typechanged"), [0_u8; 5]).unwrap();
 
         let saved = checkpoints
             .load(root.to_string_lossy().as_ref())
             .unwrap()
             .unwrap();
         assert_eq!(saved.baseline_scan_id, Some(baseline));
-        let mut staging = rescan_targets(
-            &root,
-            &["changed.bin", "removed.bin", "dir/added.bin", "source.bin"].map(target),
-            || true,
-            |_| {},
-        )
-        .unwrap();
-        let updated = apply_staged_snapshot(&database, &mut staging, baseline, &saved).unwrap();
+        let mut targets = ["changed.bin", "removed.bin", "source.bin", "linked.bin"]
+            .map(target)
+            .to_vec();
+        // FSEventsは変更のあったdirectoryも報告する。dir自身のmetadataもここで揃う。
+        targets.push(recursive_target("dir"));
+        targets.push(recursive_target("typechanged"));
+        let mut staging = rescan_targets(&root, &targets, || true, |_| {}).unwrap();
+        let transition = CheckpointTransition {
+            expected: saved.clone(),
+            next_history_token: "fsevents:v1:20".to_owned(),
+        };
+        let updated =
+            apply_staged_snapshot(&database, &mut staging, baseline, &transition).unwrap();
 
         full_scan(&repository, &root, None);
         let fresh = latest_scan_id(&database);
         assert_ne!(updated, fresh);
-        assert_eq!(snapshot(&database, updated), snapshot(&database, fresh));
+        assert_eq!(
+            unique_rows(&database, updated),
+            unique_rows(&database, fresh)
+        );
+        assert_eq!(
+            link_groups(&database, updated),
+            link_groups(&database, fresh)
+        );
         assert_eq!(totals(&database, updated), totals(&database, fresh));
-        assert_eq!(totals(&database, updated).0, 58);
+        // 未変更リンク経由のサイズ変更が両方の行へ届いている。
+        let links = link_groups(&database, updated);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].paths, "linked-copy.bin|linked.bin");
+        assert_eq!(links[0].logical_size, (64, 64));
+        assert_eq!(links[0].counted_size, 64);
+        // 8(kept)+2(added)+32(changed)+16(copy)+64(linked)+5(typechanged)
+        assert_eq!(totals(&database, updated).0, 127);
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_file(database).unwrap();

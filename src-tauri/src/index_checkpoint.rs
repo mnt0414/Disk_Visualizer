@@ -55,6 +55,40 @@ pub(crate) fn upsert_checkpoint(
     Ok(())
 }
 
+/// 走査rootが今もcheckpointと同じ実体かを確認する。
+///
+/// 走査開始時の検証だけでは、走査中のunmount・rename・差し替えを見逃す。確定直前に
+/// 見直すことで、別のvolumeやdirectoryを走査した結果を基準scanへ当てない。identityを
+/// 取得できないplatformでは検証できないため、fail closedで失敗させる。
+pub(crate) fn verify_root_identity(
+    root: &Path,
+    checkpoint: &IndexCheckpoint,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use cap_std::{ambient_authority, fs::Dir};
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = Dir::open_ambient_dir(root, ambient_authority())
+            .map_err(|error| format!("走査rootを安全に開けません: {error}"))?
+            .into_std_file()
+            .metadata()
+            .map_err(|error| format!("走査rootのidentityを取得できません: {error}"))?;
+        if metadata.dev().to_string() != checkpoint.volume_identity {
+            return Err("走査中に走査rootのvolumeが入れ替わりました".to_owned());
+        }
+        if metadata.ino().to_string() != checkpoint.root_identity {
+            return Err("走査中に走査rootが入れ替わりました".to_owned());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, checkpoint);
+        Err("走査rootの同一性検証はこのplatformでは未対応です".to_owned())
+    }
+}
+
 pub fn capture_full_scan_checkpoint(root: &Path) -> Result<Option<IndexCheckpoint>, String> {
     #[cfg(target_os = "macos")]
     {
@@ -167,11 +201,19 @@ impl IndexCheckpointRepository {
     }
 
     pub fn load(&self, root_path: &str) -> Result<Option<IndexCheckpoint>, String> {
-        self.connection()?
-            .query_row("SELECT root_path,platform,volume_identity,root_identity,history_source,history_token,baseline_scan_id,updated_at FROM index_checkpoints WHERE root_path=?1",[root_path],|row|Ok(IndexCheckpoint { root_path: row.get(0)?, platform: row.get(1)?, volume_identity: row.get(2)?, root_identity: row.get(3)?, history_source: row.get(4)?, history_token: row.get(5)?, baseline_scan_id: row.get(6)?, updated_at: row.get(7)? }))
-            .optional()
-            .map_err(|error| format!("差分更新checkpointを取得できません: {error}"))
+        load_checkpoint(&self.connection()?, root_path)
     }
+}
+
+/// 与えられた接続でcheckpointを読む。確定transaction内から前提を読み直すために使う。
+pub(crate) fn load_checkpoint(
+    connection: &Connection,
+    root_path: &str,
+) -> Result<Option<IndexCheckpoint>, String> {
+    connection
+        .query_row("SELECT root_path,platform,volume_identity,root_identity,history_source,history_token,baseline_scan_id,updated_at FROM index_checkpoints WHERE root_path=?1",[root_path],|row|Ok(IndexCheckpoint { root_path: row.get(0)?, platform: row.get(1)?, volume_identity: row.get(2)?, root_identity: row.get(3)?, history_source: row.get(4)?, history_token: row.get(5)?, baseline_scan_id: row.get(6)?, updated_at: row.get(7)? }))
+        .optional()
+        .map_err(|error| format!("差分更新checkpointを取得できません: {error}"))
 }
 
 #[cfg(test)]
@@ -194,6 +236,52 @@ mod tests {
         let repository = IndexCheckpointRepository::new(path);
         repository.initialize().unwrap();
         repository
+    }
+
+    /// v7で実際に作られていたindex_checkpointsの定義。CHECK制約も当時のまま。
+    const V7_SCHEMA: &str = "CREATE TABLE index_checkpoints (root_path TEXT PRIMARY KEY,platform TEXT NOT NULL CHECK(platform IN ('macos','windows')),volume_identity TEXT NOT NULL,root_identity TEXT NOT NULL,history_source TEXT NOT NULL CHECK(history_source IN ('fsevents','usn')),history_token TEXT NOT NULL,updated_at INTEGER NOT NULL);";
+
+    fn temporary_database(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "disk-visualizer-checkpoint-{name}-{}-{unique}.sqlite3",
+            std::process::id()
+        ))
+    }
+
+    /// 実際のv7形式で、baseline_scan_idを持たない履歴を作る。
+    fn v7_database(name: &str, rows: &str) -> PathBuf {
+        let path = temporary_database(name);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!("{V7_SCHEMA}{rows} PRAGMA user_version=7;"))
+            .unwrap();
+        path
+    }
+
+    /// 列順の違いを無視して比較するため、名前順に並べた列定義を取る。
+    fn columns(path: &Path) -> Vec<(String, String, i64, Option<String>, i64)> {
+        let connection = Connection::open(path).unwrap();
+        let mut statement = connection
+            .prepare("SELECT name,type,\"notnull\",dflt_value,pk FROM pragma_table_info('index_checkpoints') ORDER BY name")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
     }
 
     fn checkpoint(token: &str) -> IndexCheckpoint {
@@ -226,15 +314,10 @@ mod tests {
 
     #[test]
     fn migrates_v7_by_adding_baseline_link_with_backup() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "disk-visualizer-checkpoint-v7-{}-{unique}.sqlite3",
-            std::process::id()
-        ));
-        Connection::open(&path).unwrap().execute_batch("CREATE TABLE index_checkpoints (root_path TEXT PRIMARY KEY,platform TEXT NOT NULL,volume_identity TEXT NOT NULL,root_identity TEXT NOT NULL,history_source TEXT NOT NULL,history_token TEXT NOT NULL,updated_at INTEGER NOT NULL); INSERT INTO index_checkpoints VALUES ('/Volumes/Data','macos','volume-1','root-1','fsevents','fsevents:v1:100',1234); PRAGMA user_version=7;").unwrap();
+        let path = v7_database(
+            "v7",
+            " INSERT INTO index_checkpoints VALUES ('/Volumes/Data','macos','volume-1','root-1','fsevents','fsevents:v1:100',1234),('/Volumes/Other','macos','volume-2','root-2','fsevents','fsevents:v1:200',1235);",
+        );
         let repository = IndexCheckpointRepository::new(path.clone());
         repository.initialize().unwrap();
         let version: i64 = repository
@@ -244,11 +327,93 @@ mod tests {
             .unwrap();
         assert_eq!(version, 8);
         assert!(path.with_extension("sqlite3.v7-backup").exists());
-        let migrated = repository.load("/Volumes/Data").unwrap().unwrap();
-        assert_eq!(migrated.baseline_scan_id, None);
-        assert_eq!(migrated.history_token, "fsevents:v1:100");
+        // 過去の正常な履歴はすべて残し、対応する基準scanは推測しない。
+        for (root, token) in [
+            ("/Volumes/Data", "fsevents:v1:100"),
+            ("/Volumes/Other", "fsevents:v1:200"),
+        ] {
+            let migrated = repository.load(root).unwrap().unwrap();
+            assert_eq!(migrated.baseline_scan_id, None);
+            assert_eq!(migrated.history_token, token);
+        }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite3.v7-backup"));
+    }
+
+    #[test]
+    fn new_and_migrated_databases_agree_on_the_v8_schema() {
+        let fresh = repository("schema-new");
+        let migrated_path = v7_database(
+            "schema-migrated",
+            " INSERT INTO index_checkpoints VALUES ('/Volumes/Data','macos','volume-1','root-1','fsevents','fsevents:v1:100',1234);",
+        );
+        let migrated = IndexCheckpointRepository::new(migrated_path.clone());
+        migrated.initialize().unwrap();
+
+        // ALTER TABLEは列を末尾に足すため物理的な列順は揃わない。列名で参照する限り
+        // 差はないので、名前順に並べた定義で比較する。
+        assert_eq!(columns(&fresh.database_path), columns(&migrated_path));
+        // CHECK制約もv7から引き継がれ、新規DBと同じ入力を拒否する。
+        for repository in [&fresh, &migrated] {
+            let mut invalid = checkpoint("fsevents:v1:300");
+            invalid.platform = "linux".to_owned();
+            assert!(repository.save(&invalid).is_err());
+            let mut valid = checkpoint("fsevents:v1:300");
+            valid.baseline_scan_id = None;
+            assert!(repository.save(&valid).is_ok());
+            assert_eq!(
+                repository
+                    .load("/Volumes/Data")
+                    .unwrap()
+                    .unwrap()
+                    .baseline_scan_id,
+                None
+            );
+        }
+        let _ = std::fs::remove_file(&migrated_path);
+        let _ = std::fs::remove_file(migrated_path.with_extension("sqlite3.v7-backup"));
+    }
+
+    #[test]
+    fn keeps_the_v7_database_and_its_backup_when_migration_fails() {
+        // 既にbaseline_scan_id列がある壊れたv7で、ALTER TABLEを失敗させる。
+        let path = v7_database(
+            "migration-failure",
+            " ALTER TABLE index_checkpoints ADD COLUMN baseline_scan_id INTEGER; INSERT INTO index_checkpoints (root_path,platform,volume_identity,root_identity,history_source,history_token,updated_at) VALUES ('/Volumes/Data','macos','volume-1','root-1','fsevents','fsevents:v1:100',1234);",
+        );
+        let repository = IndexCheckpointRepository::new(path.clone());
+
+        assert!(repository.initialize().is_err());
+
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        // 移行できないままversionを進めない。次回起動でも同じ移行を試せる。
+        assert_eq!(version, 7);
+        let token: String = connection
+            .query_row(
+                "SELECT history_token FROM index_checkpoints WHERE root_path='/Volumes/Data'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(token, "fsevents:v1:100");
+        // 移行前バックアップは健全な状態で残る。
+        let backup = path.with_extension("sqlite3.v7-backup");
+        let backup_connection = Connection::open(&backup).unwrap();
+        let check: String = backup_connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+        let backed_up: i64 = backup_connection
+            .query_row("SELECT COUNT(*) FROM index_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(backed_up, 1);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
     }
 
     #[test]

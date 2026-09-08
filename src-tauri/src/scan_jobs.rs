@@ -2,10 +2,10 @@ use crate::incremental_rescan::{
     plan_incremental_rescan, FullRescanReason, IncrementalRescanPlan, IncrementalRescanTarget,
 };
 use crate::incremental_scan::rescan_targets;
-use crate::incremental_storage::apply_staged_snapshot;
+use crate::incremental_storage::{apply_staged_snapshot, CheckpointTransition};
 use crate::incremental_trust::assess_macos_index_trust;
 use crate::index_checkpoint::{
-    capture_full_scan_checkpoint, IndexCheckpoint, IndexCheckpointRepository,
+    capture_full_scan_checkpoint, verify_root_identity, IndexCheckpointRepository,
 };
 use crate::index_trust::{IndexTrustDecision, IndexTrustState, ScanRecommendation};
 use crate::scanner::{self, ScanProgress, ScanSummary};
@@ -54,6 +54,8 @@ pub enum FullScanReason {
     IndexUntrusted(IndexTrustState),
     /// 履歴は使えるが、部分再走査の計画が成立しない。
     PlanRejected(FullRescanReason),
+    /// scan rootの祖先に部分木全体の再走査要求が届き、root配下の変更範囲を保証できない。
+    AncestorSubtreeChanged,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -165,7 +167,32 @@ fn run_incremental(
     root: &Path,
     targets: &[IncrementalRescanTarget],
     baseline_scan_id: i64,
-    checkpoint: &IndexCheckpoint,
+    transition: &CheckpointTransition,
+) {
+    run_incremental_with_hook(
+        job,
+        database,
+        root,
+        targets,
+        baseline_scan_id,
+        transition,
+        || {},
+    )
+}
+
+/// 走査完了から確定までの境界にテスト用のフックを差し込めるようにした実装。
+///
+/// フックは確定前の中断確認より前に呼ぶ。ここが「キャンセルを受け付ける最後の地点」で、
+/// これ以降のtransactionは取り消せない。テストはこの境界で実スレッドを止めて、
+/// pause・cancel・checkpointの追い越しを決定論的に再現する。
+fn run_incremental_with_hook<H: Fn()>(
+    job: &ScanJob,
+    database: &Path,
+    root: &Path,
+    targets: &[IncrementalRescanTarget],
+    baseline_scan_id: i64,
+    transition: &CheckpointTransition,
+    before_commit: H,
 ) {
     let outcome = rescan_targets(
         root,
@@ -174,11 +201,14 @@ fn run_incremental(
         |progress| job.progress(progress),
     )
     .and_then(|mut staging| {
+        before_commit();
         // 確定は取り消せないので、直前にもう一度中断要求を確認する。
         if !job.can_continue() {
             return Err("スキャンはキャンセルされました".to_owned());
         }
-        apply_staged_snapshot(database, &mut staging, baseline_scan_id, checkpoint)
+        // 走査中にrootが差し替わっていれば、この結果は基準scanの続きではない。
+        verify_root_identity(root, &transition.expected)?;
+        apply_staged_snapshot(database, &mut staging, baseline_scan_id, transition)
     });
     let cancelled = job
         .control
@@ -302,6 +332,15 @@ impl ScanManager {
                 job: self.start(path)?,
             });
         }
+        // 祖先への部分木再走査要求は、root配下の個別変更を列挙しない。範囲を保証できない
+        // まま差分を当てると取りこぼすので、理由を明示してフルスキャンへ戻す。
+        if assessment.ancestor_rescan_required {
+            return Ok(IncrementalScanStart {
+                trust,
+                full_scan_reason: Some(FullScanReason::AncestorSubtreeChanged),
+                job: self.start(path)?,
+            });
+        }
         let plan = plan_incremental_rescan(
             &assessment.changes,
             assessment.rescan_subtrees,
@@ -328,9 +367,9 @@ impl ScanManager {
         let job = self.spawn_incremental(
             targets,
             baseline_scan_id,
-            IndexCheckpoint {
-                history_token,
-                ..checkpoint
+            CheckpointTransition {
+                expected: checkpoint,
+                next_history_token: history_token,
             },
         )?;
         Ok(IncrementalScanStart {
@@ -343,16 +382,16 @@ impl ScanManager {
         &self,
         targets: Vec<IncrementalRescanTarget>,
         baseline_scan_id: i64,
-        checkpoint: IndexCheckpoint,
+        transition: CheckpointTransition,
     ) -> Result<ScanJobSnapshot, String> {
-        let root = PathBuf::from(&checkpoint.root_path);
+        let root = PathBuf::from(&transition.expected.root_path);
         if !root.is_absolute() {
             return Err("checkpointの走査rootが絶対パスではありません".to_owned());
         }
         let database = self.repository.path().to_path_buf();
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         ensure_idle(&active)?;
-        let job = new_job(&checkpoint.root_path);
+        let job = new_job(&transition.expected.root_path);
         *active = Some(Arc::clone(&job));
         let snapshot = job.snapshot();
         std::thread::spawn(move || {
@@ -362,7 +401,7 @@ impl ScanManager {
                 &root,
                 &targets,
                 baseline_scan_id,
-                &checkpoint,
+                &transition,
             )
         });
         Ok(snapshot)
@@ -501,8 +540,10 @@ mod tests {
 #[cfg(test)]
 mod incremental_tests {
     use super::*;
+    use crate::index_checkpoint::IndexCheckpoint;
     use rusqlite::Connection;
     use std::fs;
+    use std::sync::Barrier;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn temporary(name: &str, suffix: &str) -> PathBuf {
@@ -523,116 +564,6 @@ mod incremental_tests {
         }
     }
 
-    struct Fixture {
-        root: PathBuf,
-        database: PathBuf,
-        checkpoints: IndexCheckpointRepository,
-        baseline_scan_id: i64,
-        checkpoint: IndexCheckpoint,
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-            remove_database(&self.database);
-        }
-    }
-
-    fn full_scan(repository: &ScanRepository, root: &Path, checkpoint: &IndexCheckpoint) -> i64 {
-        let stream = repository
-            .begin_stream(root.to_string_lossy().as_ref())
-            .unwrap();
-        let recorder = stream.clone();
-        let summary = scanner::scan_folder_path_controlled(
-            root,
-            || true,
-            |progress| recorder.record(progress),
-        )
-        .unwrap();
-        stream
-            .complete_with_checkpoint(&summary, Some(checkpoint))
-            .unwrap();
-        stream.scan_id()
-    }
-
-    /// 基準scanとcheckpointが対応した状態のfixtureを作る。
-    fn fixture(name: &str) -> Fixture {
-        let root = temporary(name, "");
-        fs::create_dir_all(root.join("dir")).unwrap();
-        fs::write(root.join("dir/kept.bin"), [0_u8; 8]).unwrap();
-        fs::write(root.join("changed.bin"), [0_u8; 4]).unwrap();
-        let root = root.canonicalize().unwrap();
-        let database = temporary(name, ".sqlite3");
-        let repository = ScanRepository::new(database.clone());
-        repository.initialize().unwrap();
-        let checkpoints = IndexCheckpointRepository::new(database.clone());
-        checkpoints.initialize().unwrap();
-        let root_path = root.to_string_lossy().into_owned();
-        full_scan(
-            &repository,
-            &root,
-            &IndexCheckpoint {
-                root_path: root_path.clone(),
-                platform: "macos".to_owned(),
-                volume_identity: "volume".to_owned(),
-                root_identity: "root".to_owned(),
-                history_source: "fsevents".to_owned(),
-                history_token: "fsevents:v1:10".to_owned(),
-                baseline_scan_id: None,
-                updated_at: 1,
-            },
-        );
-        let checkpoint = checkpoints.load(&root_path).unwrap().unwrap();
-        Fixture {
-            baseline_scan_id: checkpoint.baseline_scan_id.unwrap(),
-            root,
-            database,
-            checkpoints,
-            checkpoint,
-        }
-    }
-
-    impl Fixture {
-        fn advanced(&self, history_token: &str) -> IndexCheckpoint {
-            IndexCheckpoint {
-                history_token: history_token.to_owned(),
-                ..self.checkpoint.clone()
-            }
-        }
-        fn stored_checkpoint(&self) -> IndexCheckpoint {
-            self.checkpoints
-                .load(&self.checkpoint.root_path)
-                .unwrap()
-                .unwrap()
-        }
-        fn apply(
-            &self,
-            job: &ScanJob,
-            names: &[&str],
-            baseline: i64,
-            checkpoint: &IndexCheckpoint,
-        ) {
-            run_incremental(
-                job,
-                &self.database,
-                &self.root,
-                &targets(names),
-                baseline,
-                checkpoint,
-            )
-        }
-    }
-
-    fn targets(paths: &[&str]) -> Vec<IncrementalRescanTarget> {
-        paths
-            .iter()
-            .map(|path| IncrementalRescanTarget {
-                relative_path: PathBuf::from(*path),
-                recursive: false,
-            })
-            .collect()
-    }
-
     fn session_ids(database: &Path) -> Vec<i64> {
         let connection = Connection::open(database).unwrap();
         let mut statement = connection
@@ -646,116 +577,54 @@ mod incremental_tests {
         ids
     }
 
-    fn counted_size(database: &Path, scan_id: i64) -> i64 {
-        Connection::open(database)
-            .unwrap()
-            .query_row(
-                "SELECT COALESCE(SUM(size_bytes),0) FROM scan_entries WHERE scan_id=?1",
-                [scan_id],
-                |row| row.get(0),
-            )
-            .unwrap()
-    }
-
     #[test]
-    fn completes_an_incremental_update_and_points_at_the_new_snapshot() {
-        let fixture = fixture("complete");
-        fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
-        fs::write(fixture.root.join("added.bin"), [0_u8; 2]).unwrap();
-        let job = new_job(&fixture.checkpoint.root_path);
+    fn refuses_concurrent_starts_while_a_scan_is_active() {
+        let root = temporary("concurrent", "");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("only.bin"), [0_u8; 4]).unwrap();
+        let root = root.canonicalize().unwrap();
+        let database = temporary("concurrent", ".sqlite3");
+        let repository = ScanRepository::new(database.clone());
+        repository.initialize().unwrap();
+        let manager = ScanManager::new(repository);
+        let path = root.to_string_lossy().into_owned();
+        let gate = Barrier::new(3);
 
-        fixture.apply(
-            &job,
-            &["changed.bin", "added.bin"],
-            fixture.baseline_scan_id,
-            &fixture.advanced("fsevents:v1:20"),
-        );
+        // active lockを握ったまま実行中jobを差し込み、解放と同時に2本のstartを競わせる。
+        // 差し込んだjobは終わらないので、勝者が先に完了して枠が空く余地はない。
+        let mut active = manager.active.lock().unwrap();
+        *active = Some(new_job(&path));
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = path.clone();
+                    let manager = &manager;
+                    let gate = &gate;
+                    scope.spawn(move || {
+                        gate.wait();
+                        manager.start(path)
+                    })
+                })
+                .collect();
+            gate.wait();
+            drop(active);
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
 
-        let snapshot = job.snapshot();
-        assert_eq!(snapshot.status, ScanJobStatus::Completed);
-        assert_eq!(snapshot.error, None);
-        let saved = snapshot.saved_scan_id.unwrap();
-        assert_ne!(saved, fixture.baseline_scan_id);
-        assert_eq!(counted_size(&fixture.database, saved), 8 + 32 + 2);
-        // 基準scanは破棄せず、過去の履歴として残す。
-        assert_eq!(
-            counted_size(&fixture.database, fixture.baseline_scan_id),
-            12
-        );
-        let stored = fixture.stored_checkpoint();
-        assert_eq!(stored.history_token, "fsevents:v1:20");
-        assert_eq!(stored.baseline_scan_id, Some(saved));
-    }
+        for result in &results {
+            assert_eq!(
+                result.as_ref().err().map(String::as_str),
+                Some("別のスキャンが実行中です")
+            );
+        }
+        // 弾かれたstartはscan sessionも作らない。
+        assert!(session_ids(&database).is_empty());
 
-    #[test]
-    fn keeps_the_baseline_and_checkpoint_when_cancelled() {
-        let fixture = fixture("cancelled");
-        fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
-        let before = session_ids(&fixture.database);
-        let job = new_job(&fixture.checkpoint.root_path);
-        job.control
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .cancelled = true;
-
-        fixture.apply(
-            &job,
-            &["changed.bin"],
-            fixture.baseline_scan_id,
-            &fixture.advanced("fsevents:v1:20"),
-        );
-
-        let snapshot = job.snapshot();
-        assert_eq!(snapshot.status, ScanJobStatus::Cancelled);
-        assert_eq!(snapshot.saved_scan_id, None);
-        assert_eq!(session_ids(&fixture.database), before);
-        assert_eq!(fixture.stored_checkpoint(), fixture.checkpoint);
-    }
-
-    #[test]
-    fn rolls_back_the_new_snapshot_when_the_checkpoint_cannot_be_saved() {
-        let fixture = fixture("rollback");
-        fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
-        let before = session_ids(&fixture.database);
-        let job = new_job(&fixture.checkpoint.root_path);
-
-        // tokenを保存できないcheckpointで、確定直前の失敗を再現する。
-        fixture.apply(
-            &job,
-            &["changed.bin"],
-            fixture.baseline_scan_id,
-            &fixture.advanced(""),
-        );
-
-        let snapshot = job.snapshot();
-        assert_eq!(snapshot.status, ScanJobStatus::Failed);
-        assert!(snapshot.error.is_some());
-        assert_eq!(snapshot.saved_scan_id, None);
-        assert_eq!(session_ids(&fixture.database), before);
-        assert_eq!(fixture.stored_checkpoint(), fixture.checkpoint);
-    }
-
-    #[test]
-    fn refuses_to_apply_when_the_checkpoint_does_not_name_the_update_baseline() {
-        let fixture = fixture("mismatch");
-        let before = session_ids(&fixture.database);
-        let job = new_job(&fixture.checkpoint.root_path);
-
-        fixture.apply(
-            &job,
-            &["changed.bin"],
-            fixture.baseline_scan_id + 1,
-            &fixture.advanced("fsevents:v1:20"),
-        );
-
-        let snapshot = job.snapshot();
-        assert_eq!(snapshot.status, ScanJobStatus::Failed);
-        assert_eq!(
-            snapshot.error.as_deref(),
-            Some("checkpointが指す基準スキャンと更新元が一致しません")
-        );
-        assert_eq!(session_ids(&fixture.database), before);
-        assert_eq!(fixture.stored_checkpoint(), fixture.checkpoint);
+        fs::remove_dir_all(root).unwrap();
+        remove_database(&database);
     }
 
     fn wait_for_terminal(manager: &ScanManager, id: u64) -> ScanJobSnapshot {
@@ -802,5 +671,430 @@ mod incremental_tests {
 
         fs::remove_dir_all(root).unwrap();
         remove_database(&database);
+    }
+
+    /// 基準scanとcheckpointを進める経路の検証。
+    ///
+    /// 確定前に走査rootのidentityを検証するため、identityを取得できないplatformでは
+    /// fail closedになる。unix以外での挙動は差分更新自体が未対応なので検証しない。
+    #[cfg(unix)]
+    mod baseline_updates {
+        use super::*;
+        use crate::index_checkpoint::upsert_checkpoint;
+        use std::sync::mpsc::{self, Receiver, SyncSender};
+        use std::thread::JoinHandle;
+
+        struct Fixture {
+            root: PathBuf,
+            database: PathBuf,
+            checkpoints: IndexCheckpointRepository,
+            baseline_scan_id: i64,
+            checkpoint: IndexCheckpoint,
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.root);
+                remove_database(&self.database);
+            }
+        }
+
+        fn full_scan(
+            repository: &ScanRepository,
+            root: &Path,
+            checkpoint: &IndexCheckpoint,
+        ) -> i64 {
+            let stream = repository
+                .begin_stream(root.to_string_lossy().as_ref())
+                .unwrap();
+            let recorder = stream.clone();
+            let summary = scanner::scan_folder_path_controlled(
+                root,
+                || true,
+                |progress| recorder.record(progress),
+            )
+            .unwrap();
+            stream
+                .complete_with_checkpoint(&summary, Some(checkpoint))
+                .unwrap();
+            stream.scan_id()
+        }
+
+        /// 実際の走査rootのidentityを読む。確定直前の検証と同じ観測に揃える。
+        fn root_identity(root: &Path) -> (String, String) {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(root).unwrap();
+            (metadata.dev().to_string(), metadata.ino().to_string())
+        }
+
+        /// 基準scanとcheckpointが対応した状態のfixtureを作る。
+        fn fixture(name: &str) -> Fixture {
+            let root = temporary(name, "");
+            fs::create_dir_all(root.join("dir")).unwrap();
+            fs::write(root.join("dir/kept.bin"), [0_u8; 8]).unwrap();
+            fs::write(root.join("changed.bin"), [0_u8; 4]).unwrap();
+            let root = root.canonicalize().unwrap();
+            let database = temporary(name, ".sqlite3");
+            let repository = ScanRepository::new(database.clone());
+            repository.initialize().unwrap();
+            let checkpoints = IndexCheckpointRepository::new(database.clone());
+            checkpoints.initialize().unwrap();
+            let root_path = root.to_string_lossy().into_owned();
+            let (volume_identity, root_identity) = root_identity(&root);
+            full_scan(
+                &repository,
+                &root,
+                &IndexCheckpoint {
+                    root_path: root_path.clone(),
+                    platform: "macos".to_owned(),
+                    volume_identity,
+                    root_identity,
+                    history_source: "fsevents".to_owned(),
+                    history_token: "fsevents:v1:10".to_owned(),
+                    baseline_scan_id: None,
+                    updated_at: 1,
+                },
+            );
+            let checkpoint = checkpoints.load(&root_path).unwrap().unwrap();
+            Fixture {
+                baseline_scan_id: checkpoint.baseline_scan_id.unwrap(),
+                root,
+                database,
+                checkpoints,
+                checkpoint,
+            }
+        }
+
+        impl Fixture {
+            /// 保存済みcheckpointを前提に、確定できたら進めるtokenを組み合わせる。
+            fn advanced(&self, next_history_token: &str) -> CheckpointTransition {
+                CheckpointTransition {
+                    expected: self.checkpoint.clone(),
+                    next_history_token: next_history_token.to_owned(),
+                }
+            }
+            fn stored_checkpoint(&self) -> IndexCheckpoint {
+                self.checkpoints
+                    .load(&self.checkpoint.root_path)
+                    .unwrap()
+                    .unwrap()
+            }
+            fn apply(
+                &self,
+                job: &ScanJob,
+                names: &[&str],
+                baseline: i64,
+                transition: &CheckpointTransition,
+            ) {
+                run_incremental(
+                    job,
+                    &self.database,
+                    &self.root,
+                    &targets(names),
+                    baseline,
+                    transition,
+                )
+            }
+        }
+
+        fn targets(paths: &[&str]) -> Vec<IncrementalRescanTarget> {
+            paths
+                .iter()
+                .map(|path| IncrementalRescanTarget {
+                    relative_path: PathBuf::from(*path),
+                    recursive: false,
+                })
+                .collect()
+        }
+
+        fn counted_size(database: &Path, scan_id: i64) -> i64 {
+            Connection::open(database)
+                .unwrap()
+                .query_row(
+                    "SELECT COALESCE(SUM(size_bytes),0) FROM scan_entries WHERE scan_id=?1",
+                    [scan_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+
+        /// 走査完了から確定までの境界で止まるworkerを起動する。
+        ///
+        /// 呼び出し側は「境界に着いた」を受け取ってから状態を変え、「再開」を送る。
+        /// 実スレッドの順序をchannelで固定するので、待ち時間に依存しない。
+        fn spawn_at_commit_boundary(
+            fixture: &Fixture,
+            names: &[&str],
+            transition: CheckpointTransition,
+        ) -> (Arc<ScanJob>, Receiver<()>, SyncSender<()>, JoinHandle<()>) {
+            let job = new_job(&fixture.checkpoint.root_path);
+            let (reached, at_boundary) = mpsc::sync_channel::<()>(0);
+            let (release, resume) = mpsc::sync_channel::<()>(0);
+            let worker = Arc::clone(&job);
+            let database = fixture.database.clone();
+            let root = fixture.root.clone();
+            let targets = targets(names);
+            let baseline = fixture.baseline_scan_id;
+            let handle = std::thread::spawn(move || {
+                run_incremental_with_hook(
+                    &worker,
+                    &database,
+                    &root,
+                    &targets,
+                    baseline,
+                    &transition,
+                    || {
+                        reached.send(()).unwrap();
+                        resume.recv().unwrap();
+                    },
+                )
+            });
+            (job, at_boundary, release, handle)
+        }
+
+        /// ScanManager::cancelと同じ手順でworkerへ中断を伝える。
+        fn cancel(job: &ScanJob) {
+            {
+                let mut control = job.control.lock().unwrap();
+                control.cancelled = true;
+                control.paused = false;
+            }
+            job.wake.notify_all();
+        }
+
+        /// ScanManager::pauseと同じ手順でworkerを止める。
+        fn pause(job: &ScanJob) {
+            let mut state = job.state.lock().unwrap();
+            job.control.lock().unwrap().paused = true;
+            state.status = ScanJobStatus::Paused;
+        }
+
+        /// ScanManager::resumeと同じ手順でworkerを進める。
+        fn resume(job: &ScanJob) {
+            {
+                let mut state = job.state.lock().unwrap();
+                job.control.lock().unwrap().paused = false;
+                state.status = ScanJobStatus::Running;
+            }
+            job.wake.notify_all();
+        }
+
+        #[test]
+        fn cancels_at_the_last_moment_before_the_commit() {
+            let fixture = fixture("cancel-boundary");
+            fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
+            let before = session_ids(&fixture.database);
+            let (job, at_boundary, release, handle) = spawn_at_commit_boundary(
+                &fixture,
+                &["changed.bin"],
+                fixture.advanced("fsevents:v1:20"),
+            );
+
+            at_boundary.recv().unwrap();
+            cancel(&job);
+            release.send(()).unwrap();
+            handle.join().unwrap();
+
+            let snapshot = job.snapshot();
+            assert_eq!(snapshot.status, ScanJobStatus::Cancelled);
+            assert_eq!(snapshot.saved_scan_id, None);
+            assert_eq!(session_ids(&fixture.database), before);
+            assert_eq!(fixture.stored_checkpoint(), fixture.checkpoint);
+        }
+
+        #[test]
+        fn defers_the_commit_while_paused_and_finishes_after_resume() {
+            let fixture = fixture("pause-boundary");
+            fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
+            let before = session_ids(&fixture.database);
+            let (job, at_boundary, release, handle) = spawn_at_commit_boundary(
+                &fixture,
+                &["changed.bin"],
+                fixture.advanced("fsevents:v1:20"),
+            );
+
+            at_boundary.recv().unwrap();
+            pause(&job);
+            release.send(()).unwrap();
+            // pauseは確定前の中断確認より先に立つので、workerはここを越えられない。
+            assert_eq!(job.snapshot().status, ScanJobStatus::Paused);
+            assert_eq!(session_ids(&fixture.database), before);
+
+            resume(&job);
+            handle.join().unwrap();
+
+            let snapshot = job.snapshot();
+            assert_eq!(snapshot.status, ScanJobStatus::Completed);
+            let saved = snapshot.saved_scan_id.unwrap();
+            assert_eq!(counted_size(&fixture.database, saved), 8 + 32);
+            let stored = fixture.stored_checkpoint();
+            assert_eq!(stored.history_token, "fsevents:v1:20");
+            assert_eq!(stored.baseline_scan_id, Some(saved));
+        }
+
+        #[test]
+        fn refuses_to_commit_when_another_scan_advanced_the_checkpoint() {
+            let fixture = fixture("stale-assessment");
+            fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
+            let before = session_ids(&fixture.database);
+            let (job, at_boundary, release, handle) = spawn_at_commit_boundary(
+                &fixture,
+                &["changed.bin"],
+                fixture.advanced("fsevents:v1:20"),
+            );
+
+            at_boundary.recv().unwrap();
+            // 評価から確定までの間に、別のスキャンがcheckpointを進めた状態を作る。
+            let newer = IndexCheckpoint {
+                history_token: "fsevents:v1:90".to_owned(),
+                updated_at: fixture.checkpoint.updated_at + 1,
+                ..fixture.checkpoint.clone()
+            };
+            upsert_checkpoint(&Connection::open(&fixture.database).unwrap(), &newer).unwrap();
+            release.send(()).unwrap();
+            handle.join().unwrap();
+
+            let snapshot = job.snapshot();
+            assert_eq!(snapshot.status, ScanJobStatus::Failed);
+            assert_eq!(
+                snapshot.error.as_deref(),
+                Some("差分更新の前提となるcheckpointが更新されています")
+            );
+            assert_eq!(snapshot.saved_scan_id, None);
+            assert_eq!(session_ids(&fixture.database), before);
+            // 進んだcheckpointを古いtokenで巻き戻さない。
+            assert_eq!(fixture.stored_checkpoint(), newer);
+        }
+
+        #[test]
+        fn refuses_to_commit_when_the_scan_root_was_replaced() {
+            let fixture = fixture("root-replaced");
+            fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
+            let before = session_ids(&fixture.database);
+            let (job, at_boundary, release, handle) = spawn_at_commit_boundary(
+                &fixture,
+                &["changed.bin"],
+                fixture.advanced("fsevents:v1:20"),
+            );
+
+            at_boundary.recv().unwrap();
+            // 走査中に同じpathへ別のdirectoryが入れ替わった状態を作る。
+            let replaced = fixture.root.with_extension("replaced");
+            fs::rename(&fixture.root, &replaced).unwrap();
+            fs::create_dir_all(&fixture.root).unwrap();
+            release.send(()).unwrap();
+            handle.join().unwrap();
+
+            let snapshot = job.snapshot();
+            assert_eq!(snapshot.status, ScanJobStatus::Failed);
+            assert_eq!(
+                snapshot.error.as_deref(),
+                Some("走査中に走査rootが入れ替わりました")
+            );
+            assert_eq!(session_ids(&fixture.database), before);
+            assert_eq!(fixture.stored_checkpoint(), fixture.checkpoint);
+            let _ = fs::remove_dir_all(replaced);
+        }
+
+        #[test]
+        fn completes_an_incremental_update_and_points_at_the_new_snapshot() {
+            let fixture = fixture("complete");
+            fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
+            fs::write(fixture.root.join("added.bin"), [0_u8; 2]).unwrap();
+            let job = new_job(&fixture.checkpoint.root_path);
+
+            fixture.apply(
+                &job,
+                &["changed.bin", "added.bin"],
+                fixture.baseline_scan_id,
+                &fixture.advanced("fsevents:v1:20"),
+            );
+
+            let snapshot = job.snapshot();
+            assert_eq!(snapshot.status, ScanJobStatus::Completed);
+            assert_eq!(snapshot.error, None);
+            let saved = snapshot.saved_scan_id.unwrap();
+            assert_ne!(saved, fixture.baseline_scan_id);
+            assert_eq!(counted_size(&fixture.database, saved), 8 + 32 + 2);
+            // 基準scanは破棄せず、過去の履歴として残す。
+            assert_eq!(
+                counted_size(&fixture.database, fixture.baseline_scan_id),
+                12
+            );
+            let stored = fixture.stored_checkpoint();
+            assert_eq!(stored.history_token, "fsevents:v1:20");
+            assert_eq!(stored.baseline_scan_id, Some(saved));
+        }
+
+        #[test]
+        fn keeps_the_baseline_and_checkpoint_when_cancelled() {
+            let fixture = fixture("cancelled");
+            fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
+            let before = session_ids(&fixture.database);
+            let job = new_job(&fixture.checkpoint.root_path);
+            job.control
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cancelled = true;
+
+            fixture.apply(
+                &job,
+                &["changed.bin"],
+                fixture.baseline_scan_id,
+                &fixture.advanced("fsevents:v1:20"),
+            );
+
+            let snapshot = job.snapshot();
+            assert_eq!(snapshot.status, ScanJobStatus::Cancelled);
+            assert_eq!(snapshot.saved_scan_id, None);
+            assert_eq!(session_ids(&fixture.database), before);
+            assert_eq!(fixture.stored_checkpoint(), fixture.checkpoint);
+        }
+
+        #[test]
+        fn rolls_back_the_new_snapshot_when_the_checkpoint_cannot_be_saved() {
+            let fixture = fixture("rollback");
+            fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
+            let before = session_ids(&fixture.database);
+            let job = new_job(&fixture.checkpoint.root_path);
+
+            // tokenを保存できないcheckpointで、確定直前の失敗を再現する。
+            fixture.apply(
+                &job,
+                &["changed.bin"],
+                fixture.baseline_scan_id,
+                &fixture.advanced(""),
+            );
+
+            let snapshot = job.snapshot();
+            assert_eq!(snapshot.status, ScanJobStatus::Failed);
+            assert!(snapshot.error.is_some());
+            assert_eq!(snapshot.saved_scan_id, None);
+            assert_eq!(session_ids(&fixture.database), before);
+            assert_eq!(fixture.stored_checkpoint(), fixture.checkpoint);
+        }
+
+        #[test]
+        fn refuses_to_apply_when_the_checkpoint_does_not_name_the_update_baseline() {
+            let fixture = fixture("mismatch");
+            let before = session_ids(&fixture.database);
+            let job = new_job(&fixture.checkpoint.root_path);
+
+            fixture.apply(
+                &job,
+                &["changed.bin"],
+                fixture.baseline_scan_id + 1,
+                &fixture.advanced("fsevents:v1:20"),
+            );
+
+            let snapshot = job.snapshot();
+            assert_eq!(snapshot.status, ScanJobStatus::Failed);
+            assert_eq!(
+                snapshot.error.as_deref(),
+                Some("checkpointが指す基準スキャンと更新元が一致しません")
+            );
+            assert_eq!(session_ids(&fixture.database), before);
+            assert_eq!(fixture.stored_checkpoint(), fixture.checkpoint);
+        }
     }
 }

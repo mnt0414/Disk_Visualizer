@@ -2,7 +2,7 @@ use crate::cache_activity::{self, CacheObservation, CacheRuntimeState};
 use crate::cache_catalog;
 use crate::incremental_paths::normalize_relative;
 use crate::incremental_rescan::IncrementalRescanTarget;
-use crate::index_checkpoint::{upsert_checkpoint, IndexCheckpoint};
+use crate::index_checkpoint::{load_checkpoint, upsert_checkpoint, IndexCheckpoint};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -68,6 +68,13 @@ fn observation(entry: &IncrementalEntry) -> Option<CacheObservation> {
 
 /// 一時DBへ書き出す前にメモリへ保持する最大件数。
 const STAGING_BATCH_SIZE: usize = 500;
+/// 差分を確定するconnectionのメモリ上限。
+///
+/// page cacheを2MiBに固定し、GROUP BYなどの中間結果はheapではなくディスクへ出す。
+/// SQLiteの既定値（cache_size=-2000、compile-timeのTEMP_STORE=1）に頼ると、
+/// ビルド構成が変わったときに上限も変わってしまう。
+const APPLY_CONNECTION_PRAGMAS: &str = "PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA cache_size=-2048; PRAGMA temp_store=FILE;";
+
 /// 1回の差分更新で置換できる最大件数。超えた場合はフルスキャンへ戻す。
 pub const MAX_REPLACEMENT_ENTRIES: usize = 1_000_000;
 
@@ -266,6 +273,19 @@ impl IncrementalStaging {
     }
 }
 
+/// 差分適用の前提と結果。
+///
+/// `expected` は信頼評価の時点で保存されていたcheckpointそのもの。確定transaction内で
+/// 読み直して一致を確かめることで、評価から確定までの間に別のスキャンが進めた
+/// checkpointを、古い評価結果で上書きしないようにする。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointTransition {
+    /// 評価時点で保存されていたcheckpoint。
+    pub expected: IndexCheckpoint,
+    /// 確定に成功したときだけ保存する次のhistory token。
+    pub next_history_token: String,
+}
+
 /// stagingに退避した置換結果で新しいsnapshotを確定する。
 ///
 /// baselineの複製・target範囲の削除・置換の挿入・ハードリンク再集計・session確定・
@@ -274,12 +294,12 @@ pub fn apply_staged_snapshot(
     database_path: &Path,
     staging: &mut IncrementalStaging,
     baseline_scan_id: i64,
-    checkpoint: &IndexCheckpoint,
+    transition: &CheckpointTransition,
 ) -> Result<i64, String> {
-    if checkpoint.root_path != staging.root_path.to_string_lossy() {
+    if transition.expected.root_path != staging.root_path.to_string_lossy() {
         return Err("部分更新対象とcheckpointのrootが一致しません".to_owned());
     }
-    if checkpoint.baseline_scan_id != Some(baseline_scan_id) {
+    if transition.expected.baseline_scan_id != Some(baseline_scan_id) {
         return Err("checkpointが指す基準スキャンと更新元が一致しません".to_owned());
     }
     staging.flush()?;
@@ -287,7 +307,7 @@ pub fn apply_staged_snapshot(
     let mut connection = Connection::open(database_path)
         .map_err(|error| format!("スキャン履歴を開けません: {error}"))?;
     connection
-        .execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+        .execute_batch(APPLY_CONNECTION_PRAGMAS)
         .map_err(|error| error.to_string())?;
     connection
         .execute(
@@ -295,7 +315,7 @@ pub fn apply_staged_snapshot(
             [staging.path.to_string_lossy().as_ref()],
         )
         .map_err(|error| format!("部分更新の一時DBを接続できません: {error}"))?;
-    let result = apply_within_transaction(&mut connection, staging, baseline_scan_id, checkpoint);
+    let result = apply_within_transaction(&mut connection, staging, baseline_scan_id, transition);
     let _ = connection.execute_batch("DETACH DATABASE staging;");
     result
 }
@@ -304,12 +324,17 @@ fn apply_within_transaction(
     connection: &mut Connection,
     staging: &IncrementalStaging,
     baseline_scan_id: i64,
-    checkpoint: &IndexCheckpoint,
+    transition: &CheckpointTransition,
 ) -> Result<i64, String> {
     let root_path = staging.root_path.to_string_lossy().into_owned();
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
+    // 評価から確定までの間に別のスキャンがcheckpointを進めていれば、この結果はもう古い。
+    // 古いtokenで上書きすると、その間の変更を二度と拾えなくなるため確定しない。
+    if load_checkpoint(&transaction, &root_path)?.as_ref() != Some(&transition.expected) {
+        return Err("差分更新の前提となるcheckpointが更新されています".to_owned());
+    }
     let baseline_root: Option<String> = transaction
         .query_row(
             "SELECT root_path FROM scan_sessions WHERE id=?1 AND status='complete'",
@@ -348,6 +373,7 @@ fn apply_within_transaction(
         }
     }
     transaction.execute(&format!("INSERT INTO scan_entries (scan_id,{STAGED_COLUMNS}) SELECT ?1,{STAGED_COLUMNS} FROM staging.staged_entries"),[scan_id]).map_err(|error|format!("部分再走査結果を保存できません: {error}"))?;
+    refresh_linked_metadata(&transaction, scan_id)?;
     reaggregate_hard_links(&transaction, scan_id)?;
     let (size, files, directories, skipped): (i64, i64, i64, i64) = transaction.query_row("SELECT COALESCE(SUM(size_bytes),0),COALESCE(SUM(file_count),0),COALESCE(SUM(directory_count),0),COALESCE(SUM(skipped_count),0) FROM scan_entries WHERE scan_id=?1",[scan_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(|error|format!("部分更新の集計値を計算できません: {error}"))?;
     let changed = transaction.execute("UPDATE scan_sessions SET status='complete',total_size_bytes=?2,file_count=?3,directory_count=?4,skipped_count=?5,elapsed_milliseconds=0,completed_at=?6 WHERE id=?1 AND status='in_progress'",params![scan_id,size,files,directories,skipped,unix_time()?]).map_err(|error|format!("部分更新sessionを確定できません: {error}"))?;
@@ -357,14 +383,26 @@ fn apply_within_transaction(
     upsert_checkpoint(
         &transaction,
         &IndexCheckpoint {
+            history_token: transition.next_history_token.clone(),
             baseline_scan_id: Some(scan_id),
-            ..checkpoint.clone()
+            updated_at: unix_time()?,
+            ..transition.expected.clone()
         },
     )?;
     transaction
         .commit()
         .map_err(|error| format!("部分更新結果とcheckpointを確定できません: {error}"))?;
     Ok(scan_id)
+}
+
+/// 再走査で見たfileのmetadataを、同じidentityを指す未再走査の行にも反映する。
+///
+/// ハードリンクはどのリンク経由で書き換えても実体が変わる。再走査targetに含まれない
+/// 側の行はbaselineから複製されたままなので、論理サイズ・割り当てサイズ・更新時刻が
+/// 古いまま残る。identityが一致する行は同じ実体なので、今回観測した値へ揃える。
+fn refresh_linked_metadata(connection: &Connection, scan_id: i64) -> Result<(), String> {
+    connection.execute("UPDATE scan_entries SET logical_size=(SELECT MAX(s.logical_size) FROM staging.staged_entries s WHERE s.volume_identity=scan_entries.volume_identity AND s.file_identity=scan_entries.file_identity),allocated_size=(SELECT MAX(s.allocated_size) FROM staging.staged_entries s WHERE s.volume_identity=scan_entries.volume_identity AND s.file_identity=scan_entries.file_identity),modified_at=(SELECT MAX(s.modified_at) FROM staging.staged_entries s WHERE s.volume_identity=scan_entries.volume_identity AND s.file_identity=scan_entries.file_identity) WHERE scan_id=?1 AND file_identity IS NOT NULL AND volume_identity IS NOT NULL AND EXISTS (SELECT 1 FROM staging.staged_entries s WHERE s.volume_identity=scan_entries.volume_identity AND s.file_identity=scan_entries.file_identity)",[scan_id]).map_err(|error|format!("ハードリンク先のmetadataを更新できません: {error}"))?;
+    Ok(())
 }
 
 /// 未変更領域も含めてハードリンクを再集計する。
@@ -385,13 +423,13 @@ pub fn apply_incremental_snapshot(
     root_path: &Path,
     targets: &[IncrementalRescanTarget],
     replacements: &[IncrementalEntry],
-    checkpoint: &IndexCheckpoint,
+    transition: &CheckpointTransition,
 ) -> Result<i64, String> {
     let mut staging = IncrementalStaging::new(root_path, targets)?;
     for entry in replacements {
         staging.record(entry)?;
     }
-    apply_staged_snapshot(database_path, &mut staging, baseline_scan_id, checkpoint)
+    apply_staged_snapshot(database_path, &mut staging, baseline_scan_id, transition)
 }
 
 #[cfg(test)]
@@ -420,6 +458,7 @@ mod tests {
             ("dir", "dir", 0, 0, 1),
             ("nested", "dir/nested", 3, 1, 0),
         ];
+        connection.execute("INSERT INTO index_checkpoints (root_path,platform,volume_identity,root_identity,history_source,history_token,baseline_scan_id,updated_at) VALUES (?1,'macos','volume-1','root-1','fsevents',?2,1,2)",params![root.to_string_lossy().as_ref(),STORED_TOKEN]).unwrap();
         for (name, relative, size, files, directories) in rows {
             let relative = relative.replace('/', std::path::MAIN_SEPARATOR_STR);
             let absolute = root.join(&relative);
@@ -451,17 +490,45 @@ mod tests {
         }
     }
 
-    fn checkpoint(root: &Path, token: &str) -> IndexCheckpoint {
+    /// fixtureのdatabaseに保存済みのcheckpoint token。
+    const STORED_TOKEN: &str = "fsevents:v1:10";
+
+    fn checkpoint(root: &Path) -> IndexCheckpoint {
         IndexCheckpoint {
             root_path: root.to_string_lossy().into_owned(),
             platform: "macos".to_owned(),
             volume_identity: "volume-1".to_owned(),
             root_identity: "root-1".to_owned(),
             history_source: "fsevents".to_owned(),
-            history_token: token.to_owned(),
+            history_token: STORED_TOKEN.to_owned(),
             baseline_scan_id: Some(1),
             updated_at: 2,
         }
+    }
+
+    /// 保存済みcheckpointを前提に、確定できたら進めるtokenを組み合わせる。
+    fn transition(root: &Path, next_history_token: &str) -> CheckpointTransition {
+        CheckpointTransition {
+            expected: checkpoint(root),
+            next_history_token: next_history_token.to_owned(),
+        }
+    }
+
+    /// 確定用connectionのメモリ上限を、SQLiteの既定値に頼らず固定していることの確認。
+    #[test]
+    fn bounds_the_page_cache_and_spills_temporary_results_to_disk() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(APPLY_CONNECTION_PRAGMAS).unwrap();
+        let cache_size: i64 = connection
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .unwrap();
+        // 負値はKiB指定。page_sizeに依らず2MiBで頭打ちになる。
+        assert_eq!(cache_size, -2048);
+        let temp_store: i64 = connection
+            .query_row("PRAGMA temp_store", [], |row| row.get(0))
+            .unwrap();
+        // 1 = FILE。GROUP BYなどの中間結果をheapへ積まない。
+        assert_eq!(temp_store, 1);
     }
 
     #[test]
@@ -502,7 +569,7 @@ mod tests {
             &root,
             &[target("old", false), target("dir", true)],
             &[entry(root.join("old"), 5)],
-            &checkpoint(&root, "fsevents:v1:20"),
+            &transition(&root, "fsevents:v1:20"),
         )
         .unwrap();
         let connection = Connection::open(&path).unwrap();
@@ -573,7 +640,7 @@ mod tests {
             &root,
             &[target("a.bin", true)],
             &[],
-            &checkpoint(&root, "fsevents:v1:20"),
+            &transition(&root, "fsevents:v1:20"),
         )
         .unwrap();
         // 計上元が消えても、残ったリンクへ計上が移る。
@@ -593,7 +660,7 @@ mod tests {
             &root,
             &[target("b.bin", true)],
             &[replacement],
-            &checkpoint(&root, "fsevents:v1:20"),
+            &transition(&root, "fsevents:v1:20"),
         )
         .unwrap();
         // 再走査した側が満額で戻っても、二重計上しない。
@@ -602,11 +669,88 @@ mod tests {
     }
 
     #[test]
+    fn refuses_to_apply_when_the_stored_checkpoint_moved_since_the_assessment() {
+        let root = root("stale-checkpoint");
+        let path = database("stale-checkpoint", &root);
+        // 評価から確定までの間に、別のスキャンがcheckpointを進めた状態を作る。
+        let newer = IndexCheckpoint {
+            history_token: "fsevents:v1:90".to_owned(),
+            updated_at: 9,
+            ..checkpoint(&root)
+        };
+        upsert_checkpoint(&Connection::open(&path).unwrap(), &newer).unwrap();
+
+        let error = apply_incremental_snapshot(
+            &path,
+            1,
+            &root,
+            &[target("old", false)],
+            &[],
+            &transition(&root, "fsevents:v1:20"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "差分更新の前提となるcheckpointが更新されています");
+        let connection = Connection::open(&path).unwrap();
+        // 進んだcheckpointを古いtokenで巻き戻さない。
+        assert_eq!(
+            load_checkpoint(&connection, root.to_string_lossy().as_ref()).unwrap(),
+            Some(newer)
+        );
+        let sessions: i64 = connection
+            .query_row("SELECT COUNT(*) FROM scan_sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sessions, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn refreshes_metadata_of_hard_links_that_were_not_rescanned() {
+        let root = root("hard-link-metadata");
+        let path = hard_link_database("hard-link-metadata", &root);
+        // 再走査したのはb.binだけ。a.binは同じ実体を指す未再走査のリンク。
+        let mut replacement = entry(root.join("b.bin"), 20);
+        replacement.file_identity = Some("file-9".to_owned());
+        replacement.modified_at = Some(99);
+
+        let scan_id = apply_incremental_snapshot(
+            &path,
+            1,
+            &root,
+            &[target("b.bin", true)],
+            &[replacement],
+            &transition(&root, "fsevents:v1:20"),
+        )
+        .unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let mut statement = connection.prepare("SELECT relative_path,logical_size,allocated_size,modified_at FROM scan_entries WHERE scan_id=?1 ORDER BY relative_path").unwrap();
+        let rows: Vec<(String, i64, Option<i64>, Option<i64>)> = statement
+            .query_map([scan_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        // 未再走査のa.bin側も、リンク経由の書き換えを反映した値へ揃う。
+        assert_eq!(
+            rows,
+            vec![
+                ("a.bin".to_owned(), 20, Some(20), Some(99)),
+                ("b.bin".to_owned(), 20, Some(20), Some(99)),
+            ]
+        );
+        // 論理サイズは両方に載るが、計上は1件だけ。
+        assert_eq!(totals(&path, scan_id), (20, 20, 40));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn rejects_a_checkpoint_that_points_at_another_baseline() {
         let root = root("baseline-mismatch");
         let path = database("baseline-mismatch", &root);
-        let mut mismatched = checkpoint(&root, "fsevents:v1:20");
-        mismatched.baseline_scan_id = Some(2);
+        let mut mismatched = transition(&root, "fsevents:v1:20");
+        mismatched.expected.baseline_scan_id = Some(2);
         assert!(apply_incremental_snapshot(
             &path,
             1,
@@ -616,7 +760,7 @@ mod tests {
             &mismatched
         )
         .is_err());
-        mismatched.baseline_scan_id = None;
+        mismatched.expected.baseline_scan_id = None;
         assert!(apply_incremental_snapshot(
             &path,
             1,
@@ -644,7 +788,7 @@ mod tests {
             &root,
             &[target("old", false)],
             &[entry(root.join("old"), 5)],
-            &checkpoint(&root, "fsevents:v1:20"),
+            &transition(&root, "fsevents:v1:20"),
         )
         .unwrap();
         let baseline: i64 = Connection::open(&path)
@@ -669,7 +813,7 @@ mod tests {
             &root,
             &[target("old", false)],
             &[entry(root.join("old"), 5), entry(root.join("old"), 6)],
-            &checkpoint(&root, "fsevents:v1:20")
+            &transition(&root, "fsevents:v1:20")
         )
         .is_err());
         let _ = std::fs::remove_file(path);
@@ -713,7 +857,7 @@ mod tests {
             &root,
             &[target("old", false)],
             &[entry(root.join("other"), 5)],
-            &checkpoint(&root, "fsevents:v1:20")
+            &transition(&root, "fsevents:v1:20")
         )
         .is_err());
         let connection = Connection::open(&path).unwrap();
@@ -734,7 +878,7 @@ mod tests {
             &root,
             &[target("old", false)],
             &[],
-            &checkpoint(&root, "")
+            &transition(&root, "")
         )
         .is_err());
         let connection = Connection::open(&path).unwrap();

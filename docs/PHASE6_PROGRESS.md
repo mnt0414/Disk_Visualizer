@@ -78,7 +78,7 @@ FSEventsのdevice相対pathを、走査root相対の安全なpathへ変換する
 
 - 走査rootのdevice相対pathを、componentごとにdirectory handleを開き`dev`／`ino`で確認しながら復元する
 - 名前一致だけで同一性を判断せず、途中のmount point越えは拒否する
-- 変更pathを`Inside`／`Outside`／`Invalid`の3値へ落とし、root自身・root外・親参照・不正表現を区別する
+- 変更pathを`Inside`／`Ancestor`／`Outside`／`Invalid`の4値へ落とし、root自身・root外・祖先・親参照・不正表現を区別する
 - 文字列prefixの一致を親子関係として扱わない
 - `Invalid`が1件でもあれば差分更新を中止し、フルスキャンへ倒す
 
@@ -113,13 +113,42 @@ FSEventsのdevice相対pathを、走査root相対の安全なpathへ変換する
 - 信頼できない履歴、成立しない計画は、理由を`FullScanReason`として返したうえでフルスキャンへ倒す
 - 差分更新jobは結果をメモリへ載せず、確定したscan session IDを`savedScanId`として返す
 - 確定は取り消せないため、直前にもう一度中断要求を確認する
-- 変更が止まったあとの差分結果が、新規フルスキャンとpath集合・合計値で一致することを確認した
 
-詳細と検証結果は`docs/task1-integration-report.md`にある。
+## 統合コードの安全性再レビュー
+
+統合後にレビュー指摘を受けて再確認し、不足していた点を修正した。
+
+- 信頼評価から確定までの間に別のスキャンがcheckpointを進めた場合、確定transactionの中で
+  保存済みcheckpointを読み直して拒否する。古い評価結果を適用しない
+- 走査rootの祖先に`MustScanSubDirs`付きの変更通知が来た場合、`Outside`として捨てず、
+  範囲を保証できないものとして理由付きでフルスキャンへ戻す
+- 確定直前に走査rootの`dev`／`ino`を取り直し、走査中のunmount・rename・差し替えを検出する。
+  identityを取得できないplatformではfail closedで失敗させる
+- 再走査targetに含まれないハードリンクの行も、同じidentityを観測した値へ揃える。
+  計上元の選び直しだけでは古い論理サイズ・割り当てサイズ・更新時刻が残っていた
+- キャンセルを受け付ける境界を「走査完了〜確定transaction開始前」と定め、
+  実スレッドをrendezvousで止めた決定論的なテストでcancel・pause・resumeを検証する
+- 同時実行制約は、`active`ロックを保持したままBarrierで2本のstartを同時に解放して検証する
+- フルスキャンとの一致比較を、行ごとのmetadataと`(volume_identity, file_identity)`ごとの
+  path集合・論理サイズ・割り当てサイズ・計上サイズの比較へ強化した
+- 差分を確定するconnectionのpage cacheと一時領域をSQLiteの既定値に頼らず明示した
+- schema v8は、実際のv7形式（CHECK制約込み・`baseline_scan_id`なし）からの移行、
+  新規DBと移行DBのschema一致、移行失敗時のバックアップ健全性を検証した
+
+詳細と検証範囲は`docs/task1-integration-report.md`にある。
+検証したのはmacOSでのRustテストとfrontendのnpm検証まで。実volume境界・実FSEvents経路・
+アプリUI・Windows実機・二重OS CIは未実施で、タスク1は未完了。
 
 ## 次の実装
 
+タスク1の完了条件を満たすまで、タスク2には着手しない。
+
 1. 信頼状態とフルスキャン理由をUIへ表示し、`start_incremental_scan`を接続する
-2. Windows USN変更record読取adapterを追加する
-3. 上限値（履歴件数・target数・置換件数）を実値で計測し、必要なら調整する
-4. 外付け媒体の切断・再接続、スリープ復帰でidentityを再評価する
+2. Windowsで回帰確認する（テスト、schema移行、`Unsupported`でのフルスキャンへの切り替え）
+3. 二重OS CI（macos-14／windows-latest）を通す
+4. 上限値（履歴件数・target数・置換件数）を実値で計測し、必要なら調整する
+
+ここまででタスク1を完了とし、そのあとに次へ進む。
+
+5. Windows USN変更record読取adapterを追加する（タスク2）
+6. 外付け媒体の切断・再接続、スリープ復帰でidentityを再評価する（タスク3以降）

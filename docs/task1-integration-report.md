@@ -3,10 +3,19 @@
 ## 状態
 
 2026-09-08。個別に実装済みだった構成要素を、FSEvents履歴の取得からSQLiteスナップショット確定までの
-一本の差分更新経路として接続し、Macローカルでの検証を完了した。
+一本の差分更新経路として接続し、続けて統合コードの安全性を再レビューして不足を修正した。
 
-Windows実機、二重OS CI、アプリ実機受け入れ検証は未実施。
-タスク2（Windows USN変更record読取）以降には着手していない。
+実施した検証は次の範囲に限る。「Mac検証完了」とは扱わない。
+
+- macOSでの`cargo fmt --check`／`cargo clippy -- -D warnings`／`cargo test`（専用の小規模fixtureに
+  対する自動テスト。ホームディレクトリや実プロジェクトは走査していない）
+- node@22復旧後のfrontend検証（`npm ci`／`npm run check`／`npm test`／`npm run build`）
+
+未実施：実volume境界越えの走査、実FSEvents eventを流す経路、アプリUIでの受け入れ確認、
+Windows実機、二重OS CI、上限値の実値でのメモリ・時間計測。
+
+タスク1の完了条件（Windows回帰確認、二重OS CI、UI接続）を満たしていないため、
+タスク2（Windows USN変更record読取）には着手していない。
 
 ## コード基準
 
@@ -14,6 +23,8 @@ Windows実機、二重OS CI、アプリ実機受け入れ検証は未実施。
 - 依存修復のローカルコミット：ec6323a
 - plannerの境界修正：02ae78d（`docs/task1-planner-report.md`）
 - 作業ブランチ：feat/task1-incremental-integration-20260907（02ae78dから作成）
+- 統合コミット：43d8d63（実装）、3bba18c（本報告書の初版）
+- 安全性再レビューによる修正：3bba18c以降の作業ツリー変更（未コミット）
 
 ## 変更内容と根拠
 
@@ -94,6 +105,139 @@ FSEventsが返す変更pathはvolume（device）相対で、走査rootがvolume 
 - 確定（`apply_staged_snapshot`）の直前にもう一度キャンセル要求を確認する。確定は取り消せないため、
   成功後にキャンセル扱いへ落とすことはしない。
 
+## 安全性再レビューで修正した点
+
+統合後にレビュー指摘を受けて再確認した項目。既存実装で満たしていた点は根拠のテスト名を挙げ、
+不足していた点は修正と、その修正が効いていることの確認（修正を外すとテストが落ちること）を示す。
+
+### A. 信頼評価と確定の競合
+
+信頼評価は`active`ロックの外で行うため、評価から確定までの間に別のstartが入る余地がある。
+評価時点のcheckpointを`CheckpointTransition`として持ち回り、確定transactionの中で
+保存済みcheckpointを読み直して一致を確認するようにした。一致しなければ
+「差分更新の前提となるcheckpointが更新されています」で拒否し、新しいcheckpointを上書きしない。
+
+- `refuses_to_apply_when_the_stored_checkpoint_moved_since_the_assessment`（storage層。
+  transaction内の検査だけで拒否されること、新しいcheckpointが残ること、sessionが増えないこと）
+- `refuses_to_commit_when_another_scan_advanced_the_checkpoint`（実スレッドで確定境界に止め、
+  その間に別経路でcheckpointを進める）
+
+同時実行制約そのものは、`active`のMutexGuardを保持したまま`Barrier::new(3)`で2本の`start`を
+同時に解放し、両方が「別のスキャンが実行中です」になり、scan sessionも作られないことで確認した
+（`refuses_concurrent_starts_while_a_scan_is_active`）。スキャン所要時間に結果が依存しない。
+
+### B. 走査rootの祖先に対する再帰変更通知
+
+走査rootの祖先pathに`MustScanSubDirs`付きのeventが来た場合、pathとしては`Outside`だが、
+その部分木にはroot内も含まれる。これを捨てるとroot内の変更を取りこぼす。
+
+`ChangeScope`に`Ancestor`を追加し、祖先pathを`Outside`と区別した。`MustScanSubDirs`を伴う
+祖先変更（device root `.` を含む）は`ancestor_rescan_required`として上げ、
+`FullScanReason::AncestorSubtreeChanged`を理由にフルスキャンへ倒す。
+`MustScanSubDirs`を伴わない祖先変更は、その部分木の中身に触れていないので従来どおり無視する。
+
+root全体を1つのrecursive targetとして差分更新する案は採らなかった。基準スナップショットの複製→
+root配下の全削除→再挿入となり、フルスキャンより書き込み量が増えるため。範囲を保証できない場合は
+理由付きでフルスキャンへ戻す方針に統一している。
+
+- `distinguishes_strict_ancestors_from_unrelated_changes`、`treats_siblings_and_text_prefixes_as_outside`
+- `requires_a_full_scan_when_an_ancestor_demands_a_subtree_rescan`、`ignores_ancestor_changes_without_a_subtree_rescan`
+
+### C. 確定直前のroot／volume identity再検証
+
+走査開始時の信頼評価だけでは、走査中のunmount・rename・差し替えを見逃す。確定直前に
+`verify_root_identity`で走査rootの`dev`／`ino`を取り直し、checkpointの
+`volume_identity`／`root_identity`と比較する。identityを取得できないplatformでは
+検証できないためfail closedで失敗させる（差分更新自体がmacOS専用のため実害はない）。
+
+- `refuses_to_commit_when_the_scan_root_was_replaced`（走査完了後・確定前にrootをrenameし、
+  同名のdirectoryを作り直す）
+
+### D. 再走査していないハードリンクのmetadata（実際の不具合）
+
+レビューで見つかった実際の不具合。ハードリンクはどのリンク経由で書き換えても実体が変わるが、
+再走査targetに含まれない側の行は基準スナップショットから複製されたままで、論理サイズ・
+割り当てサイズ・更新時刻が古い値で残っていた。計上元の選び直し（`reaggregate_hard_links`）は
+「どの行を計上するか」しか直さないため、この差は残る。
+
+staged挿入の直後・再集計の前に`refresh_linked_metadata`を挟み、同じ
+`(volume_identity, file_identity)`を指す未再走査の行へ、今回観測した値を反映するようにした。
+
+この修正が効いていることの確認として、`refresh_linked_metadata`の呼び出しを一時的に外すと
+次の2本が落ちる。
+
+```
+refreshes_metadata_of_hard_links_that_were_not_rescanned
+  left:  [("a.bin", 10, None, None), ("b.bin", 20, Some(20), Some(99))]
+  right: [("a.bin", 20, Some(20), Some(99)), ("b.bin", 20, Some(20), Some(99))]
+
+matches_a_fresh_full_scan_after_changes_stop
+  left:  LinkGroup { ... logical_size: (6, 64), ... counted_size: 6 }
+  right: LinkGroup { ... logical_size: (64, 64), ... counted_size: 64 }
+```
+
+### E. キャンセルを受け付ける境界
+
+確定（`apply_staged_snapshot`）は取り消せない。境界を次のように定めた。
+
+1. 走査中：`can_continue`が偽になった時点で中止し、部分的な置換をstagingへ残さない。
+2. 走査完了〜確定直前：ここが最後の受付地点。中断要求を再確認し、次に
+   `verify_root_identity`を行い、そのうえで確定transactionへ入る。
+3. 確定transaction開始後：キャンセルを受け付けない。成功した確定を後からキャンセル扱いへ
+   落とすことはしない。
+
+この境界にテスト専用のフック（`run_incremental_with_hook`）を置き、
+`std::sync::mpsc::sync_channel(0)`のrendezvousで実スレッドを確実に止めてから操作する。
+同期関数の直接呼出しではなく、実際のworker threadの順序を制御した決定論的なテストになっている。
+
+- `cancels_at_the_last_moment_before_the_commit`（境界で止めてからcancel。sessionもcheckpointも動かない）
+- `defers_the_commit_while_paused_and_finishes_after_resume`（境界で止めてpause→resume→確定）
+- `refuses_to_commit_when_another_scan_advanced_the_checkpoint`、`refuses_to_commit_when_the_scan_root_was_replaced`
+
+差分更新の確定経路はunix専用（`verify_root_identity`がfail closed）なので、
+これらのテストは`#[cfg(unix)] mod baseline_updates`に置いた。windows-latestの`cargo test`では
+このモジュールごとコンパイルされない。platform非依存のテスト
+（`falls_back_to_a_full_scan_when_the_index_is_not_trusted`、
+`refuses_concurrent_starts_while_a_scan_is_active`）は両OSで実行される。
+
+### F. フルスキャンとの一致比較
+
+path集合と全体合計だけの比較をやめ、行ごとのmetadataとidentityごとの集計を比較するようにした
+（`matches_a_fresh_full_scan_after_changes_stop`）。
+
+- **行ごと**：`relative_path`・`entry_type`・`is_directory`・`logical_size`・`allocated_size`・
+  `file_count`・`directory_count`・`skipped_count`・`skip_reason`・`modified_at`・
+  `file_identity`・`volume_identity`。
+- **identityごと**：`(volume_identity, file_identity)`単位で、path集合・論理サイズ・
+  割り当てサイズ・更新時刻・計上された`size_bytes`を比較する。ハードリンクについて
+  正規化するのは「どのpathを計上元に選んだか」だけで、集合と各サイズは正規化しない。
+- **比較から除外した列と理由**：`id`・`scan_id`（snapshotごとに必ず変わる代理キー）、
+  `name`・`path`・`parent_path`（`relative_path`から一意に決まる冗長表現）、
+  `cache_*`（bundled catalogがpathから決める分類で、走査経路に依存しない）、
+  行ごとの`size_bytes`（ハードリンクの計上元は走査順で入れ替わりうるため、identityごとに比較する）。
+
+fixtureに含めた変化：file変更、file削除、計上元リンクの削除（`source.bin`削除、`copy.bin`残存）、
+**再走査していないリンク経由でのサイズ変更**（`linked.bin`を書き換え、`linked-copy.bin`は
+targetに含めない）、directoryからfileへの型変更、変更のないdirectory。
+
+### G. schema v8の移行
+
+- 実際のv7のDDL（`git show 89d529b`で取得。`CHECK(platform IN ('macos','windows'))`と
+  `CHECK(history_source IN ('fsevents','usn'))`を含み、`baseline_scan_id`を持たない）から移行する
+  （`migrates_v7_by_adding_baseline_link_with_backup`）。移行後、2件の履歴がどちらも
+  tokenを保ったまま残り、`baseline_scan_id`はNULLのまま。対応が不明な基準scanを推測しない。
+- 新規v8 DBと移行済みv8 DBのschema一致（`new_and_migrated_databases_agree_on_the_v8_schema`）。
+  `ALTER TABLE`は列を末尾に足すため物理的な列順は揃わない。列名で参照する限り差はないので、
+  名前順に並べた`pragma_table_info`（name／type／notnull／dflt_value／pk）で比較し、
+  加えてCHECK制約が両方で同じ入力を拒否することを確認する。
+  移行の列型を`INTEGER`から`TEXT`へ変えると、このテストは
+  `("baseline_scan_id", "INTEGER", ...)` と `("baseline_scan_id", "TEXT", ...)` の差で落ちる。
+- 移行失敗からの復旧（`keeps_the_v7_database_and_its_backup_when_migration_fails`）。
+  `ALTER TABLE`が失敗する壊れたv7を与えると
+  「スキャン履歴をv8へ移行できません: duplicate column name: baseline_scan_id」で失敗し、
+  `user_version`は7のまま（次回起動で同じ移行を再試行できる）、既存の履歴も残り、
+  移行前バックアップは`PRAGMA quick_check`が`ok`を返す健全な状態で残る。
+
 ## baseline・checkpointの契約
 
 - checkpointは走査root（canonical path）ごとに1件。`root_path`が主キー。
@@ -117,11 +261,14 @@ FSEventsが返す変更pathはvolume（device）相対で、走査rootがvolume 
 | `work/a/b` | `Inside("a/b")` |
 | `work` | `Inside(".")`（root自身の変更） |
 | `workspace/x` | `Outside`（文字列prefixは親子ではない） |
-| `other/x`、`.`（root外の祖先） | `Outside` |
+| `other/x` | `Outside`（無関係な兄弟） |
+| `.`、`work`の祖先 | `Ancestor`。`MustScanSubDirs`付きならフルスキャンへ、無ければ無視 |
 | `/abs/path`、`..`を含むpath、UTF-8化不能 | `Invalid`（fail closed） |
 
 走査rootがvolume rootの場合、device相対pathはそのままscan-root相対pathになる。
 `Invalid`は1件でも混じれば差分更新を中止し、フルスキャンへ倒す。`Outside`は無視する。
+`Ancestor`は、その部分木全体の再走査を求めるevent（`MustScanSubDirs`）を伴う場合だけ
+`FullScanReason::AncestorSubtreeChanged`としてフルスキャンへ倒す。
 
 ## メモリ上限設計の根拠
 
@@ -133,8 +280,20 @@ FSEventsが返す変更pathはvolume（device）相対で、走査rootがvolume 
 - **未計測**：`MAX_REPLACEMENT_ENTRIES = 1_000_000`という実値、および
   `MAX_HISTORY_CHANGES = 65_536`／`MAX_RESCAN_TARGETS = 4_096`という実値での
   ピークメモリ・所要時間は測っていない。上限値そのものの妥当性は未検証。
-- **未計測**：大規模実データ（数百万entry）での差分適用のI/O量・所要時間。
+- **計測済み（SQLite側の上限）**：差分を確定するconnectionは
+  `PRAGMA cache_size=-2048`（page cache 2MiB）と`PRAGMA temp_store=FILE`を明示的に設定する
+  （`APPLY_CONNECTION_PRAGMAS`、`bounds_the_page_cache_and_spills_temporary_results_to_disk`）。
+  基準スナップショットの複製もハードリンク再集計のGROUP BYもSQLite内で完結し、
+  中間結果はheapではなくディスクへ出る。行をアプリ側のVecへ載せ替える経路はない。
+  設定前の実測値は`cache_size=-2000`／`temp_store=0`（compile-timeの`TEMP_STORE=1`＝FILEに委譲）／
+  `page_size=4096`／`soft_heap_limit=0`で、bundled SQLiteは3.46.0。
+  既定値のままでもディスクへ出るが、ビルド構成に依存させないため明示した。
+  一時staging DB側も同じく`cache_size=-2048`／`temp_store=FILE`を設定している。
+- **未計測**：大規模実データ（数百万entry）での差分適用のI/O量・所要時間・RSS。
   検証は専用の小規模fixtureのみで行い、ホームディレクトリや実プロジェクトは走査していない。
+  再現手順：使い捨てのvolume上に数百万件のfixtureを生成し、`/usr/bin/time -l`で
+  最大RSSと経過時間を採る。必要環境：数十GBの空き領域と、実行中にSpotlight索引や
+  Time Machineが動かない状態。
 
 ## 意図的なトレードオフ
 
@@ -144,11 +303,14 @@ FSEventsが返す変更pathはvolume（device）相対で、走査rootがvolume 
    DBを使うため、移行が壊れる。加えて、1回の差分更新で1度だけ実行するGROUP BYのために
    フルスキャンの全INSERTへ書き込み増幅を課すことになる。SQLiteはこのGROUP BYをディスクへ
    spillできるため、現時点では追加しない判断とした。
-2. **フルスキャンと差分更新の一致比較で、行ごとの`size_bytes`は比較していない。**
+2. **フルスキャンと差分更新の一致比較で、行ごとの`size_bytes`だけは比較していない。**
    ハードリンクの計上元として選ばれる行は、走査順によって同じ`(device, inode)`集合の中で
-   入れ替わりうる。行単位で固定すると実装依存の期待値になるため、
-   pathの集合と合計値（サイズ・file数・directory数・skip数）で一致を確認している
-   （`matches_a_fresh_full_scan_after_changes_stop`）。
+   入れ替わりうる。行単位で固定すると実装依存の期待値になるため、この列だけは
+   identityごとの集計（`LinkGroup.counted_size`）として比較する。
+   他の列は行ごとに比較する（「安全性再レビューで修正した点」のF）。
+3. **確定直前のroot identity検証はunix専用で、それ以外のplatformではfail closedで失敗する。**
+   `cap_std::fs::MetadataExt`が`#[cfg(unix)]`のため。差分更新自体がmacOS専用なので
+   実害はないが、Windowsで差分更新を有効にする際（タスク2）には同等の検証が必要になる。
 
 ## 実行したコマンド
 
@@ -159,7 +321,17 @@ cargo clippy --locked --all-targets --all-features --manifest-path src-tauri/Car
 cargo test --locked --manifest-path src-tauri/Cargo.toml
 ```
 
-環境：macOS 15.4／arm64、rustc 1.97.1、cargo 1.97.1、clippy 0.1.97。
+frontend側は、node@22を復旧したうえで次を実行した。
+
+```
+npm ci
+npm run check
+npm test
+npm run build
+```
+
+環境：macOS 15.4／arm64、rustc 1.97.1、cargo 1.97.1、clippy 0.1.97、
+node v22.23.2（`/opt/homebrew/opt/node@22/bin/node`）、npm 10.9.8。
 
 テスト・警告の無効化、`#[allow]`の追加、lint設定の緩和は行っていない。
 
@@ -167,24 +339,31 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml
 
 ```
 cargo fmt --check                         終了コード0（差分なし）
-cargo clippy ... -- -D warnings           Finished dev profile（警告0）
-cargo test --locked                       129 passed; 0 failed; 1 ignored
+cargo clippy ... -- -D warnings           終了コード0（Finished dev profile、警告0）
+cargo test --locked                       終了コード0
+                                          142 passed; 0 failed; 1 ignored
                                           main.rs 0件、doc-tests 0件
+npm ci                                    終了コード0（0 vulnerabilities）
+npm run check                             終了コード0（tsc -b）
+npm test                                  終了コード0（3 files / 7 tests passed）
+npm run build                             終了コード0
 ```
 
-作業前は107 passed／0 failed／1 ignored。今回+22本。
+統合作業前は107 passed／0 failed／1 ignored。統合で129、安全性再レビューで142になった。
+再レビューでは18本追加し、5本を`#[cfg(unix)] mod baseline_updates`へ移した（差し引き+13）。
 
-| モジュール | 件数 | 備考 |
+| モジュール | 件数 | 再レビューでの増減 |
 |---|---|---|
-| `incremental_rescan` | 13 | 02ae78dから変更なし（`normalize_relative`の移動のみ） |
-| `incremental_trust` | 11 | +5 |
-| `incremental_storage` | 11 | +1（上限停止） |
-| `incremental_scan` | 11 | 新規 |
-| `incremental_paths` | 7 | 新規 |
-| `scan_jobs` | 8 | +5（差分更新統合） |
-| `index_checkpoint` | 5 | +2（v7→v8移行、基準scan ID検証） |
+| `scan_jobs` | 13 | +5（確定境界のcancel／pause、checkpoint追い越し、root差し替え、同時start） |
+| `incremental_trust` | 13 | +2（祖先のsubtree再走査要求） |
+| `incremental_storage` | 14 | +3（評価後のcheckpoint移動、未再走査リンクのmetadata、確定connectionのメモリ上限） |
+| `incremental_rescan` | 13 | 変更なし |
+| `incremental_scan` | 11 | 変更なし（一致比較テストの内容を強化） |
+| `incremental_paths` | 8 | +1（祖先と無関係な変更の区別） |
+| `index_checkpoint` | 7 | +2（新規v8と移行v8のschema一致、移行失敗からの復旧） |
 | `storage` | 10 | |
-| その他（既存） | 53 | |
+| `cache_catalog` | 10 | |
+| その他（既存） | 44 | |
 
 ignored 1本は既存の実機依存テストで、今回追加したものではない。
 
@@ -193,7 +372,7 @@ ignored 1本は既存の実機依存テストで、今回追加したもので�
 | 要求ケース | テスト |
 |---|---|
 | 走査root≠volume rootのpath変換 | `converts_device_relative_changes_for_a_nested_scan_root`、`passes_changes_through_when_the_scan_root_is_the_volume_root` |
-| root自身・root外・親参照・不正path | `treats_ancestors_siblings_and_text_prefixes_as_outside`、`rejects_unsafe_change_paths_without_guessing_scope`、`normalizes_relative_paths_and_rejects_escapes`、`represents_the_volume_root_as_a_single_dot` |
+| root自身・root外・親参照・不正path | `treats_siblings_and_text_prefixes_as_outside`、`distinguishes_strict_ancestors_from_unrelated_changes`、`rejects_unsafe_change_paths_without_guessing_scope`、`normalizes_relative_paths_and_rejects_escapes`、`represents_the_volume_root_as_a_single_dot` |
 | fileの追加・変更・削除 | `replaces_added_changed_and_deleted_files` |
 | directoryのrename・削除・型変更 | `collects_a_renamed_directory_under_its_new_name`、`leaves_no_replacement_when_a_directory_is_deleted`、`drops_old_descendants_when_a_directory_becomes_a_file` |
 | 読取失敗と消失の区別 | `fails_closed_when_a_target_cannot_be_read`、`leaves_no_replacement_when_a_directory_is_deleted` |
@@ -202,7 +381,14 @@ ignored 1本は既存の実機依存テストで、今回追加したもので�
 | ハードリンク計上元の削除と再集計 | `reaggregates_hard_links_when_the_counted_link_disappears`、`reaggregates_hard_links_when_a_link_is_rescanned` |
 | baseline／checkpoint不一致 | `refuses_to_apply_when_the_checkpoint_does_not_name_the_update_baseline`、`rejects_a_checkpoint_that_points_at_another_baseline`、`requires_a_full_scan_until_the_checkpoint_names_a_baseline`、`rejects_invalid_baseline_scan_id` |
 | キャンセル・保存失敗・rollback | `keeps_the_baseline_and_checkpoint_when_cancelled`、`rolls_back_the_new_snapshot_when_the_checkpoint_cannot_be_saved`、`stops_without_a_partial_replacement_when_cancelled`、`rolls_back_snapshot_when_checkpoint_is_invalid`、`rolls_back_when_replacement_is_outside_target` |
-| 変更停止後の差分結果とフルスキャンの一致 | `matches_a_fresh_full_scan_after_changes_stop` |
+| 変更停止後の差分結果とフルスキャンの一致 | `matches_a_fresh_full_scan_after_changes_stop`（行ごとのmetadataとidentityごとの集計を比較） |
+| 祖先への再帰変更通知の取りこぼし | `requires_a_full_scan_when_an_ancestor_demands_a_subtree_rescan`、`ignores_ancestor_changes_without_a_subtree_rescan` |
+| 評価後にcheckpointが動いた場合 | `refuses_to_apply_when_the_stored_checkpoint_moved_since_the_assessment`、`refuses_to_commit_when_another_scan_advanced_the_checkpoint` |
+| 走査中のroot／volume差し替え | `refuses_to_commit_when_the_scan_root_was_replaced` |
+| 確定境界でのcancel・pause・resume | `cancels_at_the_last_moment_before_the_commit`、`defers_the_commit_while_paused_and_finishes_after_resume` |
+| 同時実行制約（2本のstartの競合） | `refuses_concurrent_starts_while_a_scan_is_active` |
+| 未再走査リンク経由のサイズ変更 | `refreshes_metadata_of_hard_links_that_were_not_rescanned`、`matches_a_fresh_full_scan_after_changes_stop` |
+| schema v8（実v7形式からの移行・schema一致・移行失敗） | `migrates_v7_by_adding_baseline_link_with_backup`、`new_and_migrated_databases_agree_on_the_v8_schema`、`keeps_the_v7_database_and_its_backup_when_migration_fails` |
 
 ## 異常系・ロールバック・キャンセルの検証結果
 
@@ -223,37 +409,53 @@ ignored 1本は既存の実機依存テストで、今回追加したもので�
   checkpointが無い状態では`ScanRecommendation::Full`と`FullScanReason::IndexUntrusted`を返し、
   フルスキャンが完走して`savedScanId`が入る。
 
-これらはすべて、確定処理を自由関数`run_incremental`として切り出し、
-テストからスレッドを介さず同期的に駆動して確認している（競合による不定性がない）。
+これらのうち単独の失敗経路は、確定処理を自由関数`run_incremental`として切り出し、
+テストから同期的に駆動して確認している。順序が問題になるケース（確定境界でのcancel／pause、
+checkpointの追い越し、rootの差し替え、2本のstartの競合）は、実際のworker threadを
+`sync_channel(0)`のrendezvousと`Barrier`で止めて決定論的に再現している。
 
 ## 検証ログ
 
 以下に保存した。リポジトリには含めない。
 
 ```
-~/Library/Logs/Disk_Visualizer/task1-integration-fmt.log
-~/Library/Logs/Disk_Visualizer/task1-integration-clippy.log
-~/Library/Logs/Disk_Visualizer/task1-integration-test.log
+~/Library/Logs/Disk_Visualizer/task1-integration-fmt.log      （統合時）
+~/Library/Logs/Disk_Visualizer/task1-integration-clippy.log   （統合時）
+~/Library/Logs/Disk_Visualizer/task1-integration-test.log     （統合時）
+~/Library/Logs/Disk_Visualizer/task1-safety-20260908/cargo-fmt.log
+~/Library/Logs/Disk_Visualizer/task1-safety-20260908/cargo-clippy.log
+~/Library/Logs/Disk_Visualizer/task1-safety-20260908/cargo-test.log
+~/Library/Logs/Disk_Visualizer/task1-safety-20260908/node-env.log
+~/Library/Logs/Disk_Visualizer/task1-safety-20260908/npm-ci.log
+~/Library/Logs/Disk_Visualizer/task1-safety-20260908/npm-check.log
+~/Library/Logs/Disk_Visualizer/task1-safety-20260908/npm-test.log
+~/Library/Logs/Disk_Visualizer/task1-safety-20260908/npm-build.log
 ```
+
+各ログの末尾に実行コマンドと終了コードを記録している。
 
 ## 未完了項目・未検証範囲
 
-1. **volume境界越えの実走査**：2つ目のvolumeをmountしないと再現できないため、fixtureを作れていない。
-   `device_relative_root`のmount point越え拒否と`crosses_volume`は実装済みだが、
-   実際に別volumeを跨ぐ変更を流した検証はしていない。
+1. **volume境界越えの実走査**：`device_relative_root`のmount point越え拒否と`crosses_volume`は
+   実装済みだが、実際に別volumeを跨ぐ変更を流した検証はしていない。
+   再現手順：`hdiutil attach -nomount ram://…`でRAM diskを作り`diskutil eraseVolume`で
+   APFS volumeとして初期化、走査root配下へmountして、その中と外にfileを作る。
+   必要環境：追加のmount権限（`diskutil`実行）。CIのmacos-14 runnerでも実行可能だが、
+   後始末（`hdiutil detach`）の失敗がrunnerに残るため、まず手元で確立してから入れる。
 2. **上限値の実値検証**：`MAX_REPLACEMENT_ENTRIES = 1_000_000`、`MAX_HISTORY_CHANGES = 65_536`、
    `MAX_RESCAN_TARGETS = 4_096`は、分岐の到達のみ確認しており、実値でのメモリ・時間は未計測。
 3. **UI接続**：`start_incremental_scan`はバックエンドのみ。React側からの呼び出し、
    信頼状態とフルスキャン理由の表示は未実装。
-4. **npmによる検証**：`npm run check`／`npm test`／`npm run build`は未実行。
-   ローカルのnodeがdyldエラー（`libsimdutf.34.dylib`不在）で起動しないため。
-   今回TypeScript側の契約は変更していない（`savedScanId`は追加のみ、
-   `start_incremental_scan`は新規コマンド）ため、既存フロントエンドのビルドには影響しない見込みだが、
-   実行して確かめてはいない。
-5. **アプリ実機での受け入れ検証**：Tauriアプリを起動しての差分更新の動作確認は未実施。
-6. **pause／resumeと確定の競合**：`can_continue`によるキャンセルとの競合はテスト済みだが、
-   差分更新中のpause／resumeを実際に往復させる検証はしていない。
-7. **外付け媒体の切断・再接続、スリープ復帰でのidentity再評価**：未着手（タスク3以降）。
+4. **アプリ実機での受け入れ検証**：Tauriアプリを起動しての差分更新の動作確認は未実施。
+   `npm run tauri dev`でのGUI操作が必要で、自動テストでは代替していない。
+5. **実FSEvents eventを流す経路**：`fsevents_history`のstream取得は、テストでは
+   callback層（`fsevents_callback`）とdecision層に分けて検証している。実際にファイルを
+   変更してeventが届き、それが差分更新の完走まで通ることは確認していない。
+   再現手順：走査rootでフルスキャン→checkpoint保存後にfileを変更→`start_incremental_scan`。
+   必要環境：FSEventsのlatencyを待つ実時間の待機とGUIまたはコマンド経路。
+6. **外付け媒体の切断・再接続、スリープ復帰でのidentity再評価**：未着手（タスク3以降）。
+   確定直前の`verify_root_identity`はunmount中の差し替えを捉えるが、
+   再接続後の再評価フローは実装していない。
 
 ## Windows検証が必要な範囲
 
@@ -269,6 +471,10 @@ MacでのRustテスト成功を、Windows実機成功・二重OS CI成功とは�
 - `start_incremental_scan`がWindowsでは`Unsupported`としてフルスキャンへ倒れること。
 - Windows固有のpath表現（`\\?\`、ドライブレター、代替データストリーム、大文字小文字）に対する
   変換経路の扱い。現時点でWindows向けのdevice相対path変換は実装していない（タスク2の範囲）。
+- `verify_root_identity`はunix以外でfail closedになるため、差分更新の確定経路は
+  Windowsでは使えない。`#[cfg(unix)] mod baseline_updates`のテストはWindowsでコンパイルされない。
+  タスク2でWindowsの差分更新を有効にする際は、同等のidentity検証（volume serial number＋
+  file reference number）と、対応するテストが必要になる。
 
 ## 再開手順
 
@@ -279,15 +485,21 @@ cargo clippy --locked --all-targets --all-features --manifest-path src-tauri/Car
 cargo test --locked --manifest-path src-tauri/Cargo.toml
 ```
 
-129 passed／0 failed／1 ignored、clippy警告0が再現すれば同じ地点にいる。
+142 passed／0 failed／1 ignored、clippy警告0が再現すれば同じ地点にいる。
 
-次に着手する順序：
+frontend検証にはnode@22を使う（既定のnodeは`libsimdutf.34.dylib`不在でdyldエラーになる）。
+コマンド単位でPATHの先頭に`/opt/homebrew/opt/node@22/bin`を置く。symlinkでの取り繕いや
+`brew upgrade`／`brew cleanup`は行っていない。
 
-1. nodeを復旧し（`libsimdutf`の再インストール）、`npm run check`／`npm test`／`npm run build`を実行する。
-2. `start_incremental_scan`をUIへ接続し、信頼状態とフルスキャン理由を表示する。
-3. Windowsで回帰確認する。
+タスク1の残作業（この順序で進める）：
+
+1. `start_incremental_scan`をUIへ接続し、信頼状態とフルスキャン理由を表示する。
+2. Windowsで回帰確認する（`cargo test`／`cargo clippy`、schema v6→v8・v7→v8移行、
+   `start_incremental_scan`が`Unsupported`でフルスキャンへ倒れること）。
+3. 二重OS CI（macos-14／windows-latest）を通す。
 4. 上限値の実値でメモリ・時間を計測し、必要なら調整する。
-5. タスク2（Windows USN変更record読取）へ進む。
+
+タスク1がここまで完了してから、タスク2（Windows USN変更record読取）へ進む。
 
 ## 影響と制約
 
@@ -296,5 +508,7 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml
 - 公開Tauriコマンドは`start_incremental_scan`の1件追加のみ。既存コマンドの署名は変更なし。
 - `ScanJobSnapshot`への`savedScanId`追加はオプショナルな追加フィールドで、既存の利用側は影響を受けない。
 - schemaはv7からv8へ上がる。ダウングレード経路は用意していない。
+- 差分更新の確定はunix専用（確定直前のroot identity検証が`#[cfg(unix)]`）。
+  他のplatformでは差分更新へ入らずフルスキャンへ倒れるため、既存動作は変わらない。
 - tsconfig.app.tsbuildinfo、tsconfig.node.tsbuildinfo、.serena/はコミット対象外。
 - 初期リリースの機能範囲は削減していない。

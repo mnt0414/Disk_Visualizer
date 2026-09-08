@@ -5,7 +5,10 @@ use std::path::{Component, Path, PathBuf};
 pub enum ChangeScope {
     /// scan root配下の変更。保持するのはroot基準の相対pathで、root自身は `.`。
     Inside(PathBuf),
-    /// scan root外の変更。走査対象ではないため無視する。
+    /// scan rootの厳密な祖先に対する変更。単独では走査結果に影響しないが、
+    /// 部分木全体の再走査要求を伴う場合はroot配下すべてが対象になる。
+    Ancestor,
+    /// scan rootと無関係な変更。走査対象ではないため無視する。
     Outside,
     /// 相対pathとして解釈できない変更。fail closedでフルスキャンへ戻す。
     Invalid,
@@ -34,8 +37,9 @@ pub fn normalize_relative(path: &Path) -> Option<PathBuf> {
 /// device-relative pathを、選択されたscan root基準の相対pathへ変換する。
 ///
 /// `device_relative_root` はvolume root自身のとき `.`、それ以外はvolume root基準の
-/// 相対pathを表す。scan rootの厳密な祖先に対する変更はscan結果に含まれないため
-/// `Outside` とする。root自身の同一性はcheckpointのvolume／root identityで別途検証する。
+/// 相対pathを表す。scan rootの厳密な祖先に対する変更は、単独ではscan結果に現れないが
+/// 部分木再走査要求と組み合わさるとroot配下全体を指すため `Ancestor` として区別する。
+/// root自身の同一性はcheckpointのvolume／root identityで別途検証する。
 pub fn to_scan_root_relative(device_relative_root: &Path, change: &Path) -> ChangeScope {
     let (Some(root), Some(change)) = (
         normalize_relative(device_relative_root),
@@ -46,11 +50,11 @@ pub fn to_scan_root_relative(device_relative_root: &Path, change: &Path) -> Chan
     if root == Path::new(".") {
         return ChangeScope::Inside(change);
     }
-    if change == Path::new(".") {
-        return ChangeScope::Outside;
-    }
     if change == root {
         return ChangeScope::Inside(PathBuf::from("."));
+    }
+    if change == Path::new(".") || root.starts_with(&change) {
+        return ChangeScope::Ancestor;
     }
     match change.strip_prefix(&root) {
         Ok(relative) => ChangeScope::Inside(relative.to_path_buf()),
@@ -237,11 +241,9 @@ mod tests {
     }
 
     #[test]
-    fn treats_ancestors_siblings_and_text_prefixes_as_outside() {
+    fn treats_siblings_and_text_prefixes_as_outside() {
         let root = Path::new("work/project");
         for outside in [
-            ".",
-            "work",
             "work/other",
             "work/projector/file",
             "other/work/project/file",
@@ -252,6 +254,25 @@ mod tests {
                 "{outside}"
             );
         }
+    }
+
+    /// 祖先への変更は`Outside`と混ぜない。部分木再走査要求が付くとroot配下全体を
+    /// 指すため、呼び出し側が範囲を判断できるよう区別して返す。
+    #[test]
+    fn distinguishes_strict_ancestors_from_unrelated_changes() {
+        let root = Path::new("work/project");
+        for ancestor in [".", "work"] {
+            assert_eq!(
+                to_scan_root_relative(root, Path::new(ancestor)),
+                ChangeScope::Ancestor,
+                "{ancestor}"
+            );
+        }
+        // volume rootがscan rootのときは、祖先が存在しない。
+        assert_eq!(
+            to_scan_root_relative(Path::new("."), Path::new(".")),
+            inside(".")
+        );
     }
 
     #[test]
