@@ -12,6 +12,8 @@ pub struct IndexCheckpoint {
     pub root_identity: String,
     pub history_source: String,
     pub history_token: String,
+    /// このcheckpointが指す完了済みscan session。差分更新の基準として明示的に検証する。
+    pub baseline_scan_id: Option<i64>,
     pub updated_at: i64,
 }
 
@@ -38,6 +40,9 @@ pub(crate) fn validate_checkpoint(checkpoint: &IndexCheckpoint) -> Result<(), St
     {
         return Err("差分更新checkpointのidentityまたはtokenが不足しています".to_owned());
     }
+    if checkpoint.baseline_scan_id.is_some_and(|id| id <= 0) {
+        return Err("差分更新checkpointの基準scan IDが不正です".to_owned());
+    }
     Ok(())
 }
 
@@ -46,7 +51,7 @@ pub(crate) fn upsert_checkpoint(
     checkpoint: &IndexCheckpoint,
 ) -> Result<(), String> {
     validate_checkpoint(checkpoint)?;
-    connection.execute("INSERT INTO index_checkpoints (root_path,platform,volume_identity,root_identity,history_source,history_token,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(root_path) DO UPDATE SET platform=excluded.platform,volume_identity=excluded.volume_identity,root_identity=excluded.root_identity,history_source=excluded.history_source,history_token=excluded.history_token,updated_at=excluded.updated_at",params![checkpoint.root_path,checkpoint.platform,checkpoint.volume_identity,checkpoint.root_identity,checkpoint.history_source,checkpoint.history_token,checkpoint.updated_at]).map_err(|error|format!("差分更新checkpointを保存できません: {error}"))?;
+    connection.execute("INSERT INTO index_checkpoints (root_path,platform,volume_identity,root_identity,history_source,history_token,baseline_scan_id,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(root_path) DO UPDATE SET platform=excluded.platform,volume_identity=excluded.volume_identity,root_identity=excluded.root_identity,history_source=excluded.history_source,history_token=excluded.history_token,baseline_scan_id=excluded.baseline_scan_id,updated_at=excluded.updated_at",params![checkpoint.root_path,checkpoint.platform,checkpoint.volume_identity,checkpoint.root_identity,checkpoint.history_source,checkpoint.history_token,checkpoint.baseline_scan_id,checkpoint.updated_at]).map_err(|error|format!("差分更新checkpointを保存できません: {error}"))?;
     Ok(())
 }
 
@@ -79,6 +84,7 @@ pub fn capture_full_scan_checkpoint(root: &Path) -> Result<Option<IndexCheckpoin
             root_identity: metadata.ino().to_string(),
             history_source: "fsevents".to_owned(),
             history_token,
+            baseline_scan_id: None,
             updated_at: unix_time()?,
         }))
     }
@@ -103,6 +109,27 @@ impl IndexCheckpointRepository {
         Ok(connection)
     }
 
+    /// 移行前に、VACUUM INTOで一貫したバックアップを作りquick_checkで健全性を確認する。
+    fn consistent_backup(&self, connection: &Connection, extension: &str) -> Result<(), String> {
+        let backup = self.database_path.with_extension(extension);
+        if backup.exists() {
+            return Ok(());
+        }
+        connection
+            .execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
+            .map_err(|error| format!("移行前バックアップを作成できません: {error}"))?;
+        let backup_connection = Connection::open(&backup)
+            .map_err(|error| format!("移行前バックアップを開けません: {error}"))?;
+        let check: String = backup_connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if check != "ok" {
+            let _ = std::fs::remove_file(&backup);
+            return Err(format!("移行前バックアップが破損しています: {check}"));
+        }
+        Ok(())
+    }
+
     pub fn initialize(&self) -> Result<(), String> {
         let connection = self.connection()?;
         let version: i64 = connection
@@ -110,26 +137,14 @@ impl IndexCheckpointRepository {
             .map_err(|error| error.to_string())?;
         match version {
             6 => {
-                let backup = self.database_path.with_extension("sqlite3.v6-backup");
-                if !backup.exists() {
-                    connection
-                        .execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
-                        .map_err(|error| {
-                            format!("v7移行前バックアップを作成できません: {error}")
-                        })?;
-                    let backup_connection = Connection::open(&backup)
-                        .map_err(|error| format!("v7移行前バックアップを開けません: {error}"))?;
-                    let check: String = backup_connection
-                        .query_row("PRAGMA quick_check", [], |row| row.get(0))
-                        .map_err(|error| error.to_string())?;
-                    if check != "ok" {
-                        let _ = std::fs::remove_file(&backup);
-                        return Err(format!("v7移行前バックアップが破損しています: {check}"));
-                    }
-                }
-                connection.execute_batch("BEGIN IMMEDIATE; CREATE TABLE index_checkpoints (root_path TEXT PRIMARY KEY,platform TEXT NOT NULL CHECK(platform IN ('macos','windows')),volume_identity TEXT NOT NULL,root_identity TEXT NOT NULL,history_source TEXT NOT NULL CHECK(history_source IN ('fsevents','usn')),history_token TEXT NOT NULL,updated_at INTEGER NOT NULL); PRAGMA user_version=7; COMMIT;").map_err(|error|format!("スキャン履歴をv7へ移行できません: {error}"))?;
+                self.consistent_backup(&connection, "sqlite3.v6-backup")?;
+                connection.execute_batch("BEGIN IMMEDIATE; CREATE TABLE index_checkpoints (root_path TEXT PRIMARY KEY,platform TEXT NOT NULL CHECK(platform IN ('macos','windows')),volume_identity TEXT NOT NULL,root_identity TEXT NOT NULL,history_source TEXT NOT NULL CHECK(history_source IN ('fsevents','usn')),history_token TEXT NOT NULL,baseline_scan_id INTEGER,updated_at INTEGER NOT NULL); PRAGMA user_version=8; COMMIT;").map_err(|error|format!("スキャン履歴をv8へ移行できません: {error}"))?;
             }
-            7 => {}
+            7 => {
+                self.consistent_backup(&connection, "sqlite3.v7-backup")?;
+                connection.execute_batch("BEGIN IMMEDIATE; ALTER TABLE index_checkpoints ADD COLUMN baseline_scan_id INTEGER; PRAGMA user_version=8; COMMIT;").map_err(|error|format!("スキャン履歴をv8へ移行できません: {error}"))?;
+            }
+            8 => {}
             other => {
                 return Err(format!(
                     "checkpoint移行元として未対応のDBバージョンです: {other}"
@@ -143,29 +158,17 @@ impl IndexCheckpointRepository {
         upsert_checkpoint(&self.connection()?, checkpoint)
     }
 
-    pub fn save_current(
-        &self,
-        root_path: String,
-        platform: String,
-        volume_identity: String,
-        root_identity: String,
-        history_source: String,
-        history_token: String,
-    ) -> Result<(), String> {
+    /// 更新時刻を現在時刻に打ち直してcheckpointを保存する。
+    pub fn save_current(&self, checkpoint: &IndexCheckpoint) -> Result<(), String> {
         self.save(&IndexCheckpoint {
-            root_path,
-            platform,
-            volume_identity,
-            root_identity,
-            history_source,
-            history_token,
             updated_at: unix_time()?,
+            ..checkpoint.clone()
         })
     }
 
     pub fn load(&self, root_path: &str) -> Result<Option<IndexCheckpoint>, String> {
         self.connection()?
-            .query_row("SELECT root_path,platform,volume_identity,root_identity,history_source,history_token,updated_at FROM index_checkpoints WHERE root_path=?1",[root_path],|row|Ok(IndexCheckpoint { root_path: row.get(0)?, platform: row.get(1)?, volume_identity: row.get(2)?, root_identity: row.get(3)?, history_source: row.get(4)?, history_token: row.get(5)?, updated_at: row.get(6)? }))
+            .query_row("SELECT root_path,platform,volume_identity,root_identity,history_source,history_token,baseline_scan_id,updated_at FROM index_checkpoints WHERE root_path=?1",[root_path],|row|Ok(IndexCheckpoint { root_path: row.get(0)?, platform: row.get(1)?, volume_identity: row.get(2)?, root_identity: row.get(3)?, history_source: row.get(4)?, history_token: row.get(5)?, baseline_scan_id: row.get(6)?, updated_at: row.get(7)? }))
             .optional()
             .map_err(|error| format!("差分更新checkpointを取得できません: {error}"))
     }
@@ -201,6 +204,7 @@ mod tests {
             root_identity: "root-1".to_owned(),
             history_source: "fsevents".to_owned(),
             history_token: token.to_owned(),
+            baseline_scan_id: Some(7),
             updated_at: 1234,
         }
     }
@@ -213,11 +217,48 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert!(repository
             .database_path
             .with_extension("sqlite3.v6-backup")
             .exists());
+    }
+
+    #[test]
+    fn migrates_v7_by_adding_baseline_link_with_backup() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "disk-visualizer-checkpoint-v7-{}-{unique}.sqlite3",
+            std::process::id()
+        ));
+        Connection::open(&path).unwrap().execute_batch("CREATE TABLE index_checkpoints (root_path TEXT PRIMARY KEY,platform TEXT NOT NULL,volume_identity TEXT NOT NULL,root_identity TEXT NOT NULL,history_source TEXT NOT NULL,history_token TEXT NOT NULL,updated_at INTEGER NOT NULL); INSERT INTO index_checkpoints VALUES ('/Volumes/Data','macos','volume-1','root-1','fsevents','fsevents:v1:100',1234); PRAGMA user_version=7;").unwrap();
+        let repository = IndexCheckpointRepository::new(path.clone());
+        repository.initialize().unwrap();
+        let version: i64 = repository
+            .connection()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+        assert!(path.with_extension("sqlite3.v7-backup").exists());
+        let migrated = repository.load("/Volumes/Data").unwrap().unwrap();
+        assert_eq!(migrated.baseline_scan_id, None);
+        assert_eq!(migrated.history_token, "fsevents:v1:100");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3.v7-backup"));
+    }
+
+    #[test]
+    fn rejects_invalid_baseline_scan_id() {
+        let repository = repository("baseline");
+        let mut value = checkpoint("100");
+        value.baseline_scan_id = Some(0);
+        assert!(repository.save(&value).is_err());
+        value.baseline_scan_id = None;
+        assert!(repository.save(&value).is_ok());
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use crate::fsevents_callback::CollectedFseventsChange;
+use crate::incremental_paths::normalize_relative;
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -28,25 +29,6 @@ pub enum IncrementalRescanPlan {
     },
 }
 
-fn normalize_relative(path: &Path) -> Option<PathBuf> {
-    if path.as_os_str().is_empty() {
-        return None;
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(value) => normalized.push(value),
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    if normalized.as_os_str().is_empty() {
-        Some(PathBuf::from("."))
-    } else {
-        Some(normalized)
-    }
-}
-
 fn collapse_targets(paths: BTreeSet<PathBuf>) -> Vec<PathBuf> {
     let mut collapsed: Vec<PathBuf> = Vec::new();
     for path in paths {
@@ -57,6 +39,38 @@ fn collapse_targets(paths: BTreeSet<PathBuf>) -> Vec<PathBuf> {
         collapsed.push(path);
     }
     collapsed
+}
+
+/// 置換範囲を部分木へ拡大し、祖先で統合する。
+///
+/// exact targetのまま置換すると、directoryのrename・削除・fileへの型変更で
+/// 古い子孫がsnapshotに残る。差分適用の置換単位は必ず部分木にする。
+pub fn escalate_to_subtrees(
+    targets: &[IncrementalRescanTarget],
+) -> Result<Vec<IncrementalRescanTarget>, String> {
+    let mut paths = BTreeSet::new();
+    let mut includes_root = false;
+    for target in targets {
+        let path = normalize_relative(&target.relative_path)
+            .ok_or_else(|| "部分再走査targetが不正です".to_owned())?;
+        if path == Path::new(".") {
+            includes_root = true;
+        } else {
+            paths.insert(path);
+        }
+    }
+    let paths = if includes_root {
+        vec![PathBuf::from(".")]
+    } else {
+        collapse_targets(paths)
+    };
+    Ok(paths
+        .into_iter()
+        .map(|relative_path| IncrementalRescanTarget {
+            relative_path,
+            recursive: true,
+        })
+        .collect())
 }
 
 pub fn plan_incremental_rescan(

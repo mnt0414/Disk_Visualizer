@@ -1,6 +1,9 @@
 use crate::fsevents_callback::CollectedFseventsChange;
-use crate::index_checkpoint::IndexCheckpointRepository;
+use crate::index_checkpoint::{IndexCheckpoint, IndexCheckpointRepository};
 use crate::index_trust::{IndexTrustDecision, IndexTrustState, ScanRecommendation};
+
+#[cfg(any(target_os = "macos", test))]
+use crate::incremental_paths::ChangeScope;
 use std::path::Path;
 use std::time::Duration;
 
@@ -8,8 +11,6 @@ use std::time::Duration;
 use crate::change_history::HistoryToken;
 #[cfg(any(target_os = "macos", test))]
 use crate::fsevents_history::FseventsHistoryRead;
-#[cfg(any(target_os = "macos", test))]
-use crate::index_checkpoint::IndexCheckpoint;
 #[cfg(any(target_os = "macos", test))]
 use crate::index_trust::{evaluate, IndexTrustEvidence};
 #[cfg(any(target_os = "macos", test))]
@@ -21,6 +22,10 @@ pub struct MacosIndexTrustAssessment {
     pub changes: Vec<CollectedFseventsChange>,
     pub rescan_subtrees: bool,
     pub next_history_token: Option<String>,
+    /// 差分更新の基準となる完了済みscan session。checkpointが明示的に指したものだけを載せる。
+    pub baseline_scan_id: Option<i64>,
+    /// 検証に使ったcheckpointそのもの。差分適用時に読み直さず、この対応のまま更新する。
+    pub checkpoint: Option<IndexCheckpoint>,
 }
 
 fn full_assessment(state: IndexTrustState) -> MacosIndexTrustAssessment {
@@ -32,6 +37,8 @@ fn full_assessment(state: IndexTrustState) -> MacosIndexTrustAssessment {
         changes: Vec::new(),
         rescan_subtrees: false,
         next_history_token: None,
+        baseline_scan_id: None,
+        checkpoint: None,
     }
 }
 
@@ -64,52 +71,76 @@ fn checkpoint_event_id(checkpoint: &IndexCheckpoint) -> Result<u64, IndexTrustDe
     }
 }
 
+/// device-relative pathの変更を、走査root基準の相対pathへ読み替える。
+///
+/// root外の変更は走査結果に現れないため落とす。相対pathとして解釈できない変更は
+/// 範囲を推測せず、fail closedでフルスキャンへ戻せるようエラーにする。
+#[cfg(any(target_os = "macos", test))]
+fn to_scan_root_changes(
+    device_relative_root: &Path,
+    changes: Vec<CollectedFseventsChange>,
+) -> Result<Vec<CollectedFseventsChange>, String> {
+    let mut converted = Vec::with_capacity(changes.len());
+    for change in changes {
+        match crate::incremental_paths::to_scan_root_relative(
+            device_relative_root,
+            &change.relative_path,
+        ) {
+            ChangeScope::Inside(relative_path) => converted.push(CollectedFseventsChange {
+                relative_path,
+                ..change
+            }),
+            ChangeScope::Outside => {}
+            ChangeScope::Invalid => return Err("変更pathを走査root基準で解釈できません".to_owned()),
+        }
+    }
+    Ok(converted)
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn evaluate_history(
     checkpoint: &IndexCheckpoint,
-    current_volume_identity: &str,
-    current_root_identity: &str,
+    identities: (&str, &str),
+    device_relative_root: &Path,
     history: Result<FseventsHistoryRead, String>,
-) -> MacosIndexTrustAssessment {
+) -> Result<MacosIndexTrustAssessment, String> {
+    let (current_volume_identity, current_root_identity) = identities;
     if checkpoint.volume_identity != current_volume_identity {
-        return full_assessment(IndexTrustState::VolumeChanged);
+        return Ok(full_assessment(IndexTrustState::VolumeChanged));
     }
     if checkpoint.root_identity != current_root_identity {
-        return full_assessment(IndexTrustState::RootChanged);
+        return Ok(full_assessment(IndexTrustState::RootChanged));
     }
-    let Ok(read) = history else {
-        return full_assessment(IndexTrustState::HistoryUnavailable);
+    // checkpointが基準scanを明示していない間は、差分の当て先が確定しない。
+    let Some(baseline_scan_id) = checkpoint.baseline_scan_id else {
+        return Ok(full_assessment(IndexTrustState::InitialScanRequired));
     };
-    match read.decision {
-        FseventsBatchDecision::Incremental { next_event_id } => MacosIndexTrustAssessment {
-            decision: evidence_decision(true, true, true, true, true),
-            changes: read.changes,
-            rescan_subtrees: false,
-            next_history_token: Some(
-                HistoryToken::Fsevents {
-                    event_id: next_event_id,
-                }
-                .encode(),
-            ),
-        },
-        FseventsBatchDecision::RescanSubtrees { next_event_id } => MacosIndexTrustAssessment {
-            decision: evidence_decision(true, true, true, true, true),
-            changes: read.changes,
-            rescan_subtrees: true,
-            next_history_token: Some(
-                HistoryToken::Fsevents {
-                    event_id: next_event_id,
-                }
-                .encode(),
-            ),
-        },
+    let Ok(read) = history else {
+        return Ok(full_assessment(IndexTrustState::HistoryUnavailable));
+    };
+    let (rescan_subtrees, next_event_id) = match read.decision {
+        FseventsBatchDecision::Incremental { next_event_id } => (false, next_event_id),
+        FseventsBatchDecision::RescanSubtrees { next_event_id } => (true, next_event_id),
         FseventsBatchDecision::FullScan {
             reason: FseventsFallbackReason::RootChanged,
-        } => full_assessment(IndexTrustState::RootChanged),
+        } => return Ok(full_assessment(IndexTrustState::RootChanged)),
         FseventsBatchDecision::FullScan { .. } => {
-            full_assessment(IndexTrustState::HistoryDiscontinuous)
+            return Ok(full_assessment(IndexTrustState::HistoryDiscontinuous))
         }
-    }
+    };
+    Ok(MacosIndexTrustAssessment {
+        decision: evidence_decision(true, true, true, true, true),
+        changes: to_scan_root_changes(device_relative_root, read.changes)?,
+        rescan_subtrees,
+        next_history_token: Some(
+            HistoryToken::Fsevents {
+                event_id: next_event_id,
+            }
+            .encode(),
+        ),
+        baseline_scan_id: Some(baseline_scan_id),
+        checkpoint: Some(checkpoint.clone()),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -155,6 +186,8 @@ pub fn assess_macos_index_trust(
                     changes: Vec::new(),
                     rescan_subtrees: false,
                     next_history_token: None,
+                    baseline_scan_id: None,
+                    checkpoint: None,
                 })
             }
         };
@@ -171,12 +204,12 @@ pub fn assess_macos_index_trust(
             max_changes,
             timeout,
         );
-        Ok(evaluate_history(
+        evaluate_history(
             &checkpoint,
-            &current_volume_identity,
-            &current_root_identity,
+            (&current_volume_identity, &current_root_identity),
+            &crate::incremental_paths::device_relative_root(&canonical_root)?,
             history,
-        ))
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -189,6 +222,7 @@ pub fn assess_macos_index_trust(
 mod tests {
     use super::*;
     use crate::macos_fsevents::{FseventsEvent, FseventsFallbackReason};
+    use std::path::PathBuf;
 
     fn checkpoint() -> IndexCheckpoint {
         IndexCheckpoint {
@@ -198,14 +232,29 @@ mod tests {
             root_identity: "root-1".to_owned(),
             history_source: "fsevents".to_owned(),
             history_token: HistoryToken::Fsevents { event_id: 10 }.encode(),
+            baseline_scan_id: Some(1),
             updated_at: 1,
         }
     }
 
+    fn unwrapped(result: Result<MacosIndexTrustAssessment, String>) -> MacosIndexTrustAssessment {
+        result.expect("解釈できる変更履歴は評価できる必要があります")
+    }
+
+    /// FSEventsはdevice-relative pathを返す。走査rootはvolume rootより下にある。
+    const DEVICE_RELATIVE_ROOT: &str = "Volumes/Data";
+
     fn history(decision: FseventsBatchDecision) -> Result<FseventsHistoryRead, String> {
+        changed_history(decision, "Volumes/Data/changed.txt")
+    }
+
+    fn changed_history(
+        decision: FseventsBatchDecision,
+        change: &str,
+    ) -> Result<FseventsHistoryRead, String> {
         Ok(FseventsHistoryRead {
             changes: vec![CollectedFseventsChange {
-                relative_path: "changed.txt".into(),
+                relative_path: change.into(),
                 event: FseventsEvent {
                     event_id: 11,
                     flags: 0,
@@ -229,12 +278,12 @@ mod tests {
 
     #[test]
     fn accepts_matching_continuous_history_and_advances_token() {
-        let assessment = evaluate_history(
+        let assessment = unwrapped(evaluate_history(
             &checkpoint(),
-            "volume-1",
-            "root-1",
+            ("volume-1", "root-1"),
+            Path::new(DEVICE_RELATIVE_ROOT),
             history(FseventsBatchDecision::Incremental { next_event_id: 11 }),
-        );
+        ));
         assert_eq!(assessment.decision.state, IndexTrustState::Trusted);
         assert_eq!(
             assessment.next_history_token.as_deref(),
@@ -246,62 +295,154 @@ mod tests {
 
     #[test]
     fn preserves_subtree_rescan_requirement() {
-        let assessment = evaluate_history(
+        let assessment = unwrapped(evaluate_history(
             &checkpoint(),
-            "volume-1",
-            "root-1",
+            ("volume-1", "root-1"),
+            Path::new(DEVICE_RELATIVE_ROOT),
             history(FseventsBatchDecision::RescanSubtrees { next_event_id: 11 }),
-        );
+        ));
         assert_eq!(assessment.decision.state, IndexTrustState::Trusted);
         assert!(assessment.rescan_subtrees);
     }
 
     #[test]
     fn rejects_identity_changes_before_accepting_history() {
-        let volume = evaluate_history(
+        let volume = unwrapped(evaluate_history(
             &checkpoint(),
-            "volume-2",
-            "root-1",
+            ("volume-2", "root-1"),
+            Path::new(DEVICE_RELATIVE_ROOT),
             history(FseventsBatchDecision::Incremental { next_event_id: 11 }),
-        );
+        ));
         assert_eq!(volume.decision.state, IndexTrustState::VolumeChanged);
         assert!(volume.changes.is_empty());
 
-        let root = evaluate_history(
+        let root = unwrapped(evaluate_history(
             &checkpoint(),
-            "volume-1",
-            "root-2",
+            ("volume-1", "root-2"),
+            Path::new(DEVICE_RELATIVE_ROOT),
             history(FseventsBatchDecision::Incremental { next_event_id: 11 }),
-        );
+        ));
         assert_eq!(root.decision.state, IndexTrustState::RootChanged);
     }
 
     #[test]
     fn maps_history_failures_to_full_scan_states() {
-        let unavailable = evaluate_history(
+        let unavailable = unwrapped(evaluate_history(
             &checkpoint(),
-            "volume-1",
-            "root-1",
+            ("volume-1", "root-1"),
+            Path::new(DEVICE_RELATIVE_ROOT),
             Err("timeout".to_owned()),
-        );
+        ));
         assert_eq!(
             unavailable.decision.state,
             IndexTrustState::HistoryUnavailable
         );
 
-        let dropped = evaluate_history(
+        let dropped = unwrapped(evaluate_history(
             &checkpoint(),
-            "volume-1",
-            "root-1",
+            ("volume-1", "root-1"),
+            Path::new(DEVICE_RELATIVE_ROOT),
             history(FseventsBatchDecision::FullScan {
                 reason: FseventsFallbackReason::KernelDropped,
             }),
-        );
+        ));
         assert_eq!(
             dropped.decision.state,
             IndexTrustState::HistoryDiscontinuous
         );
         assert_eq!(dropped.decision.recommendation, ScanRecommendation::Full);
+    }
+
+    #[test]
+    fn converts_change_paths_to_scan_root_relative_paths() {
+        let assessment = unwrapped(evaluate_history(
+            &checkpoint(),
+            ("volume-1", "root-1"),
+            Path::new(DEVICE_RELATIVE_ROOT),
+            changed_history(
+                FseventsBatchDecision::Incremental { next_event_id: 11 },
+                "Volumes/Data/nested/changed.txt",
+            ),
+        ));
+        assert_eq!(
+            assessment.changes[0].relative_path,
+            PathBuf::from("nested/changed.txt")
+        );
+
+        let root_itself = unwrapped(evaluate_history(
+            &checkpoint(),
+            ("volume-1", "root-1"),
+            Path::new(DEVICE_RELATIVE_ROOT),
+            changed_history(
+                FseventsBatchDecision::Incremental { next_event_id: 11 },
+                "Volumes/Data",
+            ),
+        ));
+        assert_eq!(root_itself.changes[0].relative_path, PathBuf::from("."));
+    }
+
+    #[test]
+    fn drops_changes_outside_the_scan_root() {
+        for outside in ["Volumes", "Volumes/Other/file", "Volumes/DataSet/file"] {
+            let assessment = unwrapped(evaluate_history(
+                &checkpoint(),
+                ("volume-1", "root-1"),
+                Path::new(DEVICE_RELATIVE_ROOT),
+                changed_history(
+                    FseventsBatchDecision::Incremental { next_event_id: 11 },
+                    outside,
+                ),
+            ));
+            assert!(assessment.changes.is_empty(), "{outside}");
+            assert_eq!(assessment.decision.state, IndexTrustState::Trusted);
+        }
+    }
+
+    #[test]
+    fn fails_closed_when_a_change_path_cannot_be_interpreted() {
+        for invalid in ["/Volumes/Data/file", "../file", ""] {
+            assert!(
+                evaluate_history(
+                    &checkpoint(),
+                    ("volume-1", "root-1"),
+                    Path::new(DEVICE_RELATIVE_ROOT),
+                    changed_history(
+                        FseventsBatchDecision::Incremental { next_event_id: 11 },
+                        invalid,
+                    ),
+                )
+                .is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_a_full_scan_until_the_checkpoint_names_a_baseline() {
+        let mut without_baseline = checkpoint();
+        without_baseline.baseline_scan_id = None;
+        let assessment = unwrapped(evaluate_history(
+            &without_baseline,
+            ("volume-1", "root-1"),
+            Path::new(DEVICE_RELATIVE_ROOT),
+            history(FseventsBatchDecision::Incremental { next_event_id: 11 }),
+        ));
+        assert_eq!(
+            assessment.decision.state,
+            IndexTrustState::InitialScanRequired
+        );
+        assert!(assessment.baseline_scan_id.is_none());
+    }
+
+    #[test]
+    fn reports_the_baseline_scan_the_checkpoint_points_at() {
+        let assessment = unwrapped(evaluate_history(
+            &checkpoint(),
+            ("volume-1", "root-1"),
+            Path::new(DEVICE_RELATIVE_ROOT),
+            history(FseventsBatchDecision::Incremental { next_event_id: 11 }),
+        ));
+        assert_eq!(assessment.baseline_scan_id, Some(1));
     }
 
     #[test]

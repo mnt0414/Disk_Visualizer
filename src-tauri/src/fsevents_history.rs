@@ -23,10 +23,8 @@ mod platform {
         FSEventStreamInvalidate, FSEventStreamRef, FSEventStreamRelease,
         FSEventStreamSetDispatchQueue, FSEventStreamStart, FSEventStreamStop,
     };
-    use std::ffi::{c_void, CStr, CString, OsStr};
-    use std::os::unix::ffi::OsStrExt;
+    use std::ffi::{c_void, CStr};
     use std::os::unix::fs::MetadataExt;
-    use std::path::PathBuf;
     use std::ptr::NonNull;
     use std::time::Instant;
 
@@ -117,13 +115,10 @@ mod platform {
             .dev()
             .try_into()
             .map_err(|_| "FSEventsのdevice IDが対応範囲外です".to_owned())?;
-        let mount_point = mount_point(&canonical_root)?;
-        let relative_root = device_relative_root(&canonical_root, &mount_point)?;
-        let native_root = if relative_root.is_empty() {
-            "."
-        } else {
-            &relative_root
-        };
+        let relative_root = crate::incremental_paths::device_relative_root(&canonical_root)?;
+        let native_root = relative_root
+            .to_str()
+            .ok_or_else(|| "FSEventsの走査rootはUTF-8で表現できる必要があります".to_owned())?;
         let path = CFString::from_str(native_root);
         let paths = CFArray::from_retained_objects(&[path]);
         let collector = Box::new(FseventsCallbackCollector::new(max_changes)?);
@@ -196,59 +191,6 @@ mod platform {
 
     fn callback_failure_message(failure: FseventsCallbackFailure) -> String {
         format!("FSEvents callback batchを安全に収集できません: {failure:?}")
-    }
-
-    fn mount_point(root: &Path) -> Result<PathBuf, String> {
-        let root_c = CString::new(root.as_os_str().as_bytes())
-            .map_err(|_| "FSEventsの走査rootにNULが含まれています".to_owned())?;
-        let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        if unsafe { libc::statfs(root_c.as_ptr(), info.as_mut_ptr()) } != 0 {
-            return Err(format!(
-                "FSEventsのmount pointを取得できません: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let info = unsafe { info.assume_init() };
-        let bytes = unsafe { CStr::from_ptr(info.f_mntonname.as_ptr()) }.to_bytes();
-        let mount = PathBuf::from(OsStr::from_bytes(bytes));
-        if root.starts_with(&mount) {
-            Ok(mount)
-        } else {
-            Ok(PathBuf::from("/"))
-        }
-    }
-
-    fn device_relative_root(root: &Path, mount_point: &Path) -> Result<String, String> {
-        let relative = root.strip_prefix(mount_point).map_err(|_| {
-            format!(
-                "FSEventsの走査root {} をmount point {} から相対化できません",
-                root.display(),
-                mount_point.display()
-            )
-        })?;
-        relative
-            .to_str()
-            .map(|path| path.trim_matches('/').to_owned())
-            .ok_or_else(|| "FSEventsの走査rootはUTF-8で表現できる必要があります".to_owned())
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn creates_device_relative_paths_without_parent_escape() {
-            assert_eq!(
-                device_relative_root(Path::new("/Volumes/Data/work"), Path::new("/Volumes/Data"))
-                    .unwrap(),
-                "work"
-            );
-            assert_eq!(
-                device_relative_root(Path::new("/"), Path::new("/")).unwrap(),
-                ""
-            );
-            assert!(device_relative_root(Path::new("/other"), Path::new("/Volumes/Data")).is_err());
-        }
     }
 }
 

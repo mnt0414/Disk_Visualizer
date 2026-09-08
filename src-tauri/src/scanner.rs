@@ -58,7 +58,7 @@ pub struct ScanSummary {
 }
 
 #[derive(Default)]
-struct Totals {
+pub(crate) struct Totals {
     size: u64,
     allocated: u64,
     files: u64,
@@ -84,13 +84,13 @@ impl Totals {
     }
 }
 
-struct SeenFileStore {
+pub(crate) struct SeenFileStore {
     connection: Connection,
     path: PathBuf,
 }
 
 impl SeenFileStore {
-    fn new() -> Result<Self, String> {
+    pub(crate) fn new() -> Result<Self, String> {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())?
@@ -145,7 +145,7 @@ fn next_entry(stack: &mut Vec<DirectoryFrame>) -> Option<(PathBuf, Result<DirEnt
     }
 }
 
-fn crosses_volume(root: Option<&str>, current: Option<&str>) -> bool {
+pub(crate) fn crosses_volume(root: Option<&str>, current: Option<&str>) -> bool {
     match (root, current) {
         (Some(root), Some(current)) => root != current,
         (Some(_), None) => true,
@@ -175,7 +175,7 @@ fn skipped<P: FnMut(&ScanProgress)>(
     });
 }
 
-fn scan_entry<C, P>(
+pub(crate) fn scan_entry<C, P>(
     entry: DirEntry,
     relative_path: PathBuf,
     root: &Path,

@@ -130,7 +130,7 @@ impl ScanRepository {
                 self.consistent_backup(&connection, "sqlite3.v5-backup")?;
                 Self::migrate_v5_to_v6(&connection)?
             }
-            6 | 7 => {}
+            6..=8 => {}
             other => return Err(format!("未対応のスキャン履歴バージョンです: {other}")),
         }
         let check: String = connection
@@ -309,7 +309,14 @@ impl ScanRepository {
             return Err("実行中のスキャン履歴を確定できません".to_owned());
         }
         if let Some(checkpoint) = checkpoint {
-            upsert_checkpoint(&transaction, checkpoint)?;
+            // 完了したsession自身を、次回の差分更新が使う基準として記録する。
+            upsert_checkpoint(
+                &transaction,
+                &IndexCheckpoint {
+                    baseline_scan_id: Some(scan_id),
+                    ..checkpoint.clone()
+                },
+            )?;
         }
         transaction
             .commit()
@@ -363,8 +370,7 @@ impl ScanRepository {
             .map_err(|e| e.to_string())?;
         Ok(result == "ok")
     }
-    #[cfg(test)]
-    fn path(&self) -> &std::path::Path {
+    pub(crate) fn path(&self) -> &std::path::Path {
         &self.database_path
     }
     #[cfg(test)]
@@ -395,6 +401,10 @@ fn observation_from_progress(progress: &ScanProgress) -> Option<CacheObservation
 }
 
 impl StreamingScanWriter {
+    /// 書き込み中のscan session ID。完了後の参照先として呼び出し側へ渡す。
+    pub(crate) fn scan_id(&self) -> i64 {
+        self.scan_id
+    }
     pub(crate) fn record(&self, progress: &ScanProgress) {
         if progress.file_count == 0 && progress.directory_count == 0 && progress.skipped_count == 0
         {
@@ -583,14 +593,20 @@ mod tests {
             root_identity: "42".to_owned(),
             history_source: "fsevents".to_owned(),
             history_token: "fsevents:v1:10".to_owned(),
+            baseline_scan_id: None,
             updated_at: 1234,
         };
         writer
             .complete_with_checkpoint(&summary(1), Some(&checkpoint))
             .unwrap();
+        let saved = checkpoint_repository.load("/tmp/sample").unwrap().unwrap();
+        assert_eq!(saved.baseline_scan_id, Some(writer.scan_id));
         assert_eq!(
-            checkpoint_repository.load("/tmp/sample").unwrap(),
-            Some(checkpoint)
+            saved,
+            IndexCheckpoint {
+                baseline_scan_id: Some(writer.scan_id),
+                ..checkpoint
+            }
         );
         assert_eq!(repository.list().unwrap().len(), 1);
         let _ = std::fs::remove_file(repository.path());
@@ -610,6 +626,7 @@ mod tests {
             root_identity: "42".to_owned(),
             history_source: "fsevents".to_owned(),
             history_token: String::new(),
+            baseline_scan_id: None,
             updated_at: 1234,
         };
         assert!(writer
