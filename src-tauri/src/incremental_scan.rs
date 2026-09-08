@@ -1,9 +1,9 @@
 use crate::file_metrics;
 use crate::incremental_rescan::{escalate_to_subtrees, IncrementalRescanTarget};
 use crate::incremental_storage::{IncrementalEntry, IncrementalStaging};
-use crate::scanner::{crosses_volume, scan_entry, ScanProgress, SeenFileStore};
+use crate::scanner::{is_read_failure, scan_entry, ScanProgress, SeenFileStore};
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, Metadata};
+use cap_std::fs::{Dir, DirEntry, Metadata};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -22,6 +22,38 @@ enum ResolvedParent {
     Directory(Dir),
     /// 走査rootの走査結果に行が現れない状態。置換は空になる。
     Absent,
+}
+
+/// 親directoryが走査rootと同じvolumeに属するかの判定。
+enum ParentVolume {
+    /// 同じvolume、またはroot側にidentityが無く境界を判定しない構成。
+    Inside,
+    /// 別volumeだと確認できた。フルスキャンも降りないので行は現れない。
+    Outside,
+    /// identityを取得できず、同じvolumeかを保証できない。
+    Unknown,
+}
+
+/// volume identityの組から親directoryの扱いを決める。
+///
+/// 別volumeだと確認できたときだけ「行が存在しない」と扱える。identityが取れない
+/// 状態を消失や確認済みの別volumeと同じ扱いにすると、読めなかった部分木を
+/// 削除として確定してしまう。
+fn parent_volume_scope(root: Option<&str>, current: Option<&str>) -> ParentVolume {
+    match (root, current) {
+        (Some(root), Some(current)) if root != current => ParentVolume::Outside,
+        (Some(_), None) => ParentVolume::Unknown,
+        _ => ParentVolume::Inside,
+    }
+}
+
+/// 完全な置換結果を保証できないskipを、確定前の失敗として拾い上げる。
+///
+/// フルスキャンは読取失敗もskip行として残せる。部分再走査は対象部分木を丸ごと
+/// 置き換えるので、読めなかった範囲が欠けたまま確定すると消失として適用される。
+fn incomplete_replacement(progress: &ScanProgress) -> Option<String> {
+    let reason = progress.skip_reason?;
+    is_read_failure(reason).then(|| format!("部分再走査targetを完全に読み取れません（{reason}）"))
 }
 
 fn entry_from_progress(progress: &ScanProgress) -> IncrementalEntry {
@@ -98,21 +130,26 @@ fn open_relative_directory(
         if !is_same_directory(&link, &opened)? {
             return Err("部分再走査targetの親が確認した対象と一致しません".to_owned());
         }
-        if crosses_volume(root_volume_identity, volume_identity.as_deref()) {
-            return Ok(ResolvedParent::Absent);
+        match parent_volume_scope(root_volume_identity, volume_identity.as_deref()) {
+            ParentVolume::Inside => {}
+            ParentVolume::Outside => return Ok(ResolvedParent::Absent),
+            ParentVolume::Unknown => {
+                return Err("部分再走査targetの親のvolumeを確認できません".to_owned())
+            }
         }
         current = child;
     }
     Ok(ResolvedParent::Directory(current))
 }
 
-/// directory直下を1回だけ走査し、要求された名前にbyte一致したentryを再走査する。
+/// directory直下の列挙結果を1回だけ走査し、要求された名前にbyte一致したentryを再走査する。
 ///
 /// `wanted` が `None` のときはroot全体の置換なので全entryを走査する。戻り値は
 /// 実際に一致した名前で、残りは消失かfail closedかを呼び出し側が判別する。
-fn scan_directory<C, P>(
+/// 列挙itereatorを引数に取るのは、列挙自体の失敗をテストで注入できるようにするため。
+fn scan_directory<C, P, E>(
     context: &RescanContext<'_>,
-    directory: &Dir,
+    entries: E,
     parent_relative: &Path,
     wanted: Option<&[OsString]>,
     handlers: (&mut C, &mut P),
@@ -120,20 +157,18 @@ fn scan_directory<C, P>(
 where
     C: FnMut() -> bool,
     P: FnMut(&ScanProgress),
+    E: Iterator<Item = std::io::Result<DirEntry>>,
 {
     let (control, progress) = handlers;
-    let entries = directory
-        .entries()
-        .map_err(|error| format!("部分再走査targetの親を読み取れません: {error}"))?;
     let mut matched = Vec::new();
     for entry in entries {
         if !control() {
             return Err("スキャンはキャンセルされました".to_owned());
         }
-        // 読めなかったentryは名前が分からない。要求名の生死は後段の再確認で判定する。
-        let Ok(entry) = entry else {
-            continue;
-        };
+        // 読めなかったentryは名前が分からない。この列挙結果を完全な置換の材料に
+        // できないので、消失扱いへ倒さずここで失敗させる。
+        let entry =
+            entry.map_err(|error| format!("部分再走査targetのentryを読み取れません: {error}"))?;
         let name = entry.file_name();
         if let Some(wanted) = wanted {
             if !wanted.contains(&name) {
@@ -152,6 +187,13 @@ where
         )?;
     }
     Ok(matched)
+}
+
+/// 置換対象を含むdirectoryの列挙を開く。読み取れなければ置換を組み立てない。
+fn directory_entries(directory: &Dir) -> Result<cap_std::fs::ReadDir, String> {
+    directory
+        .entries()
+        .map_err(|error| format!("部分再走査targetのdirectoryを読み取れません: {error}"))
 }
 
 /// 一致しなかった要求名が本当に消失したのかを確認する。
@@ -228,19 +270,26 @@ where
                 return;
             }
             observe(progress);
+            // 読めなかった範囲を含む結果は、置換として確定できない。
+            if let Some(error) = incomplete_replacement(progress) {
+                *failure.borrow_mut() = Some(error);
+                return;
+            }
             if let Err(error) = staging.record(&entry_from_progress(progress)) {
                 *failure.borrow_mut() = Some(error);
             }
         };
         if replaces_root {
-            scan_directory(
-                &context,
-                &root_directory,
-                Path::new(""),
-                None,
-                (&mut keep_going, &mut record),
-            )
-            .map(|_| ())
+            directory_entries(&root_directory).and_then(|entries| {
+                scan_directory(
+                    &context,
+                    entries,
+                    Path::new(""),
+                    None,
+                    (&mut keep_going, &mut record),
+                )
+                .map(|_| ())
+            })
         } else {
             rescan_groups(
                 &context,
@@ -277,7 +326,7 @@ where
         };
         let matched = scan_directory(
             context,
-            &directory,
+            directory_entries(&directory)?,
             &parent,
             Some(&names),
             (control, progress),
@@ -297,7 +346,6 @@ mod tests {
     use crate::storage::ScanRepository;
     use rusqlite::Connection;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_root(name: &str) -> PathBuf {
@@ -377,6 +425,9 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// symlinkの作成に管理者権限が要るWindowsでは、junctionを使う別のfixtureが要る。
+    /// ここではUnixのsymlinkだけを対象にし、共通テストごと落とさない。
+    #[cfg(unix)]
     #[test]
     fn does_not_follow_a_directory_replaced_by_a_symlink() {
         let root = temporary_root("link-replacement");
@@ -398,21 +449,6 @@ mod tests {
         fs::write(root.join("top.txt"), b"12").unwrap();
         let rows = staged(&root, &[".", "dir"]).unwrap();
         assert_eq!(paths(&rows), ["dir", "dir/child.txt", "top.txt"]);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn fails_closed_when_a_target_cannot_be_read() {
-        let root = temporary_root("unreadable");
-        fs::create_dir_all(root.join("dir")).unwrap();
-        fs::write(root.join("dir/child.txt"), b"1234").unwrap();
-        fs::set_permissions(root.join("dir"), fs::Permissions::from_mode(0o000)).unwrap();
-        let failure = match staged(&root, &["dir/child.txt"]) {
-            Err(error) => error,
-            Ok(_) => String::new(),
-        };
-        fs::set_permissions(root.join("dir"), fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(failure.contains("部分再走査target"), "{failure}");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -690,5 +726,210 @@ mod tests {
         assert!(rescan_targets(&root, &[target("../outside")], || true, |_| {}).is_err());
         assert!(rescan_targets(&root, &[target("")], || true, |_| {}).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 失敗を注入して、列挙エラーの扱いを権限に頼らず決定論的に確かめる。
+    fn injected_entries() -> impl Iterator<Item = std::io::Result<DirEntry>> {
+        std::iter::once(Err(std::io::Error::other("注入した列挙失敗")))
+    }
+
+    /// entry列挙が失敗したら、root全置換でもgroup置換でも結果を確定しない。
+    #[test]
+    fn fails_when_the_entry_enumeration_reports_an_error() {
+        let root = temporary_root("enumeration");
+        let seen_files = SeenFileStore::new().unwrap();
+        let context = RescanContext {
+            root: &root,
+            root_volume_identity: None,
+            seen_files: &seen_files,
+        };
+        let mut keep_going = || true;
+        let mut record = |_: &ScanProgress| {};
+        let whole_root = scan_directory(
+            &context,
+            injected_entries(),
+            Path::new(""),
+            None,
+            (&mut keep_going, &mut record),
+        );
+        let group = scan_directory(
+            &context,
+            injected_entries(),
+            Path::new(""),
+            Some(&[OsString::from("child.txt")]),
+            (&mut keep_going, &mut record),
+        );
+        fs::remove_dir_all(&root).unwrap();
+        for outcome in [whole_root, group] {
+            let failure = match outcome {
+                Err(failure) => failure,
+                Ok(matched) => panic!("列挙失敗を握りつぶした: {matched:?}"),
+            };
+            assert!(failure.contains("注入した列挙失敗"), "{failure}");
+        }
+    }
+
+    /// identity不明を、消失や確認済みの別volumeと同じ扱いにしない。
+    #[test]
+    fn separates_an_unknown_volume_identity_from_a_confirmed_other_volume() {
+        assert!(matches!(
+            parent_volume_scope(Some("volume"), Some("volume")),
+            ParentVolume::Inside
+        ));
+        assert!(matches!(
+            parent_volume_scope(Some("volume"), Some("other")),
+            ParentVolume::Outside
+        ));
+        assert!(matches!(
+            parent_volume_scope(Some("volume"), None),
+            ParentVolume::Unknown
+        ));
+    }
+
+    fn skip_progress(reason: &'static str) -> ScanProgress {
+        ScanProgress {
+            path: PathBuf::from("dir"),
+            file_count: 0,
+            directory_count: 0,
+            skipped_count: 1,
+            skip_reason: Some(reason),
+            counted_size_bytes: 0,
+            logical_size_bytes: 0,
+            allocated_size_bytes: None,
+            file_identity: None,
+            volume_identity: None,
+            modified_at: None,
+        }
+    }
+
+    /// 走査中にidentityを取得できなかったentryも、置換結果として受理しない。
+    #[test]
+    fn rejects_a_replacement_that_could_not_be_read_completely() {
+        for reason in [
+            crate::scanner::SKIP_VOLUME_IDENTITY_UNAVAILABLE,
+            crate::scanner::SKIP_METADATA_UNAVAILABLE,
+            crate::scanner::SKIP_DIRECTORY_ENTRY_UNREADABLE,
+            crate::scanner::SKIP_DIRECTORY_UNREADABLE,
+        ] {
+            let rejection = incomplete_replacement(&skip_progress(reason));
+            assert_eq!(
+                rejection,
+                Some(format!(
+                    "部分再走査targetを完全に読み取れません（{reason}）"
+                ))
+            );
+        }
+        for reason in [
+            crate::scanner::SKIP_LINK_NOT_FOLLOWED,
+            crate::scanner::SKIP_DIFFERENT_VOLUME,
+            crate::scanner::SKIP_UNSUPPORTED_ENTRY_TYPE,
+        ] {
+            assert_eq!(
+                incomplete_replacement(&skip_progress(reason)),
+                None,
+                "{reason}"
+            );
+        }
+    }
+
+    /// 読取失敗を正常な差分置換として確定しないことを確かめる。
+    ///
+    /// 権限を落とすのはこのfixture配下のpathだけで、実データには触れない。
+    #[cfg(unix)]
+    mod read_failures {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn deny_access(path: &Path) {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        fn allow_access(path: &Path) {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        /// 権限を戻してから結果を判定する。判定でpanicしてもfixtureを残さない。
+        fn staged_while_denied(
+            root: &Path,
+            denied: &Path,
+            targets: &[&str],
+        ) -> Result<Vec<(String, String)>, String> {
+            deny_access(denied);
+            let outcome = staged(root, targets);
+            allow_access(denied);
+            outcome
+        }
+
+        fn failure(outcome: Result<Vec<(String, String)>, String>) -> String {
+            match outcome {
+                Err(failure) => failure,
+                Ok(rows) => panic!("読取失敗を置換結果として確定した: {rows:?}"),
+            }
+        }
+
+        #[test]
+        fn fails_when_the_target_directory_cannot_be_opened() {
+            let root = temporary_root("denied-target");
+            fs::create_dir_all(root.join("dir")).unwrap();
+            fs::write(root.join("dir/child.txt"), b"1234").unwrap();
+            let outcome = staged_while_denied(&root, &root.join("dir"), &["dir"]);
+            fs::remove_dir_all(&root).unwrap();
+            let failure = failure(outcome);
+            assert!(
+                failure.contains("directory_replaced_or_unreadable"),
+                "{failure}"
+            );
+        }
+
+        #[test]
+        fn fails_when_a_directory_inside_the_target_cannot_be_read() {
+            let root = temporary_root("denied-inner");
+            fs::create_dir_all(root.join("dir/inner")).unwrap();
+            fs::write(root.join("dir/inner/child.txt"), b"1234").unwrap();
+            let outcome = staged_while_denied(&root, &root.join("dir/inner"), &["dir"]);
+            fs::remove_dir_all(&root).unwrap();
+            let failure = failure(outcome);
+            assert!(
+                failure.contains("directory_replaced_or_unreadable"),
+                "{failure}"
+            );
+        }
+
+        #[test]
+        fn fails_when_a_file_snapshot_cannot_be_taken() {
+            let root = temporary_root("denied-file");
+            fs::write(root.join("file.bin"), b"1234").unwrap();
+            let outcome = staged_while_denied(&root, &root.join("file.bin"), &["file.bin"]);
+            fs::remove_dir_all(&root).unwrap();
+            let failure = failure(outcome);
+            assert!(failure.contains("file_snapshot_unavailable"), "{failure}");
+        }
+
+        /// 親directoryを開けないときは、target部分木を消失として確定しない。
+        #[test]
+        fn fails_closed_when_a_target_cannot_be_read() {
+            let root = temporary_root("unreadable");
+            fs::create_dir_all(root.join("dir")).unwrap();
+            fs::write(root.join("dir/child.txt"), b"1234").unwrap();
+            let outcome = staged_while_denied(&root, &root.join("dir"), &["dir/child.txt"]);
+            fs::remove_dir_all(&root).unwrap();
+            let failure = failure(outcome);
+            assert!(failure.contains("部分再走査target"), "{failure}");
+        }
+
+        /// 消失とリンク除外は読取失敗ではない。従来どおり置換結果へ反映する。
+        #[test]
+        fn still_applies_a_real_deletion_and_an_excluded_link() {
+            let root = temporary_root("normal-exclusions");
+            let outside = temporary_root("normal-exclusions-target");
+            fs::write(outside.join("secret.bin"), b"12345678").unwrap();
+            fs::create_dir_all(root.join("gone")).unwrap();
+            fs::remove_dir_all(root.join("gone")).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+            let rows = staged(&root, &["gone", "link"]).unwrap();
+            assert_eq!(rows, [("link".to_owned(), "other".to_owned())]);
+            fs::remove_dir_all(&root).unwrap();
+            fs::remove_dir_all(&outside).unwrap();
+        }
     }
 }

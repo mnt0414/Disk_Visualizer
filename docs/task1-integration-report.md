@@ -4,6 +4,7 @@
 
 2026-09-08。個別に実装済みだった構成要素を、FSEvents履歴の取得からSQLiteスナップショット確定までの
 一本の差分更新経路として接続し、続けて統合コードの安全性を再レビューして不足を修正した。
+さらに再レビューの指摘3件（R1〜R3）を修正した（「レビュー指摘R1〜R3の修正」）。
 
 実施した検証は次の範囲に限る。「Mac検証完了」とは扱わない。
 
@@ -24,7 +25,8 @@ Windows実機、二重OS CI、上限値の実値でのメモリ・時間計測�
 - plannerの境界修正：02ae78d（`docs/task1-planner-report.md`）
 - 作業ブランチ：feat/task1-incremental-integration-20260907（02ae78dから作成）
 - 統合コミット：43d8d63（実装）、3bba18c（本報告書の初版）
-- 安全性再レビューによる修正：3bba18c以降の作業ツリー変更（未コミット）
+- 安全性再レビューによる修正：03db83d
+- レビュー指摘R1〜R3の修正：03db83d以降の作業ツリー変更（未コミット）
 
 ## 変更内容と根拠
 
@@ -186,9 +188,15 @@ matches_a_fresh_full_scan_after_changes_stop
 3. 確定transaction開始後：キャンセルを受け付けない。成功した確定を後からキャンセル扱いへ
    落とすことはしない。
 
-この境界にテスト専用のフック（`run_incremental_with_hook`）を置き、
-`std::sync::mpsc::sync_channel(0)`のrendezvousで実スレッドを確実に止めてから操作する。
-同期関数の直接呼出しではなく、実際のworker threadの順序を制御した決定論的なテストになっている。
+この境界にテスト専用のフックを置き、`std::sync::mpsc::sync_channel(0)`のrendezvousで
+実スレッドを確実に止めてから操作する。同期関数の直接呼出しではなく、実際のworker threadの
+順序を制御した決定論的なテストになっている。
+
+上の2.には「中断要求の再確認を通ったあとにcancelが成功する」隙間が残っていた。指摘R3で
+`ScanJob::begin_finalizing`を入れ、再確認と確定フェーズ入りを同じcontrol lock区間にまとめて閉じた。
+フックは`run_incremental_with_hooks`の2点（確定フェーズの直前・直後）になり、下記のテストも
+control構造体を直接書き換えるのではなく`ScanManager`のAPIを呼ぶ形へ書き換えた。詳細は
+「レビュー指摘R1〜R3の修正」のR3。
 
 - `cancels_at_the_last_moment_before_the_commit`（境界で止めてからcancel。sessionもcheckpointも動かない）
 - `defers_the_commit_while_paused_and_finishes_after_resume`（境界で止めてpause→resume→確定）
@@ -237,6 +245,186 @@ targetに含めない）、directoryからfileへの型変更、変更のないd
   「スキャン履歴をv8へ移行できません: duplicate column name: baseline_scan_id」で失敗し、
   `user_version`は7のまま（次回起動で同じ移行を再試行できる）、既存の履歴も残り、
   移行前バックアップは`PRAGMA quick_check`が`ok`を返す健全な状態で残る。
+
+## レビュー指摘R1〜R3の修正
+
+安全性再レビュー（03db83d）に対する指摘3件への対応。いずれも先に落ちるテストを用意し、
+修正後に通ること、修正を1点だけ戻すと再び落ちること（感度）を確認している。
+
+### R1：読取失敗を正常な差分置換として確定しない
+
+**指摘**：共有scannerはmetadata失敗やdirectory読取失敗も`skip`として返す。部分再走査はそれを
+stagingへ受理するため、不完全な部分木でbaselineを置換しcheckpointを進め得る。
+`scan_directory`はentry列挙エラーを`continue`で捨てていた。
+
+**原因**：skipの理由が文字列リテラルで散在し、「意図した除外」と「読取失敗」を区別する契約が
+無かった。フルスキャンはどちらもskip行として残せばよいが、部分再走査は対象部分木を丸ごと
+置き換えるため、この区別が無いと「読めなかった」が「存在しない」として確定される。
+
+**修正**：
+
+- `scanner.rs`：skip理由を定数化し、`is_read_failure`で判別する。意図した除外は
+  `link_not_followed`／`different_volume`／`unsupported_entry_type`の3つだけで、
+  未知の理由を含むそれ以外はすべて読取失敗側へ倒す。フルスキャンの挙動は変えていない
+  （従来どおりskip行として残し、配下へは降りない）。
+- `incremental_scan.rs`：`incomplete_replacement`で読取失敗のskipを見た時点で差分全体を失敗させる。
+  stagingへ入れず、session確定もcheckpoint更新も行わない。
+- `scan_directory`を列挙iterator受け取りに変え、entry列挙エラーを`continue`せずErrで返す。
+  root全置換も`directory_entries`経由で同じ経路を通るので、同じく握りつぶさない。
+- 親のvolume判定を`crosses_volume`から`ParentVolume::{Inside, Outside, Unknown}`へ分けた。
+  identityを取得できない`Unknown`は、消失や確認済みの別volumeと同一視せずErrで失敗させる。
+
+**再現テスト**：権限を落とすテストは`incremental_scan.rs`の`#[cfg(unix)] mod read_failures`に
+集約した。権限操作の対象はfixture配下のpathだけで、判定より先に権限を戻すので、
+判定でpanicしてもfixtureを残さない。実データ・実プロジェクトには触れていない。
+
+| 指摘の要求ケース | テスト |
+|---|---|
+| baselineにdir/childがある状態でtargetをdirにして読取失敗 | `read_failures::fails_closed_when_a_target_cannot_be_read` |
+| targetのdirectory自体を開けない | `read_failures::fails_when_the_target_directory_cannot_be_opened` |
+| target配下の途中directoryで読取失敗 | `read_failures::fails_when_a_directory_inside_the_target_cannot_be_read` |
+| file snapshot取得失敗 | `read_failures::fails_when_a_file_snapshot_cannot_be_taken` |
+| root全置換時のentry列挙失敗 | `fails_when_the_entry_enumeration_reports_an_error`（失敗注入。root全置換とgroup置換の両方） |
+| identity取得失敗 | `separates_an_unknown_volume_identity_from_a_confirmed_other_volume` |
+| 読取失敗と意図した除外の判別 | `rejects_a_replacement_that_could_not_be_read_completely`、`scanner::separates_intended_exclusions_from_read_failures` |
+| 真の消失と正常なリンク除外は従来どおり | `read_failures::still_applies_a_real_deletion_and_an_excluded_link` |
+| ScanManager経路で確定を拒否する | `baseline_updates::refuses_to_commit_when_a_target_cannot_be_read` |
+
+修正前のコードへそのまま掛けられるテスト（`staged`と`scan_directory`だけを使うもの）は、
+修正前に次を観測した。
+
+```
+読取失敗を置換結果として確定した: [("dir", "other")]                                （targetを開けない）
+読取失敗を置換結果として確定した: [("dir", "directory"), ("dir/inner", "other")]     （target配下）
+読取失敗を置換結果として確定した: [("file.bin", "other")]                            （file snapshot）
+列挙失敗を握りつぶした: []                                                            （entry列挙）
+```
+
+`parent_volume_scope`と`incomplete_replacement`は今回追加した関数なので、修正前のコードには
+掛けられない。この2点はガードだけを戻して感度を確認した
+（`assertion failed: matches!(parent_volume_scope(Some("volume"), None), ParentVolume::Unknown)`、
+`left: None / right: Some("部分再走査targetを完全に読み取れません（volume_identity_unavailable）")`）。
+
+**結果**：各失敗ケースで新しい完了sessionができず、baselineとcheckpointが変わらないことを
+確認した。entry列挙失敗は権限に頼らず失敗注入で決定論的に再現している。
+
+### R2：WindowsテストのUnix限定API参照を分離
+
+**指摘**：`incremental_scan.rs`のテストmoduleは`cfg(test)`のみなのに、
+`std::os::unix::fs::PermissionsExt`とUnix symlinkを参照していた。
+
+**修正**：無条件の`use std::os::unix::fs::PermissionsExt;`をテストmoduleから外し、権限操作を使う
+テストを`#[cfg(unix)] mod read_failures`へ集約した。symlinkでdirectoryを差し替える
+`does_not_follow_a_directory_replaced_by_a_symlink`には`#[cfg(unix)]`を付けた
+（Windowsのsymlink作成には追加の権限が要り、junctionを使う別のfixtureが必要になる）。
+共通テスト全体をUnix限定にはしていない。失敗注入・volume判定・置換不完全の判定
+（`fails_when_the_entry_enumeration_reports_an_error`、
+`separates_an_unknown_volume_identity_from_a_confirmed_other_volume`、
+`rejects_a_replacement_that_could_not_be_read_completely`）はcfgなしの共通テストとして残っている。
+
+関連moduleも監査した。`std::os::unix`／`std::os::windows`／`libc::`／`from_mode`を参照するのは
+`file_metrics`、`fsevents_history`、`incremental_paths`、`incremental_scan`、`incremental_trust`、
+`index_checkpoint`、`macos_fsevents`、`scan_jobs`、`scanner`、`windows_usn`の10moduleで、
+いずれも参照が`#[cfg(unix)]`／`#[cfg(windows)]`／`#[cfg(target_os = "macos")]`の配下にある。
+`scan_jobs`のUnix限定参照は`#[cfg(unix)] mod baseline_updates`の中にある。
+
+**未検証**：Windows上での実行。この環境からのクロスコンパイル確認は依存crateの段階で失敗し、
+本crateへ到達しない。
+
+```
+$ cargo check --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml
+cargo:warning=/Library/Developer/CommandLineTools/usr/lib/clang/17/include/mm_malloc.h:13:10:
+  fatal error: 'stdlib.h' file not found
+error occurred in cc-rs: command did not execute successfully （libsqlite3-sys）
+```
+
+MSVC toolchainとWindows SDKヘッダがこのmacOS環境に無いことによるもので、コード側の問題ではない。
+R2は**静的修正済み／実行未確認**とする。Windows検証のためのpushや一時workflowの追加はしていない。
+確認に使った`x86_64-pc-windows-msvc` targetは`rustup target remove`で元へ戻した。
+
+### R3：確定開始とpause／cancel受付終了を原子的にする
+
+**指摘**：最後の`can_continue()`を過ぎても`ScanJobStatus`はRunningのままなので、確定中の
+pause／cancelが成功を返せる。既存のフックは最後の確認より前にあり、この競合を検証していなかった。
+
+**原因**：中断要求の確認（control lockを取る区間）と確定開始が別々の区間になっており、その間に
+`cancel`がcontrol lockを取れた。`state.status`は確定が終わるまで更新されないので、
+`cancel`側の「RunningまたはPausedならキャンセル可」という判定も通ってしまう。
+
+**修正**：
+
+- `Control`に一方向のフラグ`finalizing`を追加し、`ScanJob::begin_finalizing()`が
+  「一時停止中は待つ／キャンセル済みなら入らない／それ以外は`finalizing`を立てる」を
+  ひとつのcontrol lock区間で行う。判定とフラグ立てが分割されないので、`pause`・`cancel`が
+  この境界をまたいで成功することはない。
+- 差分更新の確定は`can_continue()`ではなく`begin_finalizing()`を通る。フルスキャンの保存も
+  同じ境界（`committing`）を通し、両経路で規則をそろえた。
+- `pause`／`cancel`はstate→controlの順でlockし、`finalizing`なら
+  「スキャン結果の確定中は一時停止できません」「スキャン結果の確定中はキャンセルできません」を
+  返す。**新しい`ScanJobStatus`は追加していない**。`src/types/scan.ts`の`ScanJobStatus`と
+  `AsyncScanView`のポーリング条件を壊さないためで、UI側は既存のcatch経路でこの文言を
+  そのまま表示する（公開状態・返却型の変更なし。frontend検証も再実行して通っている）。
+- 確定に成功した結果は`Ok`分岐で必ずCompletedになるので、後からCancelledへ倒れない。
+  確定に失敗した場合もCancelledではなくFailedのままになる。
+- 確定中はstate・controlのどちらのlockも保持しない。DB処理の間も`status`は応答する。
+- lock順序は全経路でstate→controlで、controlを持ったままstateを取る経路は無い。
+  `begin_finalizing`はcondvar待機中にcontrol lockを解放する。
+
+**挙動の変更**：確定フェーズへ入る直前にpauseすると、フルスキャンでも保存がresumeまで遅れる
+（従来は走査完走後のpauseが保存を止めなかった）。差分更新側は従来から同じ挙動。
+
+**再現テスト**：`#[cfg(unix)] mod baseline_updates`にあったcontrolを直接書き換えるhelper
+（`cancel`／`pause`／`resume`）は削除し、すべて実際の`ScanManager::pause`／`resume`／`cancel`／
+`status`を呼ぶようにした。順序は`sync_channel(0)`のrendezvousと`Barrier`で固定しており、
+sleepで待つテストは追加していない。
+
+| 指摘の要求ケース | テスト |
+|---|---|
+| 最後の確認直前 | `baseline_updates::cancels_at_the_last_moment_before_the_commit` |
+| 確定開始との競合 | `baseline_updates::settles_a_cancel_that_races_the_start_of_the_commit`（同じ`Barrier`から同時に発火し、cancelがOkなら未確定、Errなら確定済みであることを検査） |
+| 確定フェーズへ入った後 | `baseline_updates::refuses_to_pause_or_cancel_once_the_commit_has_started`（pause・cancelとも拒否。`status`は待たされず応答する） |
+| 確定成功後 | `baseline_updates::refuses_to_pause_or_cancel_after_the_commit_succeeded` |
+| 確定失敗時 | `baseline_updates::reports_a_failed_commit_as_failed_even_when_a_cancel_was_rejected`（確定フェーズ内で別connectionがcheckpointを進める） |
+| 確定開始前のpauseの反映 | `baseline_updates::defers_the_commit_while_paused_and_finishes_after_resume` |
+| 境界そのもの（フルスキャンと共通） | `tests::refuses_pause_and_cancel_once_the_finalizing_phase_started`、`tests::cancelling_a_paused_job_keeps_it_out_of_the_finalizing_phase` |
+| フルスキャン側の配線 | `incremental_tests::a_completed_full_scan_closes_the_cancel_window_before_saving` |
+
+修正前の観測（`cargo test --locked`の全体実行）：
+
+```
+153 passed; 4 failed
+  left: None / right: Some("スキャン結果の確定中は一時停止できません")
+  left: None / right: Some("スキャン結果の確定中はキャンセルできません")
+  left: Completed / right: Cancelled
+```
+
+**感度確認**（`begin_finalizing`導入後に1点ずつ戻して再実行）：
+
+```
+確定境界をcan_continueへ戻す（pause／cancelの判定は残す）  → 3 failed
+pause／cancelのfinalizing判定だけを外す                    → 4 failed
+フルスキャン側のbegin_finalizingだけを外す                 → 1 failed
+```
+
+**未検証**：フルスキャンの確定窓そのもの（保存処理の最中）へ止めて割り込むテストは無い。
+本番経路の`start()`にテスト用フックを足さない方針のため、共通境界（`begin_finalizing`と
+`pause`／`cancel`の判定）とフルスキャン完了後の`finalizing`状態で代替している。
+また競合テストは、修正前は全体実行で8回中8回落ちるが、単独実行では30回中0回しか落ちない
+（他テストと並走する負荷に依存する）。確定フェーズの前後で確実に止める2本のテストが、
+決定論的な側を担保している。
+
+### 付随修正：一時DB名の衝突
+
+R3のテストが同時に走査を走らせるようになった結果、一時DBの名前がprocess内で衝突した。
+`SystemTime::now()`がµs精度までしか持たない環境があり、pid＋nanosだけでは同時に開いた
+一時DBが同名になる（この環境で8スレッドから取得したnanosは相異なる値が7個、最小間隔0）。
+
+- `IncrementalStaging`：`部分更新の一時DBを初期化できません: table staged_entries already exists`
+- `SeenFileStore`：`重複判定用DBを初期化できません: table seen_files already exists`
+
+どちらも名前にprocess内の連番（`AtomicU64`）を加えて分けた。名前が重なると別々の走査の結果が
+1つの一時DBへ混ざるため、テストの都合だけの問題ではない。`SeenFileStore`側は修正前に
+全体実行40回中4回落ちていたものが、修正後は40回中0回になった。
 
 ## baseline・checkpointの契約
 
@@ -341,7 +529,7 @@ node v22.23.2（`/opt/homebrew/opt/node@22/bin/node`）、npm 10.9.8。
 cargo fmt --check                         終了コード0（差分なし）
 cargo clippy ... -- -D warnings           終了コード0（Finished dev profile、警告0）
 cargo test --locked                       終了コード0
-                                          142 passed; 0 failed; 1 ignored
+                                          158 passed; 0 failed; 1 ignored
                                           main.rs 0件、doc-tests 0件
 npm ci                                    終了コード0（0 vulnerabilities）
 npm run check                             終了コード0（tsc -b）
@@ -349,21 +537,24 @@ npm test                                  終了コード0（3 files / 7 tests p
 npm run build                             終了コード0
 ```
 
-統合作業前は107 passed／0 failed／1 ignored。統合で129、安全性再レビューで142になった。
-再レビューでは18本追加し、5本を`#[cfg(unix)] mod baseline_updates`へ移した（差し引き+13）。
+統合作業前は107 passed／0 failed／1 ignored。統合で129、安全性再レビューで142、
+指摘R1〜R3の修正で158になった。再レビューでは18本追加し、5本を
+`#[cfg(unix)] mod baseline_updates`へ移した（差し引き+13）。R1〜R3では16本追加した
+（R1で9本、R3で7本）。`fails_closed_when_a_target_cannot_be_read`は
+`#[cfg(unix)] mod read_failures`へ移しただけで、増減には数えていない。
 
-| モジュール | 件数 | 再レビューでの増減 |
+| モジュール | 件数 | 増減 |
 |---|---|---|
-| `scan_jobs` | 13 | +5（確定境界のcancel／pause、checkpoint追い越し、root差し替え、同時start） |
+| `scan_jobs` | 21 | 再レビュー+5（確定境界のcancel／pause、checkpoint追い越し、root差し替え、同時start）、R1+1、R3+7 |
 | `incremental_trust` | 13 | +2（祖先のsubtree再走査要求） |
 | `incremental_storage` | 14 | +3（評価後のcheckpoint移動、未再走査リンクのmetadata、確定connectionのメモリ上限） |
 | `incremental_rescan` | 13 | 変更なし |
-| `incremental_scan` | 11 | 変更なし（一致比較テストの内容を強化） |
+| `incremental_scan` | 18 | 再レビューは変更なし（一致比較テストの内容を強化）、R1+7 |
 | `incremental_paths` | 8 | +1（祖先と無関係な変更の区別） |
 | `index_checkpoint` | 7 | +2（新規v8と移行v8のschema一致、移行失敗からの復旧） |
 | `storage` | 10 | |
 | `cache_catalog` | 10 | |
-| その他（既存） | 44 | |
+| その他（既存） | 45 | R1で`scanner`に+1 |
 
 ignored 1本は既存の実機依存テストで、今回追加したものではない。
 
@@ -430,6 +621,13 @@ checkpointの追い越し、rootの差し替え、2本のstartの競合）は、
 ~/Library/Logs/Disk_Visualizer/task1-safety-20260908/npm-check.log
 ~/Library/Logs/Disk_Visualizer/task1-safety-20260908/npm-test.log
 ~/Library/Logs/Disk_Visualizer/task1-safety-20260908/npm-build.log
+~/Library/Logs/Disk_Visualizer/task1-r1r2r3-20260908/cargo-fmt.log
+~/Library/Logs/Disk_Visualizer/task1-r1r2r3-20260908/cargo-clippy.log
+~/Library/Logs/Disk_Visualizer/task1-r1r2r3-20260908/cargo-test.log
+~/Library/Logs/Disk_Visualizer/task1-r1r2r3-20260908/node-env.log
+~/Library/Logs/Disk_Visualizer/task1-r1r2r3-20260908/npm-check.log
+~/Library/Logs/Disk_Visualizer/task1-r1r2r3-20260908/npm-test.log
+~/Library/Logs/Disk_Visualizer/task1-r1r2r3-20260908/npm-build.log
 ```
 
 各ログの末尾に実行コマンドと終了コードを記録している。
@@ -453,7 +651,11 @@ checkpointの追い越し、rootの差し替え、2本のstartの競合）は、
    変更してeventが届き、それが差分更新の完走まで通ることは確認していない。
    再現手順：走査rootでフルスキャン→checkpoint保存後にfileを変更→`start_incremental_scan`。
    必要環境：FSEventsのlatencyを待つ実時間の待機とGUIまたはコマンド経路。
-6. **外付け媒体の切断・再接続、スリープ復帰でのidentity再評価**：未着手（タスク3以降）。
+6. **Windowsでのテスト実行**：R2はcfgの分離までで、Windows上での`cargo test`は実行していない。
+   クロスコンパイルでの確認も依存crateの段階で失敗する（「レビュー指摘R1〜R3の修正」のR2）。
+7. **フルスキャンの確定窓への割り込み**：本番経路の`start()`にテスト用フックを置かない方針のため、
+   保存処理そのものの最中に止めて割り込むテストは無い（同R3）。
+8. **外付け媒体の切断・再接続、スリープ復帰でのidentity再評価**：未着手（タスク3以降）。
    確定直前の`verify_root_identity`はunmount中の差し替えを捉えるが、
    再接続後の再評価フローは実装していない。
 
@@ -485,7 +687,7 @@ cargo clippy --locked --all-targets --all-features --manifest-path src-tauri/Car
 cargo test --locked --manifest-path src-tauri/Cargo.toml
 ```
 
-142 passed／0 failed／1 ignored、clippy警告0が再現すれば同じ地点にいる。
+158 passed／0 failed／1 ignored、clippy警告0が再現すれば同じ地点にいる。
 
 frontend検証にはnode@22を使う（既定のnodeは`libsimdutf.34.dylib`不在でdyldエラーになる）。
 コマンド単位でPATHの先頭に`/opt/homebrew/opt/node@22/bin`を置く。symlinkでの取り繕いや

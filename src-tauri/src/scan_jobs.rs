@@ -79,6 +79,8 @@ struct JobState {
 struct Control {
     paused: bool,
     cancelled: bool,
+    /// 確定フェーズへ入ったら二度と戻らない。中断要求の受け付けはここで閉じる。
+    finalizing: bool,
 }
 struct ScanJob {
     id: u64,
@@ -111,6 +113,22 @@ impl ScanJob {
         }
         !control.cancelled
     }
+    /// 確定フェーズへ入る。入れたらtrueを返し、以降の中断要求を受け付けない。
+    ///
+    /// 一時停止中は`can_continue`と同じく待つ。キャンセル済みなら入らない。
+    /// 判定とフラグ立ては同じcontrol lock区間で行うので、`pause`・`cancel`が
+    /// この境界をまたいで成功することはない。
+    fn begin_finalizing(&self) -> bool {
+        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
+        while control.paused && !control.cancelled {
+            control = self.wake.wait(control).unwrap_or_else(|e| e.into_inner());
+        }
+        if control.cancelled {
+            return false;
+        }
+        control.finalizing = true;
+        true
+    }
     fn progress(&self, progress: &ScanProgress) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.current_path = progress.path.to_string_lossy().into_owned();
@@ -142,6 +160,7 @@ fn new_job(path: &str) -> Arc<ScanJob> {
         control: Mutex::new(Control {
             paused: false,
             cancelled: false,
+            finalizing: false,
         }),
         wake: Condvar::new(),
     })
@@ -169,30 +188,31 @@ fn run_incremental(
     baseline_scan_id: i64,
     transition: &CheckpointTransition,
 ) {
-    run_incremental_with_hook(
+    run_incremental_with_hooks(
         job,
         database,
         root,
         targets,
         baseline_scan_id,
         transition,
-        || {},
+        (|| {}, || {}),
     )
 }
 
-/// 走査完了から確定までの境界にテスト用のフックを差し込めるようにした実装。
+/// 確定フェーズの前後にテスト用のフックを差し込めるようにした実装。
 ///
-/// フックは確定前の中断確認より前に呼ぶ。ここが「キャンセルを受け付ける最後の地点」で、
-/// これ以降のtransactionは取り消せない。テストはこの境界で実スレッドを止めて、
-/// pause・cancel・checkpointの追い越しを決定論的に再現する。
-fn run_incremental_with_hook<H: Fn()>(
+/// `before_finalize`は確定フェーズへ入る直前、`after_finalize`は入った直後に呼ぶ。
+/// この2点の間が「キャンセルを受け付ける最後の地点」で、これ以降のtransactionは
+/// 取り消せない。テストは両側で実スレッドを止めて、pause・cancel・checkpointの
+/// 追い越しを決定論的に再現する。
+fn run_incremental_with_hooks<B: Fn(), A: Fn()>(
     job: &ScanJob,
     database: &Path,
     root: &Path,
     targets: &[IncrementalRescanTarget],
     baseline_scan_id: i64,
     transition: &CheckpointTransition,
-    before_commit: H,
+    (before_finalize, after_finalize): (B, A),
 ) {
     let outcome = rescan_targets(
         root,
@@ -201,11 +221,13 @@ fn run_incremental_with_hook<H: Fn()>(
         |progress| job.progress(progress),
     )
     .and_then(|mut staging| {
-        before_commit();
-        // 確定は取り消せないので、直前にもう一度中断要求を確認する。
-        if !job.can_continue() {
+        before_finalize();
+        // 確定は取り消せない。中断要求の確認と確定フェーズ入りを同じ境界で行い、
+        // 「確認は通ったがそのあとcancelが成功する」隙間を残さない。
+        if !job.begin_finalizing() {
             return Err("スキャンはキャンセルされました".to_owned());
         }
+        after_finalize();
         // 走査中にrootが差し替わっていれば、この結果は基準scanの続きではない。
         verify_root_identity(root, &transition.expected)?;
         apply_staged_snapshot(database, &mut staging, baseline_scan_id, transition)
@@ -266,13 +288,18 @@ impl ScanManager {
                     progress_stream.record(progress);
                 },
             );
-            let cancelled = job
-                .control
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .cancelled;
+            // 保存の開始とキャンセル受付の終了を、差分更新と同じ境界で決める。
+            // ここを過ぎたcancelは成功を返さないので、保存した結果を後から
+            // Cancelledへ倒すことはない。
+            let committing = result.is_ok() && job.begin_finalizing();
+            let cancelled = !committing
+                && job
+                    .control
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .cancelled;
             match result {
-                Ok(summary) if !cancelled => {
+                Ok(summary) if committing => {
                     let persisted = stream.complete_with_checkpoint(&summary, checkpoint.as_ref());
                     let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
                     match persisted {
@@ -425,7 +452,13 @@ impl ScanManager {
             if state.status != ScanJobStatus::Running {
                 return Err("実行中のスキャンだけを一時停止できます".to_owned());
             }
-            job.control.lock().unwrap_or_else(|e| e.into_inner()).paused = true;
+            let mut control = job.control.lock().unwrap_or_else(|e| e.into_inner());
+            // 確定フェーズへ入ったあとは止められない。成功を返すと、確定した結果を
+            // 止めたと誤解させる。
+            if control.finalizing {
+                return Err("スキャン結果の確定中は一時停止できません".to_owned());
+            }
+            control.paused = true;
             state.status = ScanJobStatus::Paused;
         }
         Ok(job.snapshot())
@@ -450,9 +483,12 @@ impl ScanManager {
             if !matches!(state.status, ScanJobStatus::Running | ScanJobStatus::Paused) {
                 return Err("完了済みのスキャンはキャンセルできません".to_owned());
             }
-        }
-        {
+            // stateを持ったままcontrolへ入る。lockの順序はpauseと同じで、
+            // 確定フェーズの開始判定とこの受け付けはcontrol lockで排他になる。
             let mut control = job.control.lock().unwrap_or_else(|e| e.into_inner());
+            if control.finalizing {
+                return Err("スキャン結果の確定中はキャンセルできません".to_owned());
+            }
             control.cancelled = true;
             control.paused = false;
         }
@@ -485,6 +521,7 @@ mod tests {
             control: Mutex::new(Control {
                 paused,
                 cancelled: false,
+                finalizing: false,
             }),
             wake: Condvar::new(),
         })
@@ -523,6 +560,41 @@ mod tests {
             .cancel(active_job.id)
             .unwrap();
         assert!(!receiver.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+    /// 確定フェーズはフルスキャンと差分更新で共通の境界を使う。
+    ///
+    /// 入ったあとのpause・cancelは、どちらの経路でも成功を返さない。
+    #[test]
+    fn refuses_pause_and_cancel_once_the_finalizing_phase_started() {
+        let active_job = job(ScanJobStatus::Running, false);
+        let manager = manager(Arc::clone(&active_job));
+        assert!(active_job.begin_finalizing());
+        assert_eq!(
+            manager.pause(active_job.id).err().as_deref(),
+            Some("スキャン結果の確定中は一時停止できません")
+        );
+        assert_eq!(
+            manager.cancel(active_job.id).err().as_deref(),
+            Some("スキャン結果の確定中はキャンセルできません")
+        );
+        // 確定中でも状態照会は通る。
+        assert_eq!(
+            manager.status(active_job.id).unwrap().status,
+            ScanJobStatus::Running
+        );
+    }
+    #[test]
+    fn cancelling_a_paused_job_keeps_it_out_of_the_finalizing_phase() {
+        let active_job = job(ScanJobStatus::Paused, true);
+        let waiting = Arc::clone(&active_job);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || sender.send(waiting.begin_finalizing()).unwrap());
+        std::thread::sleep(Duration::from_millis(20));
+        manager(Arc::clone(&active_job))
+            .cancel(active_job.id)
+            .unwrap();
+        assert!(!receiver.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(!active_job.control.lock().unwrap().finalizing);
     }
     #[test]
     fn rejects_second_start_while_active() {
@@ -640,6 +712,43 @@ mod incremental_tests {
             assert!(Instant::now() < deadline, "スキャンが終了しません");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// フルスキャンも差分更新と同じ確定境界を通る。
+    ///
+    /// 保存を始める前に中断要求の受け付けが閉じるので、そのあとのcancelは断る。
+    #[test]
+    fn a_completed_full_scan_closes_the_cancel_window_before_saving() {
+        let root = temporary("full-finalize", "");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("only.bin"), [0_u8; 4]).unwrap();
+        let root = root.canonicalize().unwrap();
+        let database = temporary("full-finalize", ".sqlite3");
+        let repository = ScanRepository::new(database.clone());
+        repository.initialize().unwrap();
+        let manager = ScanManager::new(repository);
+
+        let started = manager.start(root.to_string_lossy().into_owned()).unwrap();
+        let snapshot = wait_for_terminal(&manager, started.id);
+
+        assert_eq!(snapshot.status, ScanJobStatus::Completed);
+        assert!(snapshot.saved_scan_id.is_some());
+        let job = manager
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap();
+        assert!(job.control.lock().unwrap().finalizing);
+        assert_eq!(
+            manager.cancel(started.id).err().as_deref(),
+            Some("完了済みのスキャンはキャンセルできません")
+        );
+        assert_eq!(session_ids(&database).len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+        remove_database(&database);
     }
 
     #[test]
@@ -818,84 +927,100 @@ mod incremental_tests {
                 .unwrap()
         }
 
-        /// 走査完了から確定までの境界で止まるworkerを起動する。
+        /// 確定境界で止められるworkerと、それを操作する実ScanManager。
         ///
-        /// 呼び出し側は「境界に着いた」を受け取ってから状態を変え、「再開」を送る。
-        /// 実スレッドの順序をchannelで固定するので、待ち時間に依存しない。
-        fn spawn_at_commit_boundary(
+        /// pause・resume・cancelはすべて`manager`のAPIから送る。controlを直接
+        /// 書き換えると、受け付け可否そのものを検証できない。
+        struct Boundary {
+            manager: ScanManager,
+            job: Arc<ScanJob>,
+            handle: Option<JoinHandle<()>>,
+        }
+
+        impl Boundary {
+            fn id(&self) -> u64 {
+                self.job.id
+            }
+            fn join(&mut self) -> ScanJobSnapshot {
+                self.handle.take().unwrap().join().unwrap();
+                self.job.snapshot()
+            }
+        }
+
+        /// 確定フェーズの前後で止まるworkerを、実ScanManagerの管理下で起動する。
+        fn spawn_incremental_worker<B, A>(
             fixture: &Fixture,
             names: &[&str],
             transition: CheckpointTransition,
-        ) -> (Arc<ScanJob>, Receiver<()>, SyncSender<()>, JoinHandle<()>) {
+            before_finalize: B,
+            after_finalize: A,
+        ) -> Boundary
+        where
+            B: Fn() + Send + 'static,
+            A: Fn() + Send + 'static,
+        {
             let job = new_job(&fixture.checkpoint.root_path);
-            let (reached, at_boundary) = mpsc::sync_channel::<()>(0);
-            let (release, resume) = mpsc::sync_channel::<()>(0);
+            let manager = ScanManager {
+                active: Mutex::new(Some(Arc::clone(&job))),
+                repository: ScanRepository::new(fixture.database.clone()),
+            };
             let worker = Arc::clone(&job);
             let database = fixture.database.clone();
             let root = fixture.root.clone();
             let targets = targets(names);
             let baseline = fixture.baseline_scan_id;
             let handle = std::thread::spawn(move || {
-                run_incremental_with_hook(
+                run_incremental_with_hooks(
                     &worker,
                     &database,
                     &root,
                     &targets,
                     baseline,
                     &transition,
-                    || {
-                        reached.send(()).unwrap();
-                        resume.recv().unwrap();
-                    },
+                    (before_finalize, after_finalize),
                 )
             });
-            (job, at_boundary, release, handle)
-        }
-
-        /// ScanManager::cancelと同じ手順でworkerへ中断を伝える。
-        fn cancel(job: &ScanJob) {
-            {
-                let mut control = job.control.lock().unwrap();
-                control.cancelled = true;
-                control.paused = false;
+            Boundary {
+                manager,
+                job,
+                handle: Some(handle),
             }
-            job.wake.notify_all();
         }
 
-        /// ScanManager::pauseと同じ手順でworkerを止める。
-        fn pause(job: &ScanJob) {
-            let mut state = job.state.lock().unwrap();
-            job.control.lock().unwrap().paused = true;
-            state.status = ScanJobStatus::Paused;
+        /// workerを止めるフックと、その操作端を作る。
+        ///
+        /// 呼び出し側は「境界に着いた」を受け取ってから状態を変え、「再開」を送る。
+        /// 実スレッドの順序をchannelで固定するので、待ち時間に依存しない。
+        fn gate() -> (impl Fn() + Send + 'static, Receiver<()>, SyncSender<()>) {
+            let (reached, arrived) = mpsc::sync_channel::<()>(0);
+            let (release, resume) = mpsc::sync_channel::<()>(0);
+            let hook = move || {
+                reached.send(()).unwrap();
+                resume.recv().unwrap();
+            };
+            (hook, arrived, release)
         }
 
-        /// ScanManager::resumeと同じ手順でworkerを進める。
-        fn resume(job: &ScanJob) {
-            {
-                let mut state = job.state.lock().unwrap();
-                job.control.lock().unwrap().paused = false;
-                state.status = ScanJobStatus::Running;
-            }
-            job.wake.notify_all();
-        }
-
+        /// 確定フェーズへ入る直前のcancelは受け付け、確定させない。
         #[test]
         fn cancels_at_the_last_moment_before_the_commit() {
             let fixture = fixture("cancel-boundary");
             fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
             let before = session_ids(&fixture.database);
-            let (job, at_boundary, release, handle) = spawn_at_commit_boundary(
+            let (before_finalize, at_boundary, release) = gate();
+            let mut boundary = spawn_incremental_worker(
                 &fixture,
                 &["changed.bin"],
                 fixture.advanced("fsevents:v1:20"),
+                before_finalize,
+                || {},
             );
 
             at_boundary.recv().unwrap();
-            cancel(&job);
+            boundary.manager.cancel(boundary.id()).unwrap();
             release.send(()).unwrap();
-            handle.join().unwrap();
+            let snapshot = boundary.join();
 
-            let snapshot = job.snapshot();
             assert_eq!(snapshot.status, ScanJobStatus::Cancelled);
             assert_eq!(snapshot.saved_scan_id, None);
             assert_eq!(session_ids(&fixture.database), before);
@@ -907,23 +1032,28 @@ mod incremental_tests {
             let fixture = fixture("pause-boundary");
             fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
             let before = session_ids(&fixture.database);
-            let (job, at_boundary, release, handle) = spawn_at_commit_boundary(
+            let (before_finalize, at_boundary, release) = gate();
+            let mut boundary = spawn_incremental_worker(
                 &fixture,
                 &["changed.bin"],
                 fixture.advanced("fsevents:v1:20"),
+                before_finalize,
+                || {},
             );
 
             at_boundary.recv().unwrap();
-            pause(&job);
+            boundary.manager.pause(boundary.id()).unwrap();
             release.send(()).unwrap();
-            // pauseは確定前の中断確認より先に立つので、workerはここを越えられない。
-            assert_eq!(job.snapshot().status, ScanJobStatus::Paused);
+            // pauseは確定フェーズへ入る前に立つので、workerはここを越えられない。
+            assert_eq!(
+                boundary.manager.status(boundary.id()).unwrap().status,
+                ScanJobStatus::Paused
+            );
             assert_eq!(session_ids(&fixture.database), before);
 
-            resume(&job);
-            handle.join().unwrap();
+            boundary.manager.resume(boundary.id()).unwrap();
+            let snapshot = boundary.join();
 
-            let snapshot = job.snapshot();
             assert_eq!(snapshot.status, ScanJobStatus::Completed);
             let saved = snapshot.saved_scan_id.unwrap();
             assert_eq!(counted_size(&fixture.database, saved), 8 + 32);
@@ -932,15 +1062,178 @@ mod incremental_tests {
             assert_eq!(stored.baseline_scan_id, Some(saved));
         }
 
+        /// 確定開始とcancelが同時でも、応答と結果が食い違わない。
+        ///
+        /// どちらが先でもよいが、cancelが成功を返したなら確定していない、
+        /// 断られたなら確定している、のどちらかでなければならない。
+        #[test]
+        fn settles_a_cancel_that_races_the_start_of_the_commit() {
+            let fixture = fixture("cancel-race");
+            fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
+            let before = session_ids(&fixture.database);
+            // 確定開始とcancelを同じbarrierから同時に離す。channelの往復を挟むと
+            // 片方が必ず先に着いてしまい、競合そのものを再現できない。
+            let start = Arc::new(Barrier::new(2));
+            let worker_start = Arc::clone(&start);
+            let mut boundary = spawn_incremental_worker(
+                &fixture,
+                &["changed.bin"],
+                fixture.advanced("fsevents:v1:20"),
+                move || {
+                    worker_start.wait();
+                },
+                || {},
+            );
+
+            start.wait();
+            let cancelled = boundary.manager.cancel(boundary.id());
+            let snapshot = boundary.join();
+
+            match cancelled {
+                // 受け付けたなら、baselineもcheckpointも動いていない。
+                Ok(_) => {
+                    assert_eq!(snapshot.status, ScanJobStatus::Cancelled);
+                    assert_eq!(snapshot.saved_scan_id, None);
+                    assert_eq!(session_ids(&fixture.database), before);
+                    assert_eq!(fixture.stored_checkpoint(), fixture.checkpoint);
+                }
+                // 断ったなら、確定は最後まで進んでいる。
+                Err(error) => {
+                    assert_eq!(error, "スキャン結果の確定中はキャンセルできません");
+                    assert_eq!(snapshot.status, ScanJobStatus::Completed);
+                    let saved = snapshot.saved_scan_id.unwrap();
+                    assert_eq!(session_ids(&fixture.database).len(), before.len() + 1);
+                    let stored = fixture.stored_checkpoint();
+                    assert_eq!(stored.history_token, "fsevents:v1:20");
+                    assert_eq!(stored.baseline_scan_id, Some(saved));
+                }
+            }
+        }
+
+        /// 確定フェーズへ入ったあとのpause・cancelは成功を返さない。
+        #[test]
+        fn refuses_to_pause_or_cancel_once_the_commit_has_started() {
+            let fixture = fixture("finalizing");
+            fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
+            let before = session_ids(&fixture.database);
+            let (after_finalize, inside, release_inside) = gate();
+            let mut boundary = spawn_incremental_worker(
+                &fixture,
+                &["changed.bin"],
+                fixture.advanced("fsevents:v1:20"),
+                || {},
+                after_finalize,
+            );
+
+            inside.recv().unwrap();
+
+            assert_eq!(
+                boundary.manager.pause(boundary.id()).err().as_deref(),
+                Some("スキャン結果の確定中は一時停止できません")
+            );
+            assert_eq!(
+                boundary.manager.cancel(boundary.id()).err().as_deref(),
+                Some("スキャン結果の確定中はキャンセルできません")
+            );
+            // 確定処理の間も状態照会は待たされない。
+            assert_eq!(
+                boundary.manager.status(boundary.id()).unwrap().status,
+                ScanJobStatus::Running
+            );
+            assert_eq!(session_ids(&fixture.database), before);
+
+            release_inside.send(()).unwrap();
+            let snapshot = boundary.join();
+
+            assert_eq!(snapshot.status, ScanJobStatus::Completed);
+            let saved = snapshot.saved_scan_id.unwrap();
+            assert_eq!(session_ids(&fixture.database).len(), before.len() + 1);
+            assert_eq!(fixture.stored_checkpoint().baseline_scan_id, Some(saved));
+        }
+
+        /// 確定に成功したjobを、あとから来たpause・cancelで覆さない。
+        #[test]
+        fn refuses_to_pause_or_cancel_after_the_commit_succeeded() {
+            let fixture = fixture("after-commit");
+            fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
+            let mut boundary = spawn_incremental_worker(
+                &fixture,
+                &["changed.bin"],
+                fixture.advanced("fsevents:v1:20"),
+                || {},
+                || {},
+            );
+
+            let snapshot = boundary.join();
+            assert_eq!(snapshot.status, ScanJobStatus::Completed);
+            let saved = snapshot.saved_scan_id.unwrap();
+
+            assert_eq!(
+                boundary.manager.pause(boundary.id()).err().as_deref(),
+                Some("実行中のスキャンだけを一時停止できます")
+            );
+            assert_eq!(
+                boundary.manager.cancel(boundary.id()).err().as_deref(),
+                Some("完了済みのスキャンはキャンセルできません")
+            );
+            let after = boundary.manager.status(boundary.id()).unwrap();
+            assert_eq!(after.status, ScanJobStatus::Completed);
+            assert_eq!(after.saved_scan_id, Some(saved));
+            assert_eq!(fixture.stored_checkpoint().baseline_scan_id, Some(saved));
+        }
+
+        /// 確定に失敗したjobはFailedのまま。断ったcancelでCancelledへ倒さない。
+        #[test]
+        fn reports_a_failed_commit_as_failed_even_when_a_cancel_was_rejected() {
+            let fixture = fixture("finalize-failure");
+            fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
+            let before = session_ids(&fixture.database);
+            let (after_finalize, inside, release_inside) = gate();
+            let mut boundary = spawn_incremental_worker(
+                &fixture,
+                &["changed.bin"],
+                fixture.advanced("fsevents:v1:20"),
+                || {},
+                after_finalize,
+            );
+
+            inside.recv().unwrap();
+            assert_eq!(
+                boundary.manager.cancel(boundary.id()).err().as_deref(),
+                Some("スキャン結果の確定中はキャンセルできません")
+            );
+            // 確定フェーズの内側で、別のスキャンがcheckpointを進めた状態を作る。
+            let newer = IndexCheckpoint {
+                history_token: "fsevents:v1:90".to_owned(),
+                updated_at: fixture.checkpoint.updated_at + 1,
+                ..fixture.checkpoint.clone()
+            };
+            upsert_checkpoint(&Connection::open(&fixture.database).unwrap(), &newer).unwrap();
+            release_inside.send(()).unwrap();
+            let snapshot = boundary.join();
+
+            assert_eq!(snapshot.status, ScanJobStatus::Failed);
+            assert_eq!(
+                snapshot.error.as_deref(),
+                Some("差分更新の前提となるcheckpointが更新されています")
+            );
+            assert_eq!(snapshot.saved_scan_id, None);
+            assert_eq!(session_ids(&fixture.database), before);
+            assert_eq!(fixture.stored_checkpoint(), newer);
+        }
+
         #[test]
         fn refuses_to_commit_when_another_scan_advanced_the_checkpoint() {
             let fixture = fixture("stale-assessment");
             fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
             let before = session_ids(&fixture.database);
-            let (job, at_boundary, release, handle) = spawn_at_commit_boundary(
+            let (before_finalize, at_boundary, release) = gate();
+            let mut boundary = spawn_incremental_worker(
                 &fixture,
                 &["changed.bin"],
                 fixture.advanced("fsevents:v1:20"),
+                before_finalize,
+                || {},
             );
 
             at_boundary.recv().unwrap();
@@ -952,9 +1245,8 @@ mod incremental_tests {
             };
             upsert_checkpoint(&Connection::open(&fixture.database).unwrap(), &newer).unwrap();
             release.send(()).unwrap();
-            handle.join().unwrap();
+            let snapshot = boundary.join();
 
-            let snapshot = job.snapshot();
             assert_eq!(snapshot.status, ScanJobStatus::Failed);
             assert_eq!(
                 snapshot.error.as_deref(),
@@ -971,10 +1263,13 @@ mod incremental_tests {
             let fixture = fixture("root-replaced");
             fs::write(fixture.root.join("changed.bin"), [0_u8; 32]).unwrap();
             let before = session_ids(&fixture.database);
-            let (job, at_boundary, release, handle) = spawn_at_commit_boundary(
+            let (before_finalize, at_boundary, release) = gate();
+            let mut boundary = spawn_incremental_worker(
                 &fixture,
                 &["changed.bin"],
                 fixture.advanced("fsevents:v1:20"),
+                before_finalize,
+                || {},
             );
 
             at_boundary.recv().unwrap();
@@ -983,9 +1278,8 @@ mod incremental_tests {
             fs::rename(&fixture.root, &replaced).unwrap();
             fs::create_dir_all(&fixture.root).unwrap();
             release.send(()).unwrap();
-            handle.join().unwrap();
+            let snapshot = boundary.join();
 
-            let snapshot = job.snapshot();
             assert_eq!(snapshot.status, ScanJobStatus::Failed);
             assert_eq!(
                 snapshot.error.as_deref(),
@@ -1069,6 +1363,37 @@ mod incremental_tests {
             let snapshot = job.snapshot();
             assert_eq!(snapshot.status, ScanJobStatus::Failed);
             assert!(snapshot.error.is_some());
+            assert_eq!(snapshot.saved_scan_id, None);
+            assert_eq!(session_ids(&fixture.database), before);
+            assert_eq!(fixture.stored_checkpoint(), fixture.checkpoint);
+        }
+
+        /// 読み取れない対象を含む差分は確定しない。
+        ///
+        /// 権限を落とすのはfixture配下のdirectoryだけで、実データには触れない。
+        #[test]
+        fn refuses_to_commit_when_a_target_cannot_be_read() {
+            use std::os::unix::fs::PermissionsExt;
+            let fixture = fixture("unreadable-target");
+            let before = session_ids(&fixture.database);
+            let job = new_job(&fixture.checkpoint.root_path);
+            let denied = fixture.root.join("dir");
+            fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+
+            fixture.apply(
+                &job,
+                &["dir"],
+                fixture.baseline_scan_id,
+                &fixture.advanced("fsevents:v1:20"),
+            );
+
+            fs::set_permissions(&denied, fs::Permissions::from_mode(0o755)).unwrap();
+            let snapshot = job.snapshot();
+            assert_eq!(snapshot.status, ScanJobStatus::Failed);
+            assert_eq!(
+                snapshot.error.as_deref(),
+                Some("部分再走査targetを完全に読み取れません（directory_replaced_or_unreadable）")
+            );
             assert_eq!(snapshot.saved_scan_id, None);
             assert_eq!(session_ids(&fixture.database), before);
             assert_eq!(fixture.stored_checkpoint(), fixture.checkpoint);

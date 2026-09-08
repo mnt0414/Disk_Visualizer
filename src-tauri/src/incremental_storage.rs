@@ -6,6 +6,7 @@ use crate::index_checkpoint::{load_checkpoint, upsert_checkpoint, IndexCheckpoin
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -102,6 +103,12 @@ impl Drop for IncrementalStaging {
     }
 }
 
+/// 一時DBの名前を分ける連番。
+///
+/// 時刻はµs精度までしか持たない環境があり、同時に開いたstagingが同じ名前になりうる。
+/// 名前が重なると別々の走査結果が1つの一時DBへ混ざるので、process内で必ず分ける。
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 impl IncrementalStaging {
     /// 走査rootと置換対象targetを固定してstagingを開く。
     pub fn new(root_path: &Path, targets: &[IncrementalRescanTarget]) -> Result<Self, String> {
@@ -123,8 +130,9 @@ impl IncrementalStaging {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())?
             .as_nanos();
+        let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "disk-visualizer-staging-{}-{unique}.sqlite3",
+            "disk-visualizer-staging-{}-{unique}-{sequence}.sqlite3",
             std::process::id()
         ));
         let connection = Connection::open(&path)

@@ -136,8 +136,36 @@ FSEventsのdevice相対pathを、走査root相対の安全なpathへ変換する
   新規DBと移行DBのschema一致、移行失敗時のバックアップ健全性を検証した
 
 詳細と検証範囲は`docs/task1-integration-report.md`にある。
-検証したのはmacOSでのRustテストとfrontendのnpm検証まで。実volume境界・実FSEvents経路・
-アプリUI・Windows実機・二重OS CIは未実施で、タスク1は未完了。
+
+## レビュー指摘R1〜R3の修正
+
+安全性再レビューへの指摘3件を修正した。各指摘の原因・修正・再現テスト・未検証範囲は
+`docs/task1-integration-report.md`の「レビュー指摘R1〜R3の修正」にある。
+
+- **R1：読取失敗を正常な差分置換として確定しない。** 共有scannerのskip理由を定数化し、
+  意図した除外（リンク非追跡・確認済みの別volume・非対応entry種別）と読取失敗を`is_read_failure`で
+  分けた。部分再走査は読取失敗のskipを見た時点で差分全体を失敗させ、stagingへ入れず、
+  session確定もcheckpoint更新も行わない。`scan_directory`のentry列挙エラーは`continue`せず
+  Errで返し、root全置換の経路も同じ扱いにした。親のvolume判定は`Inside`／`Outside`／`Unknown`へ
+  分け、identityを取得できない状態を消失や確認済みの別volumeと同一視しない
+- **R2：WindowsテストのUnix限定API参照を分離。** 無条件の`PermissionsExt`参照をやめ、権限操作を
+  使うテストを`#[cfg(unix)] mod read_failures`へ集約した。symlinkでdirectoryを差し替える
+  テストにも`#[cfg(unix)]`を付けた。失敗注入・volume判定・置換不完全の判定は共通テストとして
+  残している。全moduleで`std::os::unix`／`std::os::windows`／`libc`参照がcfgの配下にあることを
+  確認した。Windows上での実行は未確認（この環境からのクロスコンパイルは依存crateの段階で失敗する）
+- **R3：確定開始とpause／cancel受付終了を原子的にする。** `ScanJob::begin_finalizing()`が
+  中断要求の確認と確定フェーズ入りをひとつのcontrol lock区間で行う。確定フェーズへ入ったあとの
+  pause／cancelは成功を返さず、呼び出し側が判別できるエラーを返す（`ScanJobStatus`は増やしていない）。
+  フルスキャンの保存も同じ境界を通る。確定に成功した結果は後からCancelledにならず、確定に
+  失敗した場合もFailedのままになる。確定中はstate・controlのどちらのlockも保持しないので、
+  `status`はDB処理の間も応答する。テストはcontrolを直接書き換えず、実際の`ScanManager`の
+  pause／resume／cancel／statusを`Barrier`とrendezvousで順序固定して呼ぶ
+- 付随して、`IncrementalStaging`と`SeenFileStore`の一時DB名にprocess内の連番を加えた。
+  `SystemTime::now()`がµs精度までの環境では、pid＋nanosだけでは同時に開いた一時DBが同名になり、
+  別々の走査の結果が1つの一時DBへ混ざる
+
+検証したのはmacOSでのRustテスト（158 passed／0 failed／1 ignored）とfrontendのnpm検証まで。
+実volume境界・実FSEvents経路・アプリUI・Windows実機・二重OS CIは未実施で、タスク1は未完了。
 
 ## 次の実装
 

@@ -5,9 +5,34 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_SUMMARY_ENTRIES: usize = 200;
+
+/// 走査対象から意図して外したentryの理由。フルスキャンも部分再走査も配下へ降りない。
+pub(crate) const SKIP_LINK_NOT_FOLLOWED: &str = "link_not_followed";
+pub(crate) const SKIP_DIFFERENT_VOLUME: &str = "different_volume";
+pub(crate) const SKIP_UNSUPPORTED_ENTRY_TYPE: &str = "unsupported_entry_type";
+/// 読み取れなかったentryの理由。走査結果はその部分木を完全には表していない。
+pub(crate) const SKIP_DIRECTORY_ENTRY_UNREADABLE: &str = "directory_entry_unreadable";
+pub(crate) const SKIP_METADATA_UNAVAILABLE: &str = "metadata_unavailable";
+pub(crate) const SKIP_FILE_SNAPSHOT_UNAVAILABLE: &str = "file_snapshot_unavailable";
+pub(crate) const SKIP_DIRECTORY_REPLACED_OR_UNREADABLE: &str = "directory_replaced_or_unreadable";
+pub(crate) const SKIP_VOLUME_IDENTITY_UNAVAILABLE: &str = "volume_identity_unavailable";
+pub(crate) const SKIP_DIRECTORY_UNREADABLE: &str = "directory_unreadable";
+
+/// skipの理由が「意図した除外」か「読取失敗」かを判別する。
+///
+/// フルスキャンはどちらもskip行として残す。部分再走査は該当部分木を丸ごと
+/// 置き換えるため、読取失敗を含んだままでは完全な置換結果を主張できない。
+/// 判別できない理由は読取失敗側へ倒す。
+pub(crate) fn is_read_failure(reason: &str) -> bool {
+    !matches!(
+        reason,
+        SKIP_LINK_NOT_FOLLOWED | SKIP_DIFFERENT_VOLUME | SKIP_UNSUPPORTED_ENTRY_TYPE
+    )
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScanProgress {
@@ -89,14 +114,22 @@ pub(crate) struct SeenFileStore {
     path: PathBuf,
 }
 
+/// 一時DBの名前を分ける連番。
+///
+/// 時刻はµs精度までしか持たない環境があり、同時に開いたstoreが同じ名前になりうる。
+/// 名前が重なると別々の走査のハードリンク判定が1つの一時DBへ混ざるので、
+/// process内で必ず分ける。
+static SEEN_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 impl SeenFileStore {
     pub(crate) fn new() -> Result<Self, String> {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())?
             .as_nanos();
+        let sequence = SEEN_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "disk-visualizer-seen-{}-{unique}.sqlite3",
+            "disk-visualizer-seen-{}-{unique}-{sequence}.sqlite3",
             std::process::id()
         ));
         let connection = Connection::open(&path)
@@ -200,7 +233,7 @@ where
                     skipped(
                         &mut totals,
                         root.join(parent),
-                        "directory_entry_unreadable",
+                        SKIP_DIRECTORY_ENTRY_UNREADABLE,
                         progress,
                     );
                     continue;
@@ -217,24 +250,24 @@ where
         let file_type = match entry.file_type() {
             Ok(value) => value,
             Err(_) => {
-                skipped(&mut totals, path, "metadata_unavailable", progress);
+                skipped(&mut totals, path, SKIP_METADATA_UNAVAILABLE, progress);
                 continue;
             }
         };
         if file_type.is_symlink() {
-            skipped(&mut totals, path, "link_not_followed", progress);
+            skipped(&mut totals, path, SKIP_LINK_NOT_FOLLOWED, progress);
         } else if file_type.is_file() {
             let file = match entry.open() {
                 Ok(value) => value.into_std(),
                 Err(_) => {
-                    skipped(&mut totals, path, "file_snapshot_unavailable", progress);
+                    skipped(&mut totals, path, SKIP_FILE_SNAPSHOT_UNAVAILABLE, progress);
                     continue;
                 }
             };
             let metrics = match file_metrics::collect_open_file(&file) {
                 Some(value) => value,
                 None => {
-                    skipped(&mut totals, path, "file_snapshot_unavailable", progress);
+                    skipped(&mut totals, path, SKIP_FILE_SNAPSHOT_UNAVAILABLE, progress);
                     continue;
                 }
             };
@@ -279,7 +312,7 @@ where
                     skipped(
                         &mut totals,
                         path,
-                        "directory_replaced_or_unreadable",
+                        SKIP_DIRECTORY_REPLACED_OR_UNREADABLE,
                         progress,
                     );
                     continue;
@@ -292,9 +325,9 @@ where
                     &mut totals,
                     path,
                     if volume_identity.is_some() {
-                        "different_volume"
+                        SKIP_DIFFERENT_VOLUME
                     } else {
-                        "volume_identity_unavailable"
+                        SKIP_VOLUME_IDENTITY_UNAVAILABLE
                     },
                     progress,
                 );
@@ -304,7 +337,7 @@ where
             let entries = match directory.entries() {
                 Ok(value) => value,
                 Err(_) => {
-                    skipped(&mut totals, path, "directory_unreadable", progress);
+                    skipped(&mut totals, path, SKIP_DIRECTORY_UNREADABLE, progress);
                     continue;
                 }
             };
@@ -327,7 +360,7 @@ where
                 entries,
             });
         } else {
-            skipped(&mut totals, path, "unsupported_entry_type", progress);
+            skipped(&mut totals, path, SKIP_UNSUPPORTED_ENTRY_TYPE, progress);
         }
     }
     Ok(totals)
@@ -389,7 +422,7 @@ where
                 skipped(
                     &mut totals,
                     root.clone(),
-                    "directory_entry_unreadable",
+                    SKIP_DIRECTORY_ENTRY_UNREADABLE,
                     &mut progress,
                 );
                 continue;
@@ -458,6 +491,29 @@ mod tests {
         let path = std::env::temp_dir().join(format!("disk-visualizer-{name}-{unique}"));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+    /// 意図した除外と読取失敗の区別が、理由ごとに1か所で決まっていることを確かめる。
+    #[test]
+    fn separates_intended_exclusions_from_read_failures() {
+        for reason in [
+            SKIP_LINK_NOT_FOLLOWED,
+            SKIP_DIFFERENT_VOLUME,
+            SKIP_UNSUPPORTED_ENTRY_TYPE,
+        ] {
+            assert!(!is_read_failure(reason), "{reason}");
+        }
+        for reason in [
+            SKIP_DIRECTORY_ENTRY_UNREADABLE,
+            SKIP_METADATA_UNAVAILABLE,
+            SKIP_FILE_SNAPSHOT_UNAVAILABLE,
+            SKIP_DIRECTORY_REPLACED_OR_UNREADABLE,
+            SKIP_VOLUME_IDENTITY_UNAVAILABLE,
+            SKIP_DIRECTORY_UNREADABLE,
+        ] {
+            assert!(is_read_failure(reason), "{reason}");
+        }
+        // 判別できない理由はfail closed側へ倒す。
+        assert!(is_read_failure("unknown_reason"));
     }
     #[test]
     fn scans_files_and_nested_directories() {
