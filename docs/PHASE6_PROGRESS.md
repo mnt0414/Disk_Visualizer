@@ -71,11 +71,55 @@ macOSではフルスキャン開始前にFSEvents checkpointとdirectory handle�
 - 更新後のサイズ・file・directory・skip集計をSQLite内容から再計算する
 - 新sessionのcomplete化と次の履歴checkpoint更新を同じtransactionで確定する
 - checkpoint不正を含む途中失敗では新sessionとentryをすべてrollbackする
-- scannerによるtargetの実走査とScanManager統合は次の実装境界とする
+
+## 変更pathの走査root相対化
+
+FSEventsのdevice相対pathを、走査root相対の安全なpathへ変換する経路を`incremental_paths`へ分離した。
+
+- 走査rootのdevice相対pathを、componentごとにdirectory handleを開き`dev`／`ino`で確認しながら復元する
+- 名前一致だけで同一性を判断せず、途中のmount point越えは拒否する
+- 変更pathを`Inside`／`Outside`／`Invalid`の3値へ落とし、root自身・root外・親参照・不正表現を区別する
+- 文字列prefixの一致を親子関係として扱わない
+- `Invalid`が1件でもあれば差分更新を中止し、フルスキャンへ倒す
+
+## capability-based部分再走査
+
+計画された再走査targetを、cap-stdのdirectory handle経由でmetadataだけ収集する。
+
+- 親directoryを1 componentずつ開き、`dev`／`ino`が期待と一致しなければ中止する
+- symlink・junction・reparse pointを辿らず、別volumeへ出ない
+- ファイル内容は読まず、metadataだけを取得する
+- 消失は親entryの不在確認を経て空replacementとし、metadata失敗・アクセス拒否は失敗として中止する
+- 読取失敗を削除として適用しない
+- 置換単位を部分木へ拡大し、directoryのrename・削除・fileへの型変更で古い子孫を残さない
+- キャンセル時は部分的な置換をstagingへ残さない
+
+## baselineとcheckpointの対応（SQLite v8）
+
+「同じrootの最新スキャン」という推測を使わず、checkpointが名指しした基準scanだけを差分の適用先とする。
+
+- `index_checkpoints`に`baseline_scan_id`列を追加した（v7→v8）
+- 0以下の基準scan IDを不正として拒否する
+- checkpointの基準scanと更新元が一致しなければ差分を適用しない
+- 移行はVACUUM INTOと`PRAGMA quick_check`によるバックアップを経る。v6→v8とv7→v8の両経路を持つ
+- 新スナップショットの確定、token更新、`baseline_scan_id`の付け替えを同一transactionで行う
+- キャンセル・走査失敗・適用失敗・identity不一致ではcheckpointを進めず、過去の履歴を残す
+
+## ScanManager統合
+
+`start_incremental_scan`コマンドを追加し、差分更新とフルスキャンの切り替えを一本の経路にまとめた。
+
+- 信頼評価はactive lockの外で行い、進捗照会・pause・resume・cancelを止めない
+- 信頼できない履歴、成立しない計画は、理由を`FullScanReason`として返したうえでフルスキャンへ倒す
+- 差分更新jobは結果をメモリへ載せず、確定したscan session IDを`savedScanId`として返す
+- 確定は取り消せないため、直前にもう一度中断要求を確認する
+- 変更が止まったあとの差分結果が、新規フルスキャンとpath集合・合計値で一致することを確認した
+
+詳細と検証結果は`docs/task1-integration-report.md`にある。
 
 ## 次の実装
 
-1. capability-based scannerで部分再走査targetを収集し、原子的なSQLite差分適用へ接続する
+1. 信頼状態とフルスキャン理由をUIへ表示し、`start_incremental_scan`を接続する
 2. Windows USN変更record読取adapterを追加する
-3. 信頼状態をUIへ表示し、差分不可時は理由付きでフルスキャンを提案する
+3. 上限値（履歴件数・target数・置換件数）を実値で計測し、必要なら調整する
 4. 外付け媒体の切断・再接続、スリープ復帰でidentityを再評価する
