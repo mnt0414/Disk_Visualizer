@@ -13,7 +13,9 @@ use std::path::{Component, Path, PathBuf};
 /// 部分再走査中に変わらない前提をまとめる。
 struct RescanContext<'a> {
     root: &'a Path,
-    root_volume_identity: Option<&'a str>,
+    /// 走査に使うroot handleから確認したvolume identity。取得できない場合は
+    /// contextを組み立てず、entryを列挙する前に走査ごと失敗させる。
+    root_volume_identity: &'a str,
     seen_files: &'a SeenFileStore,
 }
 
@@ -26,7 +28,7 @@ enum ResolvedParent {
 
 /// 親directoryが走査rootと同じvolumeに属するかの判定。
 enum ParentVolume {
-    /// 同じvolume、またはroot側にidentityが無く境界を判定しない構成。
+    /// 両側のidentityを取得でき、同じvolumeだと確認できた。
     Inside,
     /// 別volumeだと確認できた。フルスキャンも降りないので行は現れない。
     Outside,
@@ -38,12 +40,16 @@ enum ParentVolume {
 ///
 /// 別volumeだと確認できたときだけ「行が存在しない」と扱える。identityが取れない
 /// 状態を消失や確認済みの別volumeと同じ扱いにすると、読めなかった部分木を
-/// 削除として確定してしまう。
+/// 削除として確定してしまう。root側が不明な組も同じで、境界を判定できない以上
+/// `Inside`として降りることはできない。
+///
+/// 呼び出し側は確認済みのidentityを渡すが、`Option`のまま受け取って未取得の組も
+/// 判定できるようにしてある。
 fn parent_volume_scope(root: Option<&str>, current: Option<&str>) -> ParentVolume {
     match (root, current) {
-        (Some(root), Some(current)) if root != current => ParentVolume::Outside,
-        (Some(_), None) => ParentVolume::Unknown,
-        _ => ParentVolume::Inside,
+        (Some(root), Some(current)) if root == current => ParentVolume::Inside,
+        (Some(_), Some(_)) => ParentVolume::Outside,
+        _ => ParentVolume::Unknown,
     }
 }
 
@@ -96,7 +102,7 @@ fn is_same_directory(link: &Metadata, opened: &Metadata) -> Result<bool, String>
 /// 消失は区別し、消失以外はfail closedでエラーにする。
 fn open_relative_directory(
     root: &Dir,
-    root_volume_identity: Option<&str>,
+    root_volume_identity: &str,
     relative: &Path,
 ) -> Result<ResolvedParent, String> {
     let mut current = root
@@ -130,7 +136,7 @@ fn open_relative_directory(
         if !is_same_directory(&link, &opened)? {
             return Err("部分再走査targetの親が確認した対象と一致しません".to_owned());
         }
-        match parent_volume_scope(root_volume_identity, volume_identity.as_deref()) {
+        match parent_volume_scope(Some(root_volume_identity), volume_identity.as_deref()) {
             ParentVolume::Inside => {}
             ParentVolume::Outside => return Ok(ResolvedParent::Absent),
             ParentVolume::Unknown => {
@@ -180,7 +186,7 @@ where
             entry,
             parent_relative.to_path_buf(),
             context.root,
-            context.root_volume_identity,
+            Some(context.root_volume_identity),
             control,
             progress,
             context.seen_files,
@@ -228,6 +234,31 @@ fn group_by_parent(
     Ok(groups)
 }
 
+/// 走査に使うroot handleからvolume identityを取り出す関数。
+///
+/// 取得失敗を注入して、拒否が実際の入口へ接続されていることをテストするために
+/// 関数ポインタで受け取る。本番経路は`file_metrics`の実装だけを渡す。
+type RootVolumeIdentity = fn(&std::fs::File) -> Option<String>;
+
+/// 走査に使うroot handleを開き、そのhandleからvolume identityを確認する。
+///
+/// checkpointに保存された値は代用にしない。ここで取得できなければ、走査中に
+/// volume境界を判定できず、別volumeへ降りたのか同じvolumeなのかを区別できない。
+/// entryを1件も列挙しないうちに失敗させる。
+fn open_root_with_identity(
+    root: &Path,
+    volume_identity: RootVolumeIdentity,
+) -> Result<(Dir, String), String> {
+    let directory = Dir::open_ambient_dir(root, ambient_authority())
+        .map_err(|error| format!("走査rootを開けません: {error}"))?;
+    let std_root = directory.into_std_file();
+    let identity = volume_identity(&std_root);
+    let directory = Dir::from_std_file(std_root);
+    let identity =
+        identity.ok_or_else(|| "走査rootのvolume identityを取得できません".to_owned())?;
+    Ok((directory, identity))
+}
+
 /// 計画されたtargetをcapability baseで部分再走査し、置換結果をstagingへ書き出す。
 ///
 /// 置換範囲は必ず部分木へ拡大するため、directoryのrename・削除・型変更で古い子孫が
@@ -243,19 +274,35 @@ where
     C: Fn() -> bool,
     P: Fn(&ScanProgress),
 {
+    rescan_targets_with(
+        root,
+        planned,
+        control,
+        observe,
+        file_metrics::volume_identity_from_open_file,
+    )
+}
+
+fn rescan_targets_with<C, P>(
+    root: &Path,
+    planned: &[IncrementalRescanTarget],
+    control: C,
+    observe: P,
+    volume_identity: RootVolumeIdentity,
+) -> Result<IncrementalStaging, String>
+where
+    C: Fn() -> bool,
+    P: Fn(&ScanProgress),
+{
     if !root.is_absolute() {
         return Err("部分再走査には絶対pathが必要です".to_owned());
     }
     let targets = escalate_to_subtrees(planned)?;
-    let root_directory = Dir::open_ambient_dir(root, ambient_authority())
-        .map_err(|error| format!("走査rootを開けません: {error}"))?;
-    let std_root = root_directory.into_std_file();
-    let root_volume_identity = file_metrics::volume_identity_from_open_file(&std_root);
-    let root_directory = Dir::from_std_file(std_root);
+    let (root_directory, root_volume_identity) = open_root_with_identity(root, volume_identity)?;
     let seen_files = SeenFileStore::new()?;
     let context = RescanContext {
         root,
-        root_volume_identity: root_volume_identity.as_deref(),
+        root_volume_identity: &root_volume_identity,
         seen_files: &seen_files,
     };
     let mut staging = IncrementalStaging::new(root, &targets)?;
@@ -345,6 +392,7 @@ mod tests {
     use crate::index_checkpoint::{IndexCheckpoint, IndexCheckpointRepository};
     use crate::storage::ScanRepository;
     use rusqlite::Connection;
+    use std::cell::Cell;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -516,6 +564,19 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    fn session_ids(database: &Path) -> Vec<i64> {
+        let connection = Connection::open(database).unwrap();
+        let mut statement = connection
+            .prepare("SELECT id FROM scan_sessions ORDER BY id")
+            .unwrap();
+        let ids = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        ids
     }
 
     /// 走査結果1行分のうち、走査経路によらず一致すべき列。
@@ -740,7 +801,7 @@ mod tests {
         let seen_files = SeenFileStore::new().unwrap();
         let context = RescanContext {
             root: &root,
-            root_volume_identity: None,
+            root_volume_identity: "volume",
             seen_files: &seen_files,
         };
         let mut keep_going = || true;
@@ -770,6 +831,9 @@ mod tests {
     }
 
     /// identity不明を、消失や確認済みの別volumeと同じ扱いにしない。
+    ///
+    /// root側が不明な組も含める。どちらか一方でも欠けていれば境界を判定できず、
+    /// `Inside`として降りることも`Outside`として消すこともできない。
     #[test]
     fn separates_an_unknown_volume_identity_from_a_confirmed_other_volume() {
         assert!(matches!(
@@ -784,6 +848,113 @@ mod tests {
             parent_volume_scope(Some("volume"), None),
             ParentVolume::Unknown
         ));
+        assert!(matches!(
+            parent_volume_scope(None, Some("volume")),
+            ParentVolume::Unknown
+        ));
+        assert!(matches!(
+            parent_volume_scope(None, None),
+            ParentVolume::Unknown
+        ));
+    }
+
+    /// 走査rootのvolume identityを取得できないときは、entryを1件も列挙しない。
+    ///
+    /// 取得失敗を実際の入口へ注入し、root全置換と通常targetの両方で、進捗callbackも
+    /// 中断確認callbackも呼ばれないことを確かめる。
+    #[test]
+    fn refuses_to_start_a_rescan_without_the_root_volume_identity() {
+        let root = temporary_root("missing-root-identity");
+        fs::create_dir_all(root.join("dir")).unwrap();
+        fs::write(root.join("dir/child.txt"), b"1234").unwrap();
+        fs::write(root.join("top.txt"), b"12").unwrap();
+        for (label, targets) in [
+            ("root全置換", vec![target(".")]),
+            (
+                "通常target",
+                vec![target("top.txt"), recursive_target("dir")],
+            ),
+        ] {
+            let asked = Cell::new(0_u32);
+            let observed = Cell::new(0_u32);
+            let outcome = rescan_targets_with(
+                &root,
+                &targets,
+                || {
+                    asked.set(asked.get() + 1);
+                    true
+                },
+                |_| observed.set(observed.get() + 1),
+                |_| None,
+            );
+            let failure = match outcome {
+                Err(failure) => failure,
+                Ok(_) => panic!("identity不明のまま走査した: {label}"),
+            };
+            assert_eq!(failure, "走査rootのvolume identityを取得できません");
+            assert_eq!((asked.get(), observed.get()), (0, 0), "{label}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// identityを取得できずに失敗した部分再走査は、確定sessionもcheckpointも動かさない。
+    #[test]
+    fn keeps_the_baseline_and_checkpoint_without_the_root_volume_identity() {
+        let root = temporary_root("missing-identity-commit");
+        fs::create_dir_all(root.join("dir")).unwrap();
+        fs::write(root.join("dir/child.txt"), b"1234").unwrap();
+        fs::write(root.join("top.txt"), b"12").unwrap();
+
+        let database = temporary_database("missing-identity-commit");
+        let repository = ScanRepository::new(database.clone());
+        repository.initialize().unwrap();
+        let checkpoints = IndexCheckpointRepository::new(database.clone());
+        checkpoints.initialize().unwrap();
+        let root_path = root.to_string_lossy().into_owned();
+        full_scan(
+            &repository,
+            &root,
+            Some(&IndexCheckpoint {
+                root_path: root_path.clone(),
+                platform: "macos".to_owned(),
+                volume_identity: "volume".to_owned(),
+                root_identity: "root".to_owned(),
+                history_source: "fsevents".to_owned(),
+                history_token: "fsevents:v1:12".to_owned(),
+                baseline_scan_id: None,
+                updated_at: 1,
+            }),
+        );
+        let baseline = latest_scan_id(&database);
+        let sessions = session_ids(&database);
+        let checkpoint = checkpoints.load(&root_path).unwrap().unwrap();
+        assert_eq!(checkpoint.baseline_scan_id, Some(baseline));
+
+        fs::write(root.join("top.txt"), [0_u8; 32]).unwrap();
+        for (label, targets) in [
+            ("root全置換", vec![target(".")]),
+            (
+                "通常target",
+                vec![target("top.txt"), recursive_target("dir")],
+            ),
+        ] {
+            // 走査が失敗すれば確定へ進まないので、apply_staged_snapshotは呼ばない。
+            let outcome = rescan_targets_with(&root, &targets, || true, |_| {}, |_| None);
+            assert_eq!(
+                outcome.err().as_deref(),
+                Some("走査rootのvolume identityを取得できません"),
+                "{label}"
+            );
+            assert_eq!(session_ids(&database), sessions, "{label}");
+            assert_eq!(
+                checkpoints.load(&root_path).unwrap().unwrap(),
+                checkpoint,
+                "{label}"
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(database).unwrap();
     }
 
     fn skip_progress(reason: &'static str) -> ScanProgress {

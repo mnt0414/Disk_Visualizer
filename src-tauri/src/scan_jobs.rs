@@ -1066,6 +1066,12 @@ mod incremental_tests {
         ///
         /// どちらが先でもよいが、cancelが成功を返したなら確定していない、
         /// 断られたなら確定している、のどちらかでなければならない。
+        ///
+        /// 断り方は2通りある。確定フェーズの開始に間に合わなかった場合は「確定中」、
+        /// workerが確定まで終えたあとに届いた場合は「完了済み」を返す。どちらも
+        /// この競合では正当な応答なので、文言を確かめたうえで同じ整合性を検証する。
+        /// 個々のフェーズを狙った検証は`refuses_to_pause_or_cancel_once_the_commit_has_started`
+        /// と`refuses_to_pause_or_cancel_after_the_commit_succeeded`が決定論的に行う。
         #[test]
         fn settles_a_cancel_that_races_the_start_of_the_commit() {
             let fixture = fixture("cancel-race");
@@ -1099,7 +1105,14 @@ mod incremental_tests {
                 }
                 // 断ったなら、確定は最後まで進んでいる。
                 Err(error) => {
-                    assert_eq!(error, "スキャン結果の確定中はキャンセルできません");
+                    assert!(
+                        matches!(
+                            error.as_str(),
+                            "スキャン結果の確定中はキャンセルできません"
+                                | "完了済みのスキャンはキャンセルできません"
+                        ),
+                        "{error}"
+                    );
                     assert_eq!(snapshot.status, ScanJobStatus::Completed);
                     let saved = snapshot.saved_scan_id.unwrap();
                     assert_eq!(session_ids(&fixture.database).len(), before.len() + 1);

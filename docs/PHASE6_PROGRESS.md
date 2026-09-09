@@ -167,6 +167,30 @@ FSEventsのdevice相対pathを、走査root相対の安全なpathへ変換する
 検証したのはmacOSでのRustテスト（158 passed／0 failed／1 ignored）とfrontendのnpm検証まで。
 実volume境界・実FSEvents経路・アプリUI・Windows実機・二重OS CIは未実施で、タスク1は未完了。
 
+## 追加修正：R1〜R3の再レビューで受けた2件
+
+上のR1〜R3（8b5d6a4）に対する再レビューで受けた2件を修正した。詳細は
+`docs/task1-integration-report.md`の「追加修正：R1〜R3の再レビューで受けた2件」にある。
+変更したのは`incremental_scan.rs`と`scan_jobs.rs`の2ファイルで、frontendは触っていない。
+
+- **走査rootのvolume identityを取得できなければ列挙を始めない。** R1では現在のentry側が
+  取れない場合だけを`Unknown`へ倒しており、root側が取れないまま走査へ入れる構造が残っていた。
+  部分再走査のcontextを「確認済みidentity」必須（`&str`）に変え、実際に走査へ使うroot handleから
+  identityを取れなければ、entry列挙も子directory走査も始める前に失敗させる。checkpointに保存した
+  値は代用にしない。確定直前の`verify_root_identity`はそのまま残す。`parent_volume_scope`は
+  両側が確認できて一致したときだけ`Inside`で、root側不明も`Unknown`へ倒す。共有scannerと
+  フルスキャンの経路は変更していない
+- **確定開始と競合したcancelの正当な結果を網羅する。** workerが先に確定まで終えた場合の
+  「完了済み」拒否も正当な応答なので、競合テストは2つの拒否文言のどちらかであることを確かめ、
+  どちらでも同じ整合性検証（新snapshotを指す・sessionが1件増える・checkpointが進む）を行う。
+  任意のErrを通す緩いassertionにはしていない。確定前・確定中・確定後を狙う決定論的なテストは
+  そのまま残し、確定処理本体（`begin_finalizing`）にも手を入れていない
+
+この2件は、判定関数だけでなく実際の部分走査入口で拒否されること、修正前は落ちて修正後に
+通ることをログで残している（`~/Library/Logs/Disk_Visualizer/task1-followup-20260908/`）。
+検証したのはmacOSでのRustテスト（160 passed／0 failed／1 ignored）まで。Windowsでの実行、
+実volume境界・実FSEvents経路・アプリUI・二重OS CIは引き続き未実施で、タスク1は未完了。
+
 ## 次の実装
 
 タスク1の完了条件を満たすまで、タスク2には着手しない。

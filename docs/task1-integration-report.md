@@ -4,7 +4,9 @@
 
 2026-09-08。個別に実装済みだった構成要素を、FSEvents履歴の取得からSQLiteスナップショット確定までの
 一本の差分更新経路として接続し、続けて統合コードの安全性を再レビューして不足を修正した。
-さらに再レビューの指摘3件（R1〜R3）を修正した（「レビュー指摘R1〜R3の修正」）。
+さらに再レビューの指摘3件（R1〜R3）を修正し、その再レビューで受けた2件
+（走査rootのvolume identity未取得の拒否、確定開始と競合したcancelのテスト網羅）も修正した
+（「レビュー指摘R1〜R3の修正」「追加修正：R1〜R3の再レビューで受けた2件」）。
 
 実施した検証は次の範囲に限る。「Mac検証完了」とは扱わない。
 
@@ -26,7 +28,8 @@ Windows実機、二重OS CI、上限値の実値でのメモリ・時間計測�
 - 作業ブランチ：feat/task1-incremental-integration-20260907（02ae78dから作成）
 - 統合コミット：43d8d63（実装）、3bba18c（本報告書の初版）
 - 安全性再レビューによる修正：03db83d
-- レビュー指摘R1〜R3の修正：03db83d以降の作業ツリー変更（未コミット）
+- レビュー指摘R1〜R3の修正：8b5d6a4
+- 追加修正（root identity未取得の拒否、競合テストの網羅）：8b5d6a4以降の作業ツリー変更（未コミット）
 
 ## 変更内容と根拠
 
@@ -308,6 +311,9 @@ stagingへ受理するため、不完全な部分木でbaselineを置換しcheck
 **結果**：各失敗ケースで新しい完了sessionができず、baselineとcheckpointが変わらないことを
 確認した。entry列挙失敗は権限に頼らず失敗注入で決定論的に再現している。
 
+ここで`Unknown`へ倒したのは「現在のentry側のidentityが取れない」場合だけで、走査root側が
+取れない場合はこの節では直していない。それは後述の「追加修正」の追加1で扱う。
+
 ### R2：WindowsテストのUnix限定API参照を分離
 
 **指摘**：`incremental_scan.rs`のテストmoduleは`cfg(test)`のみなのに、
@@ -413,6 +419,8 @@ pause／cancelのfinalizing判定だけを外す                    → 4 failed
 （他テストと並走する負荷に依存する）。確定フェーズの前後で確実に止める2本のテストが、
 決定論的な側を担保している。
 
+この競合テストが正当な応答を1つ取りこぼしていた点は、後述の「追加修正」の追加2で直した。
+
 ### 付随修正：一時DB名の衝突
 
 R3のテストが同時に走査を走らせるようになった結果、一時DBの名前がprocess内で衝突した。
@@ -425,6 +433,110 @@ R3のテストが同時に走査を走らせるようになった結果、一時
 どちらも名前にprocess内の連番（`AtomicU64`）を加えて分けた。名前が重なると別々の走査の結果が
 1つの一時DBへ混ざるため、テストの都合だけの問題ではない。`SeenFileStore`側は修正前に
 全体実行40回中4回落ちていたものが、修正後は40回中0回になった。
+
+## 追加修正：R1〜R3の再レビューで受けた2件
+
+R1〜R3の修正（8b5d6a4）に対する再レビューで受けた2件への対応。前節までのR1〜R3とは別の作業で、
+変更したのは`src-tauri/src/incremental_scan.rs`と`src-tauri/src/scan_jobs.rs`の2ファイル。
+frontendのファイルは触っていない。
+
+### 追加1：走査rootのvolume identityを取得できなければ列挙を始めない
+
+**指摘**：`parent_volume_scope(None, Some(...))`と`(None, None)`が`Inside`になる。
+`rescan_targets`も`root_volume_identity = None`を拒否せず共有scannerへ渡し、
+`crosses_volume(None, ...)`は`false`を返す。root側のidentityが取れないまま部分再走査が
+最後まで進み、境界を確認できていない結果でbaselineを置き換え得る。
+
+**原因**：R1で`Unknown`へ倒したのは現在のentry側が取れない場合だけだった。
+`RescanContext.root_volume_identity`が`Option<&str>`のままで、未取得のまま走査へ入れる構造だった。
+
+**修正**：
+
+- `RescanContext.root_volume_identity`を`&str`にした。未取得のままcontextを組み立てられない。
+- `open_root_with_identity`を追加し、実際に走査へ使うroot handleからidentityを取る。
+  取れなければ`走査rootのvolume identityを取得できません`で失敗する。この呼び出しは
+  `SeenFileStore::new`・`IncrementalStaging::new`・`directory_entries`・`rescan_groups`の
+  すべてより前にあり、entryを1件も列挙せず子directoryへも降りない。
+- checkpointに保存された`volume_identity`は今回の取得失敗の代用にしない。確定直前の
+  `verify_root_identity`（C節）はそのまま残し、走査前の取得と確定直前の再確認の2点で確かめる。
+- `parent_volume_scope`は両側が`Some`で一致したときだけ`Inside`。root側が`None`の組も
+  `Unknown`へ倒す。引数は`Option`のままにして、未取得の組も判定として検証できるようにした。
+- 共有scannerの`crosses_volume`・`scan_entry`とフルスキャンの経路は変更していない。
+
+**再現テスト**：
+
+| 指摘の要求ケース | テスト |
+|---|---|
+| root=None・current=Some／root=None・current=None／root=Some・current=None／一致／不一致 | `separates_an_unknown_volume_identity_from_a_confirmed_other_volume`（5組すべて） |
+| root identity取得失敗を注入したとき、列挙処理が呼ばれない | `refuses_to_start_a_rescan_without_the_root_volume_identity` |
+| root全置換と通常targetの両方で、確定sessionが増えずbaselineとcheckpointが変わらない | `keeps_the_baseline_and_checkpoint_without_the_root_volume_identity` |
+
+判定関数だけでは終えず、実際の入口`rescan_targets`で拒否されることを検証している。
+差し替えられるのはidentity取得だけで（関数ポインタ`RootVolumeIdentity`）、
+`Dir::open_ambient_dir`もガードの位置も本番と同じ経路を通る。公開している`rescan_targets`は
+`file_metrics::volume_identity_from_open_file`を渡すだけの薄いラッパで、既存テストは
+この既定経路を通っている。
+
+「列挙処理が呼ばれない」は、進捗callbackと中断確認callbackの呼び出し回数がどちらも0で
+あることで確かめる。root全置換（`.`）と通常targetの両方を同じテスト内で通す。
+
+**修正前の観測**：注入用の差し替え口だけを先に足し、拒否処理を入れない状態で実行した
+（`red-incremental-scan.log`、終了コード101、3 failed）。
+
+```
+assertion failed: matches!(parent_volume_scope(None, Some("volume")), ParentVolume::Unknown)
+identity不明のまま走査した: root全置換
+（keeps_the_baseline_and_checkpoint_without_the_root_volume_identity）root全置換
+```
+
+2本目は、拒否が無ければroot全置換がそのまま成功していたことを示す。拒否処理を入れると
+3本とも通る（`green-incremental-scan.log`、20 passed）。
+
+### 追加2：確定開始と競合したcancelの正当な結果を網羅する
+
+**指摘**：`settles_a_cancel_that_races_the_start_of_the_commit`は、cancelが断られたときの文言を
+「確定中」だけに限定していた。workerが先に確定まで終えていれば「完了済み」も正当な応答になる。
+
+**原因**：`ScanManager::cancel`は2種類の拒否を返す。`state.status`がRunning／Pausedでなければ
+「完了済みのスキャンはキャンセルできません」、`control.finalizing`が立っていれば
+「スキャン結果の確定中はキャンセルできません」。テストは後者だけを正当としていた。
+
+**修正**：Errの分岐でこの2文言のどちらかであることを`matches!`で確かめ、どちらでも同じ
+整合性検証（Completed、`saved_scan_id`あり、完了sessionが1件増える、checkpointのtokenが進み
+`baseline_scan_id`が新しいsnapshotを指す）を行う。任意のErrを通す分岐は作らない。
+cancelが成功した場合の検証（Cancelled、`saved_scan_id`なし、session据え置き、checkpoint据え置き）も
+そのまま残す。`begin_finalizing`と確定処理本体には手を入れていない。
+
+確定前・確定中・確定後を狙う決定論的なテストは従来どおり残している。
+
+| フェーズ | テスト | 期待 |
+|---|---|---|
+| 確定前 | `baseline_updates::cancels_at_the_last_moment_before_the_commit` | cancel成功。baselineもcheckpointも動かない |
+| 確定中 | `baseline_updates::refuses_to_pause_or_cancel_once_the_commit_has_started` | 「確定中」で拒否 |
+| 確定後 | `baseline_updates::refuses_to_pause_or_cancel_after_the_commit_succeeded` | 「完了済み」で拒否 |
+| 同時 | `baseline_updates::settles_a_cancel_that_races_the_start_of_the_commit` | 成功なら未確定、拒否なら上の2文言のどちらかで確定済み |
+
+**修正前の観測**：この環境で両者を同じ`Barrier`から離すと、常にworkerが先にcontrol lockを取る。
+200回の実行はすべて「確定中」で、cancel成功も「完了済み」も観測できなかった
+（`race-branch-tally.log`）。そこで`start.wait()`の直後にsleepを入れてworkerを先行させ、
+「完了済み」で断られる並びを作った。修正前のassertionはそこで落ちる
+（`red-cancel-race-worker-first.log`、終了コード101）。
+
+```
+RACE-BRANCH cancel-rejected 完了済みのスキャンはキャンセルできません
+assertion `left == right` failed
+  left: "完了済みのスキャンはキャンセルできません"
+ right: "スキャン結果の確定中はキャンセルできません"
+```
+
+修正後は同じ並びで通り、確定済み側の整合性検証も満たす（`green-cancel-race-worker-first.log`）。
+sleepと分岐の`eprintln!`は観測のための一時変更で、コミットするテストには入れていない。
+
+**反復実行**：修正後の状態で競合テスト単独200回、全体20回を実行していずれも0 failed
+（`repeat-runs.log`）。
+
+**未検証**：この環境では「完了済み」で断られる並びが自然には出ない。sleepで並びを作った
+観測までで、実機の負荷条件下での分布は測っていない。
 
 ## baseline・checkpointの契約
 
@@ -529,7 +641,7 @@ node v22.23.2（`/opt/homebrew/opt/node@22/bin/node`）、npm 10.9.8。
 cargo fmt --check                         終了コード0（差分なし）
 cargo clippy ... -- -D warnings           終了コード0（Finished dev profile、警告0）
 cargo test --locked                       終了コード0
-                                          158 passed; 0 failed; 1 ignored
+                                          160 passed; 0 failed; 1 ignored
                                           main.rs 0件、doc-tests 0件
 npm ci                                    終了コード0（0 vulnerabilities）
 npm run check                             終了コード0（tsc -b）
@@ -538,10 +650,13 @@ npm run build                             終了コード0
 ```
 
 統合作業前は107 passed／0 failed／1 ignored。統合で129、安全性再レビューで142、
-指摘R1〜R3の修正で158になった。再レビューでは18本追加し、5本を
+指摘R1〜R3の修正で158、今回の追加修正で160になった。再レビューでは18本追加し、5本を
 `#[cfg(unix)] mod baseline_updates`へ移した（差し引き+13）。R1〜R3では16本追加した
 （R1で9本、R3で7本）。`fails_closed_when_a_target_cannot_be_read`は
 `#[cfg(unix)] mod read_failures`へ移しただけで、増減には数えていない。
+追加修正では`incremental_scan`に2本追加し、既存2本
+（`separates_an_unknown_volume_identity_from_a_confirmed_other_volume`と
+`settles_a_cancel_that_races_the_start_of_the_commit`）の検査内容を広げた。
 
 | モジュール | 件数 | 増減 |
 |---|---|---|
@@ -549,7 +664,7 @@ npm run build                             終了コード0
 | `incremental_trust` | 13 | +2（祖先のsubtree再走査要求） |
 | `incremental_storage` | 14 | +3（評価後のcheckpoint移動、未再走査リンクのmetadata、確定connectionのメモリ上限） |
 | `incremental_rescan` | 13 | 変更なし |
-| `incremental_scan` | 18 | 再レビューは変更なし（一致比較テストの内容を強化）、R1+7 |
+| `incremental_scan` | 20 | 再レビューは変更なし（一致比較テストの内容を強化）、R1+7、追加修正+2 |
 | `incremental_paths` | 8 | +1（祖先と無関係な変更の区別） |
 | `index_checkpoint` | 7 | +2（新規v8と移行v8のschema一致、移行失敗からの復旧） |
 | `storage` | 10 | |
@@ -628,7 +743,21 @@ checkpointの追い越し、rootの差し替え、2本のstartの競合）は、
 ~/Library/Logs/Disk_Visualizer/task1-r1r2r3-20260908/npm-check.log
 ~/Library/Logs/Disk_Visualizer/task1-r1r2r3-20260908/npm-test.log
 ~/Library/Logs/Disk_Visualizer/task1-r1r2r3-20260908/npm-build.log
+~/Library/Logs/Disk_Visualizer/task1-followup-20260908/cargo-fmt.log
+~/Library/Logs/Disk_Visualizer/task1-followup-20260908/cargo-clippy.log
+~/Library/Logs/Disk_Visualizer/task1-followup-20260908/cargo-test.log
+~/Library/Logs/Disk_Visualizer/task1-followup-20260908/red-incremental-scan.log
+~/Library/Logs/Disk_Visualizer/task1-followup-20260908/green-incremental-scan.log
+~/Library/Logs/Disk_Visualizer/task1-followup-20260908/red-cancel-race-worker-first.log
+~/Library/Logs/Disk_Visualizer/task1-followup-20260908/green-cancel-race-worker-first.log
+~/Library/Logs/Disk_Visualizer/task1-followup-20260908/race-branch-tally.log
+~/Library/Logs/Disk_Visualizer/task1-followup-20260908/repeat-runs.log
+~/Library/Logs/Disk_Visualizer/task1-followup-20260908/verification-summary.txt
 ```
+
+`task1-followup-20260908`のログは先頭にコマンド、末尾に終了コードを書いてある。
+このラウンドではfrontendのファイルを変更していないため、npm検証は再実行していない
+（最後の実行は`task1-r1r2r3-20260908`の`npm-*.log`）。
 
 各ログの末尾に実行コマンドと終了コードを記録している。
 
@@ -687,7 +816,7 @@ cargo clippy --locked --all-targets --all-features --manifest-path src-tauri/Car
 cargo test --locked --manifest-path src-tauri/Cargo.toml
 ```
 
-158 passed／0 failed／1 ignored、clippy警告0が再現すれば同じ地点にいる。
+160 passed／0 failed／1 ignored、clippy警告0が再現すれば同じ地点にいる。
 
 frontend検証にはnode@22を使う（既定のnodeは`libsimdutf.34.dylib`不在でdyldエラーになる）。
 コマンド単位でPATHの先頭に`/opt/homebrew/opt/node@22/bin`を置く。symlinkでの取り繕いや
