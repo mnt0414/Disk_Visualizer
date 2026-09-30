@@ -1,13 +1,19 @@
 use crate::file_metrics;
+use crate::incremental_rescan::IncrementalRescanTarget;
+use crate::incremental_storage::IncrementalEntry;
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, DirEntry, ReadDir};
+use cap_std::fs::{Dir, DirEntry, FileType, ReadDir};
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::cell::Cell;
 use std::cmp::Reverse;
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::io;
+use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_SUMMARY_ENTRIES: usize = 200;
+pub(crate) const CANCELLED_MESSAGE: &str = "スキャンはキャンセルされました";
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScanProgress {
@@ -132,6 +138,45 @@ struct DirectoryFrame {
     entries: ReadDir,
 }
 
+/// 走査対象のentryを表す。フルスキャンでは親directoryの列挙結果、
+/// 部分再走査では親Dir handleと名前の組を使い、以降の判定処理を共有する。
+enum EntryHandle<'a> {
+    Listed(DirEntry),
+    Named { parent: &'a Dir, name: OsString },
+}
+
+impl EntryHandle<'_> {
+    fn file_name(&self) -> OsString {
+        match self {
+            Self::Listed(entry) => entry.file_name(),
+            Self::Named { name, .. } => name.clone(),
+        }
+    }
+
+    fn file_type(&self) -> io::Result<FileType> {
+        match self {
+            Self::Listed(entry) => entry.file_type(),
+            Self::Named { parent, name } => parent
+                .symlink_metadata(name)
+                .map(|metadata| metadata.file_type()),
+        }
+    }
+
+    fn open(&self) -> io::Result<cap_std::fs::File> {
+        match self {
+            Self::Listed(entry) => entry.open(),
+            Self::Named { parent, name } => parent.open(name),
+        }
+    }
+
+    fn open_dir(&self) -> io::Result<Dir> {
+        match self {
+            Self::Listed(entry) => entry.open_dir(),
+            Self::Named { parent, name } => parent.open_dir(name),
+        }
+    }
+}
+
 fn next_entry(stack: &mut Vec<DirectoryFrame>) -> Option<(PathBuf, Result<DirEntry, ()>)> {
     loop {
         let frame = stack.last_mut()?;
@@ -176,7 +221,7 @@ fn skipped<P: FnMut(&ScanProgress)>(
 }
 
 fn scan_entry<C, P>(
-    entry: DirEntry,
+    entry: EntryHandle<'_>,
     relative_path: PathBuf,
     root: &Path,
     root_volume_identity: Option<&str>,
@@ -195,7 +240,7 @@ where
         let (parent, entry) = match current.take() {
             Some(value) => value,
             None => match next_entry(&mut stack) {
-                Some((parent, Ok(entry))) => (parent, entry),
+                Some((parent, Ok(entry))) => (parent, EntryHandle::Listed(entry)),
                 Some((parent, Err(()))) => {
                     skipped(
                         &mut totals,
@@ -209,7 +254,7 @@ where
             },
         };
         if !control() {
-            return Err("スキャンはキャンセルされました".to_owned());
+            return Err(CANCELLED_MESSAGE.to_owned());
         }
         let name = entry.file_name();
         let relative = parent.join(&name);
@@ -381,7 +426,7 @@ where
     let seen_files = SeenFileStore::new()?;
     for child in children {
         if !control() {
-            return Err("スキャンはキャンセルされました".to_owned());
+            return Err(CANCELLED_MESSAGE.to_owned());
         }
         let child = match child {
             Ok(value) => value,
@@ -399,7 +444,7 @@ where
         let child_path = root.join(&name);
         let is_directory = child.file_type().is_ok_and(|value| value.is_dir());
         let item = scan_entry(
-            child,
+            EntryHandle::Listed(child),
             PathBuf::new(),
             &root,
             root_volume_identity.as_deref(),
@@ -444,6 +489,246 @@ where
 
 pub fn scan_folder_path(path: &Path) -> Result<ScanSummary, String> {
     scan_folder_path_controlled(path, || true, |_| {})
+}
+
+/// 部分再走査の結果。`Scanned`以外は差分更新を安全に続行できないことを表し、
+/// 呼び出し側はフルスキャンへ戻す。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TargetScanOutcome {
+    Scanned(Vec<IncrementalEntry>),
+    UnsafeTarget,
+    UnreadableDirectoryEntry,
+    TooManyEntries,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetScanAbort {
+    UnreadableDirectoryEntry,
+    TooManyEntries,
+}
+
+enum TargetParent {
+    Absent,
+    Unsafe,
+    Found(Dir),
+}
+
+fn incremental_entry(progress: &ScanProgress) -> Option<IncrementalEntry> {
+    if progress.file_count == 0 && progress.directory_count == 0 && progress.skipped_count == 0 {
+        return None;
+    }
+    Some(IncrementalEntry {
+        path: progress.path.clone(),
+        file_count: progress.file_count,
+        directory_count: progress.directory_count,
+        skipped_count: progress.skipped_count,
+        skip_reason: progress.skip_reason,
+        counted_size_bytes: progress.counted_size_bytes,
+        logical_size_bytes: progress.logical_size_bytes,
+        allocated_size_bytes: progress.allocated_size_bytes,
+        file_identity: progress.file_identity.clone(),
+        volume_identity: progress.volume_identity.clone(),
+        modified_at: progress.modified_at,
+    })
+}
+
+fn target_components(relative_path: &Path) -> Option<Vec<OsString>> {
+    if relative_path.as_os_str().is_empty() {
+        return None;
+    }
+    let mut components = Vec::new();
+    for component in relative_path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => components.push(value.to_owned()),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(components)
+}
+
+/// rootから対象の親directoryまで、symlinkを辿らず同一volume上の実directoryだけを降りる。
+/// 途中が存在しなければ対象は削除済み(`Absent`)、symlink・非directory・別volume・
+/// volume不明・読取不能ならfail closed(`Unsafe`)とする。
+fn descend_to_parent(
+    root_directory: &Dir,
+    root_volume_identity: Option<&str>,
+    parents: &[OsString],
+) -> Result<TargetParent, String> {
+    let mut current = root_directory
+        .try_clone()
+        .map_err(|error| format!("スキャン対象を開けません: {error}"))?;
+    for component in parents {
+        let metadata = match current.symlink_metadata(component) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(TargetParent::Absent)
+            }
+            Err(_) => return Ok(TargetParent::Unsafe),
+        };
+        if !metadata.file_type().is_dir() {
+            return Ok(TargetParent::Unsafe);
+        }
+        let next = match current.open_dir(component) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(TargetParent::Absent)
+            }
+            Err(_) => return Ok(TargetParent::Unsafe),
+        };
+        let std_next = next.into_std_file();
+        let volume_identity = file_metrics::volume_identity_from_open_file(&std_next);
+        let same_volume = matches!(
+            (root_volume_identity, volume_identity.as_deref()),
+            (Some(root), Some(candidate)) if root == candidate
+        );
+        if !same_volume {
+            return Ok(TargetParent::Unsafe);
+        }
+        current = Dir::from_std_file(std_next);
+    }
+    Ok(TargetParent::Found(current))
+}
+
+/// 指定targetだけをcapability handle経由で再帰走査し、フルスキャンと同じ規則の
+/// `IncrementalEntry`を返す。走査は読み取り専用で、symlinkを辿らず、volumeを跨がない。
+/// 存在しないtargetは何も出力しない(=削除)。
+pub(crate) fn scan_targets_controlled<C, P>(
+    root: &Path,
+    targets: &[IncrementalRescanTarget],
+    max_entries: usize,
+    mut control: C,
+    mut progress: P,
+) -> Result<TargetScanOutcome, String>
+where
+    C: FnMut() -> bool,
+    P: FnMut(&ScanProgress),
+{
+    if !root.is_absolute() {
+        return Err("スキャン対象には絶対パスを指定してください".to_owned());
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("スキャン対象を開けません: {error}"))?;
+    if !root.is_dir() {
+        return Err("スキャン対象はフォルダである必要があります".to_owned());
+    }
+    let root_directory = Dir::open_ambient_dir(&root, ambient_authority())
+        .map_err(|error| format!("スキャン対象を開けません: {error}"))?;
+    let std_root = root_directory.into_std_file();
+    let root_volume_identity = file_metrics::volume_identity_from_open_file(&std_root);
+    let root_directory = Dir::from_std_file(std_root);
+    let seen_files = SeenFileStore::new()?;
+    let abort: Cell<Option<TargetScanAbort>> = Cell::new(None);
+    let mut replacements: Vec<IncrementalEntry> = Vec::new();
+    let mut guarded_control = || abort.get().is_none() && control();
+    let mut collecting_progress = |event: &ScanProgress| {
+        if event.skip_reason == Some("directory_entry_unreadable") {
+            abort.set(Some(TargetScanAbort::UnreadableDirectoryEntry));
+        }
+        if let Some(entry) = incremental_entry(event) {
+            replacements.push(entry);
+            if replacements.len() > max_entries && abort.get().is_none() {
+                abort.set(Some(TargetScanAbort::TooManyEntries));
+            }
+        }
+        progress(event);
+    };
+    let mut result = Ok(());
+    for target in targets {
+        if !guarded_control() {
+            result = Err(CANCELLED_MESSAGE.to_owned());
+            break;
+        }
+        let Some(components) = target_components(&target.relative_path) else {
+            return Ok(TargetScanOutcome::UnsafeTarget);
+        };
+        let scanned = if let Some((name, parents)) = components.split_last() {
+            match descend_to_parent(&root_directory, root_volume_identity.as_deref(), parents)? {
+                TargetParent::Unsafe => return Ok(TargetScanOutcome::UnsafeTarget),
+                TargetParent::Absent => Ok(()),
+                TargetParent::Found(parent) => {
+                    if let Err(error) = parent.symlink_metadata(name) {
+                        if error.kind() == io::ErrorKind::NotFound {
+                            continue;
+                        }
+                    }
+                    scan_entry(
+                        EntryHandle::Named {
+                            parent: &parent,
+                            name: name.clone(),
+                        },
+                        parents.iter().collect(),
+                        &root,
+                        root_volume_identity.as_deref(),
+                        &mut guarded_control,
+                        &mut collecting_progress,
+                        &seen_files,
+                    )
+                    .map(|_| ())
+                }
+            }
+        } else {
+            scan_root_children(
+                &root_directory,
+                &root,
+                root_volume_identity.as_deref(),
+                &mut guarded_control,
+                &mut collecting_progress,
+                &seen_files,
+                &abort,
+            )
+        };
+        if let Err(error) = scanned {
+            result = Err(error);
+            break;
+        }
+    }
+    match (abort.get(), result) {
+        (Some(TargetScanAbort::UnreadableDirectoryEntry), _) => {
+            Ok(TargetScanOutcome::UnreadableDirectoryEntry)
+        }
+        (Some(TargetScanAbort::TooManyEntries), _) => Ok(TargetScanOutcome::TooManyEntries),
+        (None, Err(error)) => Err(error),
+        (None, Ok(())) => Ok(TargetScanOutcome::Scanned(replacements)),
+    }
+}
+
+fn scan_root_children<C, P>(
+    root_directory: &Dir,
+    root: &Path,
+    root_volume_identity: Option<&str>,
+    control: &mut C,
+    progress: &mut P,
+    seen_files: &SeenFileStore,
+    abort: &Cell<Option<TargetScanAbort>>,
+) -> Result<(), String>
+where
+    C: FnMut() -> bool,
+    P: FnMut(&ScanProgress),
+{
+    let children = root_directory
+        .entries()
+        .map_err(|error| format!("スキャン対象を読み取れません: {error}"))?;
+    for child in children {
+        if !control() {
+            return Err(CANCELLED_MESSAGE.to_owned());
+        }
+        let Ok(child) = child else {
+            abort.set(Some(TargetScanAbort::UnreadableDirectoryEntry));
+            return Ok(());
+        };
+        scan_entry(
+            EntryHandle::Listed(child),
+            PathBuf::new(),
+            root,
+            root_volume_identity,
+            control,
+            progress,
+            seen_files,
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -514,5 +799,164 @@ mod tests {
         assert_eq!(summary.entries.len(), MAX_SUMMARY_ENTRIES);
         assert!(summary.entries_truncated);
         fs::remove_dir_all(root).unwrap();
+    }
+    fn target(path: &str) -> IncrementalRescanTarget {
+        IncrementalRescanTarget {
+            relative_path: path.split('/').collect(),
+            recursive: true,
+        }
+    }
+    fn scanned(root: &Path, targets: &[&str]) -> TargetScanOutcome {
+        let targets = targets
+            .iter()
+            .map(|value| target(value))
+            .collect::<Vec<_>>();
+        scan_targets_controlled(root, &targets, usize::MAX, || true, |_| {}).unwrap()
+    }
+    fn scanned_paths(outcome: TargetScanOutcome, root: &Path) -> Vec<String> {
+        let TargetScanOutcome::Scanned(entries) = outcome else {
+            panic!("部分再走査が完了していません: {outcome:?}");
+        };
+        let mut paths = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/")
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+    #[test]
+    fn scans_only_requested_targets_recursively() {
+        let root = temporary_directory("partial").canonicalize().unwrap();
+        fs::create_dir_all(root.join("dir").join("sub")).unwrap();
+        fs::write(root.join("skip.bin"), [0_u8; 3]).unwrap();
+        fs::write(root.join("dir").join("a.bin"), [0_u8; 2]).unwrap();
+        fs::write(root.join("dir").join("sub").join("b.bin"), [0_u8; 4]).unwrap();
+        fs::write(root.join("other.bin"), [0_u8; 5]).unwrap();
+        let paths = scanned_paths(scanned(&root, &["dir", "other.bin"]), &root);
+        assert_eq!(
+            paths,
+            ["dir", "dir/a.bin", "dir/sub", "dir/sub/b.bin", "other.bin"]
+        );
+        let nested = scanned_paths(scanned(&root, &["dir/sub/b.bin"]), &root);
+        assert_eq!(nested, ["dir/sub/b.bin"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn dot_target_scans_every_child_of_root() {
+        let root = temporary_directory("partial-root").canonicalize().unwrap();
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(root.join("dir").join("a.bin"), [0_u8; 2]).unwrap();
+        fs::write(root.join("b.bin"), [0_u8; 4]).unwrap();
+        let paths = scanned_paths(scanned(&root, &["."]), &root);
+        assert_eq!(paths, ["b.bin", "dir", "dir/a.bin"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn absent_targets_produce_no_entries() {
+        let root = temporary_directory("partial-absent")
+            .canonicalize()
+            .unwrap();
+        fs::write(root.join("kept.bin"), [0_u8; 2]).unwrap();
+        let outcome = scanned(&root, &["missing", "missing/child", "kept.bin/../x"]);
+        // ".."を含むtargetは経路として不正なのでfail closedになる。
+        assert_eq!(outcome, TargetScanOutcome::UnsafeTarget);
+        let outcome = scanned(&root, &["missing", "missing/child/deep"]);
+        assert_eq!(outcome, TargetScanOutcome::Scanned(Vec::new()));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn rejects_non_directory_intermediate_component() {
+        let root = temporary_directory("partial-file").canonicalize().unwrap();
+        fs::write(root.join("file.bin"), [0_u8; 2]).unwrap();
+        assert_eq!(
+            scanned(&root, &["file.bin/child"]),
+            TargetScanOutcome::UnsafeTarget
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn stops_when_replacement_entries_exceed_limit() {
+        let root = temporary_directory("partial-limit").canonicalize().unwrap();
+        for index in 0..4 {
+            fs::write(root.join(format!("{index}.bin")), [0_u8; 1]).unwrap();
+        }
+        let outcome = scan_targets_controlled(&root, &[target(".")], 3, || true, |_| {}).unwrap();
+        assert_eq!(outcome, TargetScanOutcome::TooManyEntries);
+        let outcome = scan_targets_controlled(&root, &[target(".")], 4, || true, |_| {}).unwrap();
+        assert!(matches!(outcome, TargetScanOutcome::Scanned(_)));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cancels_partial_scan_and_reports_progress() {
+        let root = temporary_directory("partial-cancel")
+            .canonicalize()
+            .unwrap();
+        for index in 0..4 {
+            fs::write(root.join(format!("{index}.bin")), [0_u8; 1]).unwrap();
+        }
+        let mut seen = 0_u64;
+        let mut allowed = 5_u32;
+        let result = scan_targets_controlled(
+            &root,
+            &[target(".")],
+            usize::MAX,
+            || {
+                allowed = allowed.saturating_sub(1);
+                allowed > 0
+            },
+            |event| seen += event.file_count,
+        );
+        assert_eq!(result.unwrap_err(), CANCELLED_MESSAGE);
+        assert!(seen >= 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn partial_scan_requires_absolute_existing_root() {
+        assert!(
+            scan_targets_controlled(Path::new("relative"), &[], usize::MAX, || true, |_| {})
+                .is_err()
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn partial_scan_does_not_follow_symbolic_links() {
+        use std::os::unix::fs::symlink;
+        let root = temporary_directory("partial-symlink")
+            .canonicalize()
+            .unwrap();
+        let outside = temporary_directory("partial-outside");
+        fs::write(outside.join("outside.bin"), [0_u8; 16]).unwrap();
+        fs::create_dir(root.join("real")).unwrap();
+        fs::write(root.join("real").join("in.bin"), [0_u8; 1]).unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+        symlink(&outside, root.join("real").join("inner-link")).unwrap();
+        let TargetScanOutcome::Scanned(entries) = scanned(&root, &["link", "real"]) else {
+            panic!("部分再走査が完了していません");
+        };
+        let skipped = entries
+            .iter()
+            .filter(|entry| entry.skip_reason == Some("link_not_followed"))
+            .count();
+        assert_eq!(skipped, 2);
+        assert!(!entries
+            .iter()
+            .any(|entry| entry.path.to_string_lossy().contains("outside.bin")));
+        assert_eq!(
+            scanned(&root, &["link/outside.bin"]),
+            TargetScanOutcome::UnsafeTarget
+        );
+        assert_eq!(
+            scanned(&root, &["real/inner-link/outside.bin"]),
+            TargetScanOutcome::UnsafeTarget
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }

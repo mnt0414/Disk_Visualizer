@@ -8,6 +8,7 @@ pub mod fsevents_history;
 pub mod incremental_rescan;
 pub mod incremental_storage;
 pub mod incremental_trust;
+mod incremental_update;
 pub mod index_checkpoint;
 pub mod index_trust;
 pub mod macos_fsevents;
@@ -65,6 +66,13 @@ fn scan_folder(path: String) -> Result<ScanSummary, String> {
 #[tauri::command]
 fn start_scan(path: String, manager: State<'_, ScanManager>) -> Result<ScanJobSnapshot, String> {
     manager.start(path)
+}
+#[tauri::command]
+fn start_incremental_scan(
+    path: String,
+    manager: State<'_, ScanManager>,
+) -> Result<ScanJobSnapshot, String> {
+    manager.start_incremental(path)
 }
 #[tauri::command]
 fn get_scan_status(id: u64, manager: State<'_, ScanManager>) -> Result<ScanJobSnapshot, String> {
@@ -127,6 +135,7 @@ pub fn run() {
             classify_cache_path,
             scan_folder,
             start_scan,
+            start_incremental_scan,
             get_scan_status,
             pause_scan,
             resume_scan,
