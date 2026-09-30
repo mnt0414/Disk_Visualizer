@@ -2,7 +2,7 @@ use crate::cache_activity::{self, CacheObservation, CacheRuntimeState};
 use crate::cache_catalog::{self, CacheClassificationRef};
 use crate::index_checkpoint::{upsert_checkpoint, IndexCheckpoint};
 use crate::scanner::{ScanProgress, ScanSummary};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -350,11 +350,45 @@ impl ScanRepository {
         })
         .collect()
     }
+    /// 完了済みsessionを削除する場合は、同じrootのcheckpointも同じtransactionで削除する。
+    /// checkpointが基準sessionより新しいと、履歴位置以降の変更を古い基準へ適用して
+    /// 取りこぼすため、次回は必ずフルスキャンへ戻す。
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.connection()?
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|e| format!("スキャン履歴を削除できません: {e}"))?;
+        let session: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT root_path,status FROM scan_sessions WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("スキャン履歴を削除できません: {e}"))?;
+        if let Some((root_path, status)) = session {
+            let has_checkpoints: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='index_checkpoints')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("スキャン履歴を削除できません: {e}"))?;
+            if status == "complete" && has_checkpoints {
+                transaction
+                    .execute(
+                        "DELETE FROM index_checkpoints WHERE root_path=?1",
+                        [root_path],
+                    )
+                    .map_err(|e| format!("差分更新checkpointを削除できません: {e}"))?;
+            }
+        }
+        transaction
             .execute("DELETE FROM scan_sessions WHERE id=?1", [id])
             .map_err(|e| format!("スキャン履歴を削除できません: {e}"))?;
-        Ok(())
+        transaction
+            .commit()
+            .map_err(|e| format!("スキャン履歴を削除できません: {e}"))
     }
     pub fn integrity_check(&self) -> Result<bool, String> {
         let result: String = self
@@ -362,6 +396,9 @@ impl ScanRepository {
             .query_row("PRAGMA quick_check", [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
         Ok(result == "ok")
+    }
+    pub(crate) fn database_path(&self) -> &std::path::Path {
+        &self.database_path
     }
     #[cfg(test)]
     fn path(&self) -> &std::path::Path {
@@ -395,6 +432,9 @@ fn observation_from_progress(progress: &ScanProgress) -> Option<CacheObservation
 }
 
 impl StreamingScanWriter {
+    pub(crate) fn scan_id(&self) -> i64 {
+        self.scan_id
+    }
     pub(crate) fn record(&self, progress: &ScanProgress) {
         if progress.file_count == 0 && progress.directory_count == 0 && progress.skipped_count == 0
         {
@@ -565,6 +605,79 @@ mod tests {
         writer.complete(&summary(1)).unwrap();
         assert_eq!(repository.list().unwrap().len(), 1);
         assert!(repository.integrity_check().unwrap());
+        let _ = std::fs::remove_file(repository.path());
+    }
+    fn save_checkpoint(repository: &ScanRepository, root: &str) {
+        crate::index_checkpoint::IndexCheckpointRepository::new(repository.path().to_path_buf())
+            .save(&IndexCheckpoint {
+                root_path: root.to_owned(),
+                platform: "macos".to_owned(),
+                volume_identity: "7".to_owned(),
+                root_identity: "42".to_owned(),
+                history_source: "fsevents".to_owned(),
+                history_token: "fsevents:v1:10".to_owned(),
+                updated_at: 1,
+            })
+            .unwrap();
+    }
+    fn checkpoint_count(repository: &ScanRepository) -> i64 {
+        repository
+            .connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM index_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+    #[test]
+    fn deleting_complete_scan_removes_only_that_roots_checkpoint() {
+        let repository = repository("delete-checkpoint");
+        crate::index_checkpoint::IndexCheckpointRepository::new(repository.path().to_path_buf())
+            .initialize()
+            .unwrap();
+        let writer = repository.begin_stream("/tmp/sample").unwrap();
+        writer.complete(&summary(1)).unwrap();
+        save_checkpoint(&repository, "/tmp/sample");
+        save_checkpoint(&repository, "/tmp/other");
+        repository.delete(writer.scan_id()).unwrap();
+        assert!(repository.list().unwrap().is_empty());
+        assert_eq!(checkpoint_count(&repository), 1);
+        let remaining: String = repository
+            .connection()
+            .unwrap()
+            .query_row("SELECT root_path FROM index_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, "/tmp/other");
+        let _ = std::fs::remove_file(repository.path());
+    }
+    #[test]
+    fn deleting_incomplete_scan_keeps_checkpoint() {
+        let repository = repository("delete-incomplete");
+        crate::index_checkpoint::IndexCheckpointRepository::new(repository.path().to_path_buf())
+            .initialize()
+            .unwrap();
+        let complete = repository.begin_stream("/tmp/sample").unwrap();
+        complete.complete(&summary(1)).unwrap();
+        save_checkpoint(&repository, "/tmp/sample");
+        let interrupted = repository.begin_stream("/tmp/sample").unwrap();
+        interrupted.interrupt(false).unwrap();
+        let running = repository.begin_stream("/tmp/sample").unwrap();
+        repository.delete(interrupted.scan_id()).unwrap();
+        repository.delete(running.scan_id()).unwrap();
+        assert_eq!(checkpoint_count(&repository), 1);
+        assert_eq!(repository.list().unwrap().len(), 1);
+        let _ = std::fs::remove_file(repository.path());
+    }
+    #[test]
+    fn deleting_scan_works_without_checkpoint_table() {
+        let repository = repository("delete-no-table");
+        let writer = repository.begin_stream("/tmp/sample").unwrap();
+        writer.complete(&summary(1)).unwrap();
+        repository.delete(writer.scan_id()).unwrap();
+        assert!(repository.list().unwrap().is_empty());
+        repository.delete(9999).unwrap();
         let _ = std::fs::remove_file(repository.path());
     }
     #[test]

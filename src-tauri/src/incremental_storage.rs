@@ -24,6 +24,24 @@ pub struct IncrementalEntry {
     pub modified_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppliedIncrementalSnapshot {
+    pub scan_id: i64,
+    pub total_size_bytes: u64,
+    pub file_count: u64,
+    pub directory_count: u64,
+    pub skipped_count: u64,
+}
+
+/// 差分適用の結果。`HardLinkCrossesTarget`はhard link groupが再走査targetの内外に
+/// 跨がり、集計サイズを部分再走査だけでは保証できないことを表す。この場合は
+/// transactionをrollbackしており、sessionもcheckpointも書き込まれていない。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IncrementalApplyResult {
+    Applied(AppliedIncrementalSnapshot),
+    HardLinkCrossesTarget,
+}
+
 fn unix_time() -> Result<i64, String> {
     i64::try_from(
         SystemTime::now()
@@ -36,6 +54,10 @@ fn unix_time() -> Result<i64, String> {
 
 fn to_i64(value: u64, label: &str) -> Result<i64, String> {
     i64::try_from(value).map_err(|_| format!("{label}が保存可能な範囲を超えています"))
+}
+
+fn to_u64(value: i64, label: &str) -> Result<u64, String> {
+    u64::try_from(value).map_err(|_| format!("{label}に不正な負数が保存されています"))
 }
 
 fn optional_to_i64(value: Option<u64>, label: &str) -> Result<Option<i64>, String> {
@@ -123,6 +145,29 @@ fn insert_entry(
     Ok(())
 }
 
+/// rootに対する最新の完了済みscan sessionを返す(completed_at降順、同時刻ならid降順)。
+pub fn latest_complete_scan_id(
+    database_path: &Path,
+    root_path: &Path,
+) -> Result<Option<i64>, String> {
+    let connection = Connection::open(database_path)
+        .map_err(|error| format!("スキャン履歴を開けません: {error}"))?;
+    connection
+        .execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+        .map_err(|error| error.to_string())?;
+    connection
+        .query_row(
+            "SELECT id FROM scan_sessions WHERE root_path=?1 AND status='complete' ORDER BY completed_at DESC,id DESC LIMIT 1",
+            [root_path.to_string_lossy().as_ref()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("基準スキャンを検索できません: {error}"))
+}
+
+const REMOVED_IDENTITY_SHARED_WITH_RETAINED: &str = "SELECT EXISTS(SELECT 1 FROM (SELECT volume_identity AS v,file_identity AS f,COUNT(*) AS c FROM scan_entries WHERE scan_id=?1 AND volume_identity IS NOT NULL AND file_identity IS NOT NULL GROUP BY volume_identity,file_identity) AS retained JOIN (SELECT volume_identity AS v,file_identity AS f,COUNT(*) AS c FROM scan_entries WHERE scan_id=?2 AND volume_identity IS NOT NULL AND file_identity IS NOT NULL GROUP BY volume_identity,file_identity) AS baseline ON baseline.v=retained.v AND baseline.f=retained.f WHERE baseline.c>retained.c)";
+const REPLACEMENT_IDENTITY_SHARED_WITH_RETAINED: &str = "SELECT EXISTS(SELECT 1 FROM scan_entries AS replacement JOIN scan_entries AS retained ON retained.scan_id=replacement.scan_id AND retained.volume_identity=replacement.volume_identity AND retained.file_identity=replacement.file_identity WHERE replacement.scan_id=?1 AND replacement.id>?2 AND retained.id<=?2)";
+
 pub fn apply_incremental_snapshot(
     database_path: &Path,
     baseline_scan_id: i64,
@@ -130,7 +175,7 @@ pub fn apply_incremental_snapshot(
     targets: &[IncrementalRescanTarget],
     replacements: &[IncrementalEntry],
     checkpoint: &IndexCheckpoint,
-) -> Result<i64, String> {
+) -> Result<IncrementalApplyResult, String> {
     if !root_path.is_absolute() {
         return Err("部分更新対象には絶対pathが必要です".to_owned());
     }
@@ -212,8 +257,46 @@ pub fn apply_incremental_snapshot(
                 .map_err(|error| format!("部分再走査項目を置換できません: {error}"))?;
         }
     }
+    // ここまでで新sessionにはtarget外の基準entry(retained)だけが残っている。
+    // 削除されたtarget内entryとretainedがhard link identityを共有する場合、
+    // 集計サイズ(初出だけを加算)が変わるため部分適用せずrollbackする。
+    let removed_shared: bool = transaction
+        .query_row(
+            REMOVED_IDENTITY_SHARED_WITH_RETAINED,
+            params![scan_id, baseline_scan_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("hard linkの整合性を確認できません: {error}"))?;
+    if removed_shared {
+        transaction
+            .rollback()
+            .map_err(|error| format!("部分更新をrollbackできません: {error}"))?;
+        return Ok(IncrementalApplyResult::HardLinkCrossesTarget);
+    }
+    // 以降に挿入するreplacementのidは、既存のどのretained entryのidよりも大きい
+    // (INTEGER PRIMARY KEYは表全体の最大rowid+1を割り当てる)。
+    let retained_boundary: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(id),0) FROM scan_entries WHERE scan_id=?1",
+            [scan_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
     for entry in replacements {
         insert_entry(&transaction, scan_id, root_path, entry)?;
+    }
+    let replacement_shared: bool = transaction
+        .query_row(
+            REPLACEMENT_IDENTITY_SHARED_WITH_RETAINED,
+            params![scan_id, retained_boundary],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("hard linkの整合性を確認できません: {error}"))?;
+    if replacement_shared {
+        transaction
+            .rollback()
+            .map_err(|error| format!("部分更新をrollbackできません: {error}"))?;
+        return Ok(IncrementalApplyResult::HardLinkCrossesTarget);
     }
     let (size, files, directories, skipped): (i64, i64, i64, i64) = transaction.query_row("SELECT COALESCE(SUM(size_bytes),0),COALESCE(SUM(file_count),0),COALESCE(SUM(directory_count),0),COALESCE(SUM(skipped_count),0) FROM scan_entries WHERE scan_id=?1",[scan_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(|error|format!("部分更新の集計値を計算できません: {error}"))?;
     let changed = transaction.execute("UPDATE scan_sessions SET status='complete',total_size_bytes=?2,file_count=?3,directory_count=?4,skipped_count=?5,elapsed_milliseconds=0,completed_at=?6 WHERE id=?1 AND status='in_progress'",params![scan_id,size,files,directories,skipped,unix_time()?]).map_err(|error|format!("部分更新sessionを確定できません: {error}"))?;
@@ -224,7 +307,15 @@ pub fn apply_incremental_snapshot(
     transaction
         .commit()
         .map_err(|error| format!("部分更新結果とcheckpointを確定できません: {error}"))?;
-    Ok(scan_id)
+    Ok(IncrementalApplyResult::Applied(
+        AppliedIncrementalSnapshot {
+            scan_id,
+            total_size_bytes: to_u64(size, "合計サイズ")?,
+            file_count: to_u64(files, "ファイル数")?,
+            directory_count: to_u64(directories, "フォルダ数")?,
+            skipped_count: to_u64(skipped, "読み飛ばし数")?,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -259,6 +350,13 @@ mod tests {
             connection.execute("INSERT INTO scan_entries (scan_id,name,path,parent_path,relative_path,entry_type,size_bytes,logical_size,file_count,directory_count,skipped_count,is_directory) VALUES (1,?1,?2,?3,?4,?5,?6,?6,?7,?8,0,?9)", params![name,absolute.to_string_lossy().as_ref(),absolute.parent().map(|value|value.to_string_lossy().into_owned()),absolute.strip_prefix(root).unwrap().to_string_lossy().as_ref(),if directories > 0 { "directory" } else { "file" },size,files,directories,if directories > 0 { 1 } else { 0 }]).unwrap();
         }
         path
+    }
+
+    fn applied(result: IncrementalApplyResult) -> AppliedIncrementalSnapshot {
+        match result {
+            IncrementalApplyResult::Applied(applied) => applied,
+            other => panic!("差分適用が完了していません: {other:?}"),
+        }
     }
 
     fn target(path: &str, recursive: bool) -> IncrementalRescanTarget {
@@ -300,15 +398,18 @@ mod tests {
     fn creates_new_snapshot_and_preserves_baseline() {
         let root = root("success");
         let path = database("success", &root);
-        let scan_id = apply_incremental_snapshot(
-            &path,
-            1,
-            &root,
-            &[target("old", false), target("dir", true)],
-            &[entry(root.join("old"), 5)],
-            &checkpoint(&root, "fsevents:v1:20"),
+        let scan_id = applied(
+            apply_incremental_snapshot(
+                &path,
+                1,
+                &root,
+                &[target("old", false), target("dir", true)],
+                &[entry(root.join("old"), 5)],
+                &checkpoint(&root, "fsevents:v1:20"),
+            )
+            .unwrap(),
         )
-        .unwrap();
+        .scan_id;
         let connection = Connection::open(&path).unwrap();
         let baseline_count: i64 = connection
             .query_row(
@@ -378,6 +479,106 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM scan_sessions", [], |row| row.get(0))
             .unwrap();
         assert_eq!(sessions, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn set_identity(path: &Path, relative: &str, identity: &str) {
+        Connection::open(path)
+            .unwrap()
+            .execute(
+                "UPDATE scan_entries SET volume_identity='volume-1',file_identity=?2 WHERE scan_id=1 AND relative_path=?1",
+                params![relative, identity],
+            )
+            .unwrap();
+    }
+
+    fn assert_untouched(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        let sessions: i64 = connection
+            .query_row("SELECT COUNT(*) FROM scan_sessions", [], |row| row.get(0))
+            .unwrap();
+        let checkpoints: i64 = connection
+            .query_row("SELECT COUNT(*) FROM index_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let entries: i64 = connection
+            .query_row("SELECT COUNT(*) FROM scan_entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((sessions, checkpoints, entries), (1, 0, 4));
+    }
+
+    #[test]
+    fn rejects_hard_link_shared_between_removed_and_retained_entries() {
+        let root = root("hard-link-removed");
+        let path = database("hard-link-removed", &root);
+        set_identity(&path, "keep", "shared");
+        set_identity(&path, "old", "shared");
+        let result = apply_incremental_snapshot(
+            &path,
+            1,
+            &root,
+            &[target("old", false)],
+            &[],
+            &checkpoint(&root, "fsevents:v1:20"),
+        )
+        .unwrap();
+        assert_eq!(result, IncrementalApplyResult::HardLinkCrossesTarget);
+        assert_untouched(&path);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_replacement_sharing_identity_with_retained_entry() {
+        let root = root("hard-link-replacement");
+        let path = database("hard-link-replacement", &root);
+        set_identity(&path, "keep", "file-5");
+        let result = apply_incremental_snapshot(
+            &path,
+            1,
+            &root,
+            &[target("old", false)],
+            &[entry(root.join("old"), 5)],
+            &checkpoint(&root, "fsevents:v1:20"),
+        )
+        .unwrap();
+        assert_eq!(result, IncrementalApplyResult::HardLinkCrossesTarget);
+        assert_untouched(&path);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn accepts_hard_links_that_stay_inside_targets() {
+        let root = root("hard-link-inside");
+        let path = database("hard-link-inside", &root);
+        set_identity(&path, "old", "shared");
+        set_identity(&path, "nested", "shared");
+        let result = applied(
+            apply_incremental_snapshot(
+                &path,
+                1,
+                &root,
+                &[target("old", false), target("dir", true)],
+                &[],
+                &checkpoint(&root, "fsevents:v1:20"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(result.file_count, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn finds_latest_complete_baseline_for_exact_root() {
+        let root = root("latest-baseline");
+        let path = database("latest-baseline", &root);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute("INSERT INTO scan_sessions (id,root_path,status,started_at,completed_at) VALUES (2,?1,'complete',1,1),(3,?1,'interrupted',1,9),(4,'other','complete',1,9)",[root.to_string_lossy().as_ref()]).unwrap();
+        assert_eq!(latest_complete_scan_id(&path, &root).unwrap(), Some(2));
+        assert_eq!(
+            latest_complete_scan_id(&path, &root.join("missing")).unwrap(),
+            None
+        );
         let _ = std::fs::remove_file(path);
     }
 }
